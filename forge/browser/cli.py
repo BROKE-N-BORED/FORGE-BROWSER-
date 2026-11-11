@@ -271,6 +271,43 @@ def _cmd_chat(args):
             print(f"  (open in a tab in the window: {url})")
 
 
+def _cmd_cards(args):
+    from .cards import list_cards
+    cards = list_cards()
+    if not cards:
+        print("no cards — built-ins live in forge/browser/cards/, "
+              "yours in ~/.forge/browser-cards/")
+        return 0
+    for card in cards:
+        print(f"{card.name:24} {card.title}")
+    return 0
+
+
+def _cmd_card(args):
+    from .cards import run_card
+    from .chat import ChatSession, LiveDisplay
+    session = ChatSession()
+    display = LiveDisplay()
+
+    def on_chunk(delta):
+        shown = display.feed(delta)
+        if shown:
+            print(shown, end="", flush=True)
+
+    try:
+        run_card(session, args.name, question=args.question or "",
+                 on_action=lambda kind, a: print(f"  … {kind}"),
+                 on_chunk=on_chunk)
+    except Exception as exc:
+        print(f"forge browser: {exc}")
+        return 1
+    rest = display.flush()
+    if rest:
+        print(rest, end="", flush=True)
+    print()
+    return 0
+
+
 def _cmd_app(args):
     from .app import run_app
     return run_app(args.url)
@@ -296,6 +333,15 @@ def main(argv=None):
 
     p = sub.add_parser("chat", help="talk to the browser in the terminal (local model)")
     p.set_defaults(func=_cmd_chat)
+
+    p = sub.add_parser("cards", help="list the saved workflow cards")
+    p.set_defaults(func=_cmd_cards)
+
+    p = sub.add_parser("card", help="run one saved workflow card")
+    p.add_argument("name", help="card name, e.g. summarize-page")
+    p.add_argument("question", nargs="?", default="",
+                   help="the question or topic the card works on")
+    p.set_defaults(func=_cmd_card)
 
     p = sub.add_parser("app", help="Forge Browser the program — its own browser window")
     p.add_argument("url", nargs="?", default=None, help="page to start on")

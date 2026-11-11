@@ -11,6 +11,7 @@ time with a line like:
     ACTION {"type": "research", "topic": "..."}
     ACTION {"type": "read_page"}
     ACTION {"type": "summarize"}
+    ACTION {"type": "card", "name": "summarize-page"}
 
 The session runs the action with the real engine, hands the
 result back to the model, and the model answers from what it
@@ -55,6 +56,7 @@ ACTION {"type": "open", "url": "https://example.org/page"}
 ACTION {"type": "research", "topic": "a bigger question"}
 ACTION {"type": "read_page"}
 ACTION {"type": "summarize"}
+ACTION {"type": "card", "name": "summarize-page"}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
 directly with no ACTION line. Never invent page contents, prices, or facts.
@@ -292,6 +294,14 @@ class ChatSession:
                     else:
                         result = ("No page text is available in this chat — "
                                   "open a page in the window first.")
+                elif kind == "card":
+                    # A card runs its own workflow and answers directly —
+                    # the turn ends here, not with another model step.
+                    from .cards import run_card
+                    answer = run_card(self, str(action.get("name", "")),
+                                      question=user_text, page_text=chosen_text,
+                                      on_action=on_action, on_chunk=on_chunk)
+                    break
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:

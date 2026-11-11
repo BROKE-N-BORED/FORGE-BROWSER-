@@ -70,9 +70,17 @@ Joshua's real PC.
 
 ## C. Doing features (scoped hard, on purpose)
 
-- [ ] **#9 — Cards: saved workflows [M].** Plain-text prompt+action templates
+- [~] **#9 — Cards: saved workflows [M].** Plain-text prompt+action templates
   in a folder ("morning prices check", "pull the specs table"), invoked by name
   in chat. Ship 5–10 hand-tested ones.
+  *(Built 2026-11-11: new forge/browser/cards.py — `# Title` + prompt +
+  `## Actions` ACTION lines, {question}/{page} placeholders; built-ins in
+  forge/browser/cards/, yours in ~/.forge/browser-cards/ (yours win on a
+  name clash); chat ACTION {"type": "card"} runs the workflow and answers
+  directly; CLI `cards` lists, `card <name> [question]` runs. 6 shipped:
+  summarize-page, tl-dr, key-facts, explain-like-im-new, find-price,
+  research-topic — all 6 run against a stub brain in E2E. Suite 95/95.
+  Real-PC verdict open.)*
 - [ ] **#10 — Plan → Run → Interrupt [L].** Brain shows its step plan first;
   person approves; each step runs visibly in a marked tab; a Stop button
   actually stops it. Confirm before anything that submits (purchase, post, send).

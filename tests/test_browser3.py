@@ -426,6 +426,131 @@ class RetrieveTests(unittest.TestCase):
             retrieve_module.embed_texts = original
 
 
+class CardsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cards = os.environ.get("FORGE_BROWSER_CARDS_DIR")
+        os.environ["FORGE_BROWSER_CARDS_DIR"] = self.tmp
+
+    def tearDown(self):
+        if self.old_cards is None:
+            os.environ.pop("FORGE_BROWSER_CARDS_DIR", None)
+        else:
+            os.environ["FORGE_BROWSER_CARDS_DIR"] = self.old_cards
+
+    def make_session(self):
+        session = chat.ChatSession(model="fake:1b")
+
+        def fake_chat(messages, on_chunk=None):
+            last = messages[-1]["content"]
+            if last.startswith("Summarize this part"):
+                return "part summary"
+            if last.startswith("List the key facts"):
+                return "facts answer"
+            if last.startswith("Present the summary"):
+                return "card answer"
+            return "other"
+
+        session._chat = fake_chat
+        return session
+
+    def test_parse_card(self):
+        from forge.browser.cards import parse_card
+        card = parse_card("demo", "# Demo title\nDo the thing.\n## Actions\n"
+                                  'ACTION {"type": "read_page"}\n')
+        self.assertEqual(card.title, "Demo title")
+        self.assertEqual(card.prompt, "Do the thing.")
+        self.assertEqual(card.actions, [{"type": "read_page"}])
+
+    def test_parse_card_bad_action_line(self):
+        from forge.browser.cards import parse_card
+        with self.assertRaises(BrowserError):
+            parse_card("demo", "# Demo\nPrompt.\n## Actions\nACTION nope\n")
+
+    def test_builtin_cards_shipped(self):
+        from forge.browser.cards import list_cards
+        names = [card.name for card in list_cards()]
+        for expected in ("summarize-page", "tl-dr", "key-facts",
+                         "explain-like-im-new", "find-price", "research-topic"):
+            self.assertIn(expected, names)
+
+    def test_user_card_wins_on_name_clash(self):
+        from forge.browser.cards import list_cards
+        with open(os.path.join(self.tmp, "tl-dr.md"), "w") as handle:
+            handle.write("# My TL;DR\nMy own version.\n")
+        found = {card.name: card for card in list_cards()}
+        self.assertEqual(found["tl-dr"].title, "My TL;DR")
+
+    def test_run_card_read_page(self):
+        from forge.browser.cards import run_card
+        session = self.make_session()
+        answer = run_card(session, "key-facts", page_text="Gears cost $42.")
+        self.assertEqual(answer, "facts answer")
+
+    def test_run_card_summarize(self):
+        from forge.browser.cards import run_card
+        session = self.make_session()
+        answer = run_card(session, "summarize-page", page_text="Gears turn.")
+        self.assertEqual(answer, "card answer")
+
+    def test_run_card_research_topic(self):
+        from forge.browser.cards import run_card
+        original = chat._run_research
+        seen = []
+        chat._run_research = lambda topic: seen.append(topic) or "research findings"
+        session = self.make_session()
+
+        def fake_chat(messages, on_chunk=None):
+            if "Research the topic" in messages[-1]["content"]:
+                return "researched answer"
+            return "other"
+
+        session._chat = fake_chat
+        try:
+            answer = run_card(session, "research-topic",
+                              question="quantum dots")
+        finally:
+            chat._run_research = original
+        self.assertEqual(answer, "researched answer")
+        self.assertEqual(seen, ["quantum dots"])
+
+    def test_run_card_unknown_name(self):
+        from forge.browser.cards import run_card
+        session = self.make_session()
+        with self.assertRaises(BrowserError):
+            run_card(session, "no-such-card")
+
+    def test_chat_action_runs_card(self):
+        session = chat.ChatSession(model="fake:1b")
+
+        def fake_chat(messages, on_chunk=None):
+            last = messages[-1]["content"]
+            if last.startswith("List the key facts"):
+                return "facts answer"
+            if "run the key-facts card" in last:
+                return 'ACTION {"type": "card", "name": "key-facts"}'
+            return "other"
+
+        session._chat = fake_chat
+        answer, _opens = session.ask("run the key-facts card",
+                                     page_text="Gears cost $42.")
+        self.assertEqual(answer, "facts answer")
+
+    def test_cli_cards_lists_builtins(self):
+        import io as _io
+        from contextlib import redirect_stdout
+        from forge.browser import cli as cli_module
+        out = _io.StringIO()
+
+        class Args:
+            pass
+
+        with redirect_stdout(out):
+            self.assertEqual(cli_module._cmd_cards(Args()), 0)
+        self.assertIn("summarize-page", out.getvalue())
+        self.assertIn("research-topic", out.getvalue())
+
+
 class SessionTests(unittest.TestCase):
     def make_session(self, replies):
         session = chat.ChatSession(model="fake:1b")
