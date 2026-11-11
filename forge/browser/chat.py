@@ -10,6 +10,7 @@ time with a line like:
     ACTION {"type": "open", "url": "https://..."}
     ACTION {"type": "research", "topic": "..."}
     ACTION {"type": "read_page"}
+    ACTION {"type": "summarize"}
 
 The session runs the action with the real engine, hands the
 result back to the model, and the model answers from what it
@@ -52,6 +53,7 @@ ACTION {"type": "search", "query": "words to search"}
 ACTION {"type": "open", "url": "https://example.org/page"}
 ACTION {"type": "research", "topic": "a bigger question"}
 ACTION {"type": "read_page"}
+ACTION {"type": "summarize"}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
 directly with no ACTION line. Never invent page contents, prices, or facts."""
@@ -249,6 +251,13 @@ class ChatSession:
                 elif kind == "read_page":
                     result = (page_text or "No page text is available "
                               "in this chat.")[:RESULT_CAP]
+                elif kind == "summarize":
+                    if page_text:
+                        from .summarize import summarize_page
+                        result = summarize_page(self, page_text)
+                    else:
+                        result = ("No page text is available in this chat — "
+                                  "open a page in the window first.")
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:

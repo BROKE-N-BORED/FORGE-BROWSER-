@@ -7,6 +7,7 @@ fed back to the model, tab-open requests, and the no-brain error.
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -166,6 +167,127 @@ class LiveDisplayTests(unittest.TestCase):
         display = chat.LiveDisplay()
         self.assertEqual(display.feed("one\ntwo\n"), "one\ntwo\n")
         self.assertEqual(display.flush(), "")
+
+
+class SummarizeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_cache = os.environ.get("FORGE_BROWSER_SUMMARY_CACHE")
+        os.environ["FORGE_BROWSER_SUMMARY_CACHE"] = os.path.join(self.tmp, "s.json")
+
+    def tearDown(self):
+        if self.old_cache is None:
+            os.environ.pop("FORGE_BROWSER_SUMMARY_CACHE", None)
+        else:
+            os.environ["FORGE_BROWSER_SUMMARY_CACHE"] = self.old_cache
+
+    def make_session(self):
+        session = chat.ChatSession(model="fake:1b")
+        calls = []
+
+        def fake_chat(messages, on_chunk=None):
+            prompt = messages[-1]["content"]
+            calls.append(prompt)
+            if prompt.startswith("Combine these"):
+                return "combined summary"
+            if prompt.startswith("Summarize this part"):
+                return "part summary"
+            return "other"
+
+        session._chat = fake_chat
+        session.calls = calls
+        return session
+
+    def test_short_page_one_map_call_no_reduce(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        self.assertEqual(summarize_page(session, "Short page text."), "part summary")
+        self.assertEqual(len(session.calls), 1)
+        self.assertTrue(session.calls[0].startswith("Summarize this part"))
+
+    def test_long_page_map_then_reduce(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        text = "\n".join(f"Paragraph {i} " + ("word " * 200) for i in range(6))
+        self.assertEqual(summarize_page(session, text), "combined summary")
+        maps = [c for c in session.calls if c.startswith("Summarize this part")]
+        reduces = [c for c in session.calls if c.startswith("Combine these")]
+        self.assertGreater(len(maps), 1)
+        self.assertEqual(len(reduces), 1)
+        self.assertIn("part summary", reduces[0])
+
+    def test_cache_hit_skips_brain(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        summarize_page(session, "Same page.")
+        first = len(session.calls)
+        self.assertGreater(first, 0)
+        self.assertEqual(summarize_page(session, "Same page."), "part summary")
+        self.assertEqual(len(session.calls), first)
+
+    def test_changed_text_misses_cache(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        summarize_page(session, "Version one.")
+        first = len(session.calls)
+        summarize_page(session, "Version two.")
+        self.assertGreater(len(session.calls), first)
+
+    def test_empty_page_no_calls(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        self.assertEqual(summarize_page(session, "   "), "")
+        self.assertEqual(session.calls, [])
+
+    def test_single_chunk_streams_live(self):
+        from forge.browser.summarize import summarize_page
+        session = self.make_session()
+        streamed = []
+
+        def fake_streaming_chat(messages, on_chunk=None):
+            prompt = messages[-1]["content"]
+            if on_chunk is not None:
+                on_chunk("part ")
+                on_chunk("summary")
+            return "part summary"
+
+        session._chat = fake_streaming_chat
+        self.assertEqual(
+            summarize_page(session, "Short page.", on_chunk=streamed.append),
+            "part summary")
+        self.assertEqual(streamed, ["part ", "summary"])
+
+    def test_chat_action_summarizes_current_page(self):
+        session = chat.ChatSession(model="fake:1b")
+        calls = []
+
+        def fake_chat(messages, on_chunk=None):
+            last = messages[-1]["content"]
+            calls.append(last)
+            if last.startswith("Combine these"):
+                return "combined summary"
+            if last.startswith("Summarize this part"):
+                return "part summary"
+            if "summarize this page" in last:
+                return 'ACTION {"type": "summarize"}'
+            return "Here is the summary: part summary."
+
+        session._chat = fake_chat
+        answer, _opens = session.ask("summarize this page",
+                                     page_text="Some page text here.")
+        self.assertIn("part summary", answer)
+        self.assertTrue(any(c.startswith("Summarize this part") for c in calls))
+
+    def test_summarize_action_without_page_is_plain(self):
+        session = chat.ChatSession(model="fake:1b")
+        queue = ['ACTION {"type": "summarize"}', "No page is open."]
+
+        def fake_chat(messages, on_chunk=None):
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        answer, _opens = session.ask("summarize this page")
+        self.assertEqual(answer, "No page is open.")
 
 
 class SessionTests(unittest.TestCase):

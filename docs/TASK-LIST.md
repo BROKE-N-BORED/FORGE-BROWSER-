@@ -39,8 +39,14 @@ Joshua's real PC.
 
 ## B. Reading features
 
-- [ ] **#5 — Summarize this page [S–M].** One click / one chat phrase,
+- [~] **#5 — Summarize this page [S–M].** One click / one chat phrase,
   map-reduce in chunks for long pages, cached by URL + content hash.
+  *(Built 2026-11-11: new forge/browser/summarize.py — ~1500-char chunks,
+  map then combine, cache at ~/.forge/summaries.json keyed by URL+text
+  hash (50 entries); chat ACTION "summarize" + dock Summarize button,
+  both streaming live. Suite 75/75; stub E2E (6 maps + 1 reduce, cache
+  hit = 0 calls, changed text re-summarizes); offscreen Qt smoke drove
+  the real button — summary once in the log. Real-PC verdict open.)*
 - [ ] **#6 — Link previews [M].** Hover a link, get a 2-line summary of where
   it goes. On demand only — no prefetching (would thrash the CPU).
 - [ ] **#7 — Cross-tab compare [M].** "Compare these three" → extract the same
@@ -88,9 +94,14 @@ Joshua's real PC.
 
 ## G. Engine-room hardening [FIX] — defects in the shipped build
 
-- [ ] **#17 — [P1] Cap downloads.** Fetched files currently load fully into
+- [~] **#17 — [P1] Cap downloads.** Fetched files currently load fully into
   RAM with no size limit — a big file can OOM an 8 GB machine. Stream to disk
   with a cap. *Highest-risk open item in the analysis.*
+  *(Built 2026-11-11: _http.py caps — 32 MiB in memory, 512 MiB streamed
+  to disk, Content-Length refused from headers, cap counts decompressed
+  bytes (gzip bombs refused), partial files removed; fetch_any streams
+  to a temp file first and reads text back only under the memory cap.
+  Suite 75/75 incl. 6 new cap tests. Real-PC verdict open.)*
 - [ ] **#18 — [E2] Markdown table separator row.** html2md tables currently
   aren't valid Markdown tables.
 - [ ] **#19 — [E3] Barrier detection on raw HTML.** Research scans extracted

@@ -34,11 +34,12 @@ import io
 import json
 import os
 import re
+import tempfile
 import zlib
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from ._http import decode_body, http_get
+from ._http import MAX_BODY_BYTES, decode_body, http_get_to_file
 from .errors import BrowserError
 from .html2md import html_to_markdown
 
@@ -81,14 +82,14 @@ def media_dir():
     return path
 
 
-def _save_bytes(body, final_url, kind):
+def _keep_file(tmp_path, final_url, kind):
+    """Move an already-downloaded temp file to its media-dir name."""
     name = os.path.basename(urlparse(final_url).path) or f"download.{kind}"
     if "." not in name:
         name += "." + kind
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
     path = os.path.join(media_dir(), safe)
-    with open(path, "wb") as handle:
-        handle.write(body)
+    os.replace(tmp_path, path)
     return path
 
 
@@ -227,60 +228,95 @@ def _pdf_unescape(raw):
 
 
 def fetch_any(url, timeout=30, describe=True, transcribe=True):
-    """Fetch any URL and return a FileResult for whatever it is."""
+    """Fetch any URL and return a FileResult for whatever it is.
+
+    The download streams straight to a temp file first (task #17),
+    so RAM stays flat no matter the size — the file cap, not memory,
+    is the limit. Text kinds are read back only when they fit the
+    in-memory cap; anything bigger is kept on disk and reported
+    as saved, never half-read.
+    """
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
         raise BrowserError(f"Forge Browser only fetches http(s) — refused {url!r}")
-    final_url, headers, body = http_get(url, timeout=timeout)
+    fd, tmp_path = tempfile.mkstemp(prefix="forge-fetch-", dir=media_dir())
+    os.close(fd)
+    try:
+        final_url, headers, size = http_get_to_file(url, tmp_path, timeout=timeout)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     content_type = ""
     if headers is not None:
         content_type = (headers.get_content_type() or "").lower()
     kind = _kind_for(content_type, final_url)
     result = FileResult(url=url, final_url=final_url, kind=kind,
-                        content_type=content_type, size_bytes=len(body))
+                        content_type=content_type, size_bytes=size)
+    try:
+        body = None
+        if kind in ("html", "pdf", "text") and size <= MAX_BODY_BYTES:
+            with open(tmp_path, "rb") as handle:
+                body = handle.read()
+        if body is None:
+            # A save-kind, or a text kind too big to hold in memory:
+            # the file is already on disk — keep it and say so.
+            result.saved_path = _keep_file(tmp_path, final_url, kind)
+            if kind in ("html", "pdf", "text"):
+                result.notes.append(
+                    f"too big to read as text ({size} bytes, over the "
+                    f"{MAX_BODY_BYTES} byte limit) — saved the file instead")
+            else:
+                result.notes.append(f"saved the {kind} file ({size} bytes)")
+            if kind == "image" and describe:
+                from .media import describe_saved_image
+                description = describe_saved_image(result.saved_path)
+                if description:
+                    result.text = description
+                else:
+                    result.notes.append(
+                        "no local vision seat is configured, so the image was "
+                        "saved but not described (see BROWSER.md: vision seat)")
+            if kind == "audio" and transcribe:
+                from .media import transcribe_saved_audio
+                transcript = transcribe_saved_audio(result.saved_path)
+                if transcript:
+                    result.text = transcript
+                else:
+                    result.notes.append(
+                        "no local transcription backend is configured, so the "
+                        "audio was saved but not transcribed (see BROWSER.md)")
+            return result
 
-    if kind == "html":
-        text = decode_body(body, headers)
-        result.title, result.text, _ = html_to_markdown(text, final_url)
-    elif kind == "pdf":
-        result.text = extract_pdf_text(body)
-        result.title = os.path.basename(urlparse(final_url).path)
-        if not result.text:
-            result.saved_path = _save_bytes(body, final_url, "pdf")
-            result.notes.append(
-                "this PDF has no readable text layer (likely scanned images) — "
-                "the file was saved; reading it needs the vision seat / OCR, "
-                "which is not part of this build")
-    elif kind == "text":
-        text = decode_body(body, headers)
-        if content_type == "application/json" or final_url.split("?")[0].endswith(".json"):
-            try:
-                result.text = json.dumps(json.loads(text), indent=2)[:200000]
-            except json.JSONDecodeError:
+        if kind == "html":
+            text = decode_body(body, headers)
+            result.title, result.text, _ = html_to_markdown(text, final_url)
+        elif kind == "pdf":
+            result.text = extract_pdf_text(body)
+            result.title = os.path.basename(urlparse(final_url).path)
+            if not result.text:
+                result.saved_path = _keep_file(tmp_path, final_url, "pdf")
+                result.notes.append(
+                    "this PDF has no readable text layer (likely scanned images) — "
+                    "the file was saved; reading it needs the vision seat / OCR, "
+                    "which is not part of this build")
+        elif kind == "text":
+            text = decode_body(body, headers)
+            if content_type == "application/json" or final_url.split("?")[0].endswith(".json"):
+                try:
+                    result.text = json.dumps(json.loads(text), indent=2)[:200000]
+                except json.JSONDecodeError:
+                    result.text = text
+            elif content_type == "text/csv" or final_url.split("?")[0].endswith(".csv"):
+                result.text = _csv_to_markdown(text)
+            else:
                 result.text = text
-        elif content_type == "text/csv" or final_url.split("?")[0].endswith(".csv"):
-            result.text = _csv_to_markdown(text)
-        else:
-            result.text = text
-    elif kind in ("image", "audio", "video", "binary"):
-        result.saved_path = _save_bytes(body, final_url, kind)
-        result.notes.append(f"saved the {kind} file ({len(body)} bytes)")
-        if kind == "image" and describe:
-            from .media import describe_saved_image
-            description = describe_saved_image(result.saved_path)
-            if description:
-                result.text = description
-            else:
-                result.notes.append(
-                    "no local vision seat is configured, so the image was "
-                    "saved but not described (see BROWSER.md: vision seat)")
-        if kind == "audio" and transcribe:
-            from .media import transcribe_saved_audio
-            transcript = transcribe_saved_audio(result.saved_path)
-            if transcript:
-                result.text = transcript
-            else:
-                result.notes.append(
-                    "no local transcription backend is configured, so the "
-                    "audio was saved but not transcribed (see BROWSER.md)")
-    return result
+        return result
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass

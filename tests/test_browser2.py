@@ -8,6 +8,7 @@ against a local HTTP fixture server.
 """
 
 import base64
+import gzip
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,6 +25,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from forge.browser import BrowserError  # noqa: E402
 from forge.browser import barriers, media, vault as vault_module  # noqa: E402
+from forge.browser import files as files_module  # noqa: E402
+from forge.browser._http import http_get, http_get_to_file  # noqa: E402
 from forge.browser.cdp import BrowserSession, format_ax_tree  # noqa: E402
 from forge.browser.files import extract_pdf_text, fetch_any  # noqa: E402
 from forge.browser.research import make_plan, run_research  # noqa: E402
@@ -258,12 +262,43 @@ def _make_pdf():
 
 class _FileHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path == "/big-chunked.bin":
+            # No Content-Length: the body ends at connection close.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.end_headers()
+            self.wfile.write(b"x" * 2048)
+            return
+        if self.path == "/bomb.gz":
+            raw = gzip.compress(b"A" * 5000)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        if self.path == "/declared-big.bin":
+            # Headers first, body 1.5 s later: a client that refuses
+            # from Content-Length alone never waits for the body.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", "5000")
+            self.end_headers()
+            time.sleep(1.5)
+            try:
+                self.wfile.write(b"x" * 5000)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         routes = {
             "/doc.pdf": ("application/pdf", _make_pdf()),
             "/pic.png": ("image/png", FAKE_PNG),
             "/data.json": ("application/json", b'{"a": 1}'),
             "/table.csv": ("text/csv", b"name,value\nalpha,1\n"),
             "/song.mp3": ("audio/mpeg", b"not-real-audio"),
+            "/big.bin": ("application/octet-stream", b"x" * 2048),
+            "/big.txt": ("text/plain", b"y" * 2048),
         }
         content_type, body = routes.get(self.path, ("text/plain", b"missing"))
         self.send_response(200 if self.path in routes else 404)
@@ -332,6 +367,81 @@ class FileTests(unittest.TestCase):
         result = fetch_any(self.base + "/song.mp3")
         self.assertEqual(result.kind, "audio")
         self.assertTrue(os.path.isfile(result.saved_path))
+
+
+class DownloadCapTests(unittest.TestCase):
+    """Task #17: no download may fill the machine's memory."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _FileHandler)
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.tmp = tempfile.mkdtemp()
+        cls.old_media = os.environ.get("FORGE_BROWSER_MEDIA_DIR")
+        os.environ["FORGE_BROWSER_MEDIA_DIR"] = cls.tmp
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        if cls.old_media is None:
+            os.environ.pop("FORGE_BROWSER_MEDIA_DIR", None)
+        else:
+            os.environ["FORGE_BROWSER_MEDIA_DIR"] = cls.old_media
+
+    def test_declared_length_refused_fast(self):
+        started = time.monotonic()
+        with self.assertRaises(BrowserError) as caught:
+            http_get(self.base + "/declared-big.bin", max_bytes=1024)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertIn("5000", str(caught.exception))
+        self.assertIn("1024", str(caught.exception))
+
+    def test_chunked_body_refused_over_cap(self):
+        with self.assertRaises(BrowserError):
+            http_get(self.base + "/big-chunked.bin", max_bytes=1024)
+
+    def test_gzip_bomb_refused_on_decompressed_size(self):
+        # ~50 bytes on the wire, 5000 bytes out — the cap counts
+        # decompressed bytes, so the bomb is refused.
+        with self.assertRaises(BrowserError):
+            http_get(self.base + "/bomb.gz", max_bytes=1024)
+
+    def test_get_to_file_caps_and_removes_partial(self):
+        path = os.path.join(self.tmp, "partial.bin")
+        with self.assertRaises(BrowserError):
+            http_get_to_file(self.base + "/big.bin", path, max_bytes=1024)
+        self.assertFalse(os.path.exists(path))
+        _url, _headers, size = http_get_to_file(
+            self.base + "/big.bin", path, max_bytes=4096)
+        self.assertEqual(size, 2048)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"x" * 2048)
+
+    def test_fetch_any_binary_past_memory_cap(self):
+        # A binary over the in-memory cap still downloads — it
+        # streams to disk instead of into RAM.
+        old = files_module.MAX_BODY_BYTES
+        files_module.MAX_BODY_BYTES = 1024
+        try:
+            result = fetch_any(self.base + "/big.bin")
+        finally:
+            files_module.MAX_BODY_BYTES = old
+        self.assertEqual(result.kind, "binary")
+        self.assertEqual(result.size_bytes, 2048)
+        self.assertTrue(os.path.isfile(result.saved_path))
+
+    def test_fetch_any_text_over_memory_cap_saved_not_read(self):
+        old = files_module.MAX_BODY_BYTES
+        files_module.MAX_BODY_BYTES = 1024
+        try:
+            result = fetch_any(self.base + "/big.txt")
+        finally:
+            files_module.MAX_BODY_BYTES = old
+        self.assertEqual(result.kind, "text")
+        self.assertEqual(result.text, "")
+        self.assertTrue(os.path.isfile(result.saved_path))
+        self.assertTrue(any("too big" in n for n in result.notes))
 
 
 # ----------------------------------------------------------------------

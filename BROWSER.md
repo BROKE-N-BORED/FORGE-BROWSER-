@@ -80,12 +80,16 @@ LOCAL Ollama model is the brain (automatic pick, or set
 FORGE_BROWSER_CHAT_MODEL). It answers directly, or takes one
 action at a time with the engine room: search (keyless), open a
 page (which also opens it in a tab for you), research (the
-plan-gated runner — asking in chat is the approval), or read_page
-(the current tab's text is its context). At most 3 actions per
-message, so a small model stays on rails; engine output is capped
-before it reaches the model, sized for small context windows.
-No Ollama answering = the dock says so and browsing still works.
-Terminal version: `python3 -m forge.browser chat`.
+plan-gated runner — asking in chat is the approval), read_page
+(the current tab's text is its context), or summarize (the current
+page, map-reduce in ~1500-char chunks so a long page still fits a
+small model; cached by URL + content hash under
+~/.forge/summaries.json). At most 3 actions per message, so a small
+model stays on rails; engine output is capped before it reaches
+the model, sized for small context windows. The dock also has a
+Summarize button: one click summarizes the current tab, streamed
+live into the log. No Ollama answering = the dock says so and
+browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
 ## Commands
 

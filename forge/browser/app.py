@@ -162,8 +162,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     entry = QtWidgets.QLineEdit()
     entry.setPlaceholderText("Ask for a page, a search, a summary…")
     send = QtWidgets.QPushButton("Send")
+    summarize_btn = QtWidgets.QPushButton("Summarize")
     row.addWidget(entry)
     row.addWidget(send)
+    row.addWidget(summarize_btn)
     layout.addLayout(row)
     dock.setWidget(panel)
     dock.setMinimumWidth(320)
@@ -171,6 +173,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     if not model:
         entry.setEnabled(False)
         send.setEnabled(False)
+        summarize_btn.setEnabled(False)
         return
 
     state = {"busy": False, "live": False}
@@ -181,6 +184,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def finish():
         state["busy"] = False
         send.setEnabled(True)
+        summarize_btn.setEnabled(True)
         entry.setEnabled(True)
         entry.setFocus()
 
@@ -239,6 +243,45 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         except Exception as exc:
             signals.failed.emit(str(exc))
 
+    def work_summary(page_text):
+        display = LiveDisplay()
+
+        def on_chunk(delta):
+            shown = display.feed(delta)
+            if shown:
+                signals.token.emit(shown)
+
+        try:
+            signals.notice.emit("working: summarizing…")
+            from .summarize import summarize_page
+            summary = summarize_page(session, page_text, on_chunk=on_chunk)
+            rest = display.flush()
+            if rest:
+                signals.token.emit(rest)
+            signals.answer.emit(summary or "(no summary — the page text was empty)")
+        except Exception as exc:
+            signals.failed.emit(str(exc))
+
+    def do_summarize():
+        if state["busy"]:
+            return
+        state["busy"] = True
+        state["live"] = False
+        send.setEnabled(False)
+        summarize_btn.setEnabled(False)
+        entry.setEnabled(False)
+        view = window.tabs.currentWidget()
+
+        def got_page(page_text):
+            threading.Thread(target=work_summary, args=(page_text or None,),
+                             daemon=True).start()
+
+        if view is not None:
+            view.page().runJavaScript(
+                "document.body ? document.body.innerText : ''", got_page)
+        else:
+            got_page(None)
+
     def do_send():
         text = entry.text().strip()
         if not text or state["busy"]:
@@ -246,6 +289,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         state["busy"] = True
         state["live"] = False
         send.setEnabled(False)
+        summarize_btn.setEnabled(False)
         entry.setEnabled(False)
         entry.clear()
         append("You", text)
@@ -263,6 +307,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     send.clicked.connect(do_send)
     entry.returnPressed.connect(do_send)
+    summarize_btn.clicked.connect(do_summarize)
 
 
 def run_app(start_url=None):
