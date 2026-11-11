@@ -31,11 +31,23 @@ Joshua's real PC.
   stub E2E proved incremental delivery (6 chunks over 1.80 s) + payload;
   offscreen Qt smoke drove the real dock — answer once, no ACTION leak.
   Real-PC verdict open.)*
-- [ ] **#3 — Chunk-and-retrieve page feeding [M].** Chunk the current page
+- [~] **#3 — Chunk-and-retrieve page feeding [M].** Chunk the current page
   (200–400 tokens), embed with nomic-embed-text, retrieve only the chunks that
   match the question. What makes "chat with my tabs" actually work at 8k context.
-- [ ] **#4 — @tab addressing [S, needs #3].** "What does @tab2 say about the
+  *(Built 2026-11-11: new forge/browser/retrieve.py — ~1200-char chunks
+  with 200-char overlap, /api/embed via nomic-embed-text, cosine top-4,
+  per-page embedding cache; short pages go in whole, no-embeddings
+  degrades silently to the old truncated head. Suite 85/85; stub E2E
+  found the price past the old 6000-char cut (4821 chars sent of 8766)
+  and proved the no-embeddings fallback. Real-PC verdict open.)*
+- [~] **#4 — @tab addressing [S, needs #3].** "What does @tab2 say about the
   price?" — let the person name tabs in chat.
+  *(Built 2026-11-11 with #3: ask() takes tabs=[{title,url,text,current}],
+  @tabN picks that tab's text (read_page/summarize follow it), the brain
+  gets the numbered tab list; dock reads every tab's text on send (5 s
+  guard so a silent tab can't hang it). Offscreen Qt smoke with two real
+  tabs: "@tab2 what is the price?" answered from tab 2, once. Real-PC
+  verdict open.)*
 
 ## B. Reading features
 

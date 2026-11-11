@@ -221,7 +221,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
 
-    def work(text, page_text):
+    def work(text, page_text, tabs=None):
         display = LiveDisplay()
 
         def on_chunk(delta):
@@ -231,7 +231,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
         try:
             answer, opens = session.ask(
-                text, page_text=page_text,
+                text, page_text=page_text, tabs=tabs,
                 on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
                 on_chunk=on_chunk)
             for url in opens:
@@ -293,17 +293,45 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         entry.setEnabled(False)
         entry.clear()
         append("You", text)
-        view = window.tabs.currentWidget()
+        # Read every tab's text, so @tabN can name any of them.
+        count = window.tabs.count()
+        current = window.tabs.currentIndex()
+        texts = [None] * count
+        started = {"done": False}
 
-        def got_page(page_text):
-            threading.Thread(target=work, args=(text, page_text or None),
+        def start_work():
+            if started["done"]:
+                return
+            started["done"] = True
+            tabs = []
+            for i in range(count):
+                view = window.tabs.widget(i)
+                tabs.append({"title": view.title() if view is not None else "",
+                             "url": view.url().toString() if view is not None else "",
+                             "text": texts[i] or "",
+                             "current": i == current})
+            page_text = texts[current] if 0 <= current < count else None
+            threading.Thread(target=work, args=(text, page_text, tabs),
                              daemon=True).start()
 
-        if view is not None:
-            view.page().runJavaScript(
-                "document.body ? document.body.innerText : ''", got_page)
-        else:
-            got_page(None)
+        def collect(i, page_text):
+            texts[i] = page_text or ""
+            if all(t is not None for t in texts):
+                start_work()
+
+        if count == 0:
+            start_work()
+            return
+        for i in range(count):
+            view = window.tabs.widget(i)
+            if view is not None:
+                view.page().runJavaScript(
+                    "document.body ? document.body.innerText : ''",
+                    lambda page_text, i=i: collect(i, page_text))
+            else:
+                collect(i, "")
+        # A tab that never answers must not hang the send.
+        QtCore.QTimer.singleShot(5000, start_work)
 
     send.clicked.connect(do_send)
     entry.returnPressed.connect(do_send)

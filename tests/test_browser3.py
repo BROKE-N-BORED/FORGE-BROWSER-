@@ -290,6 +290,142 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(answer, "No page is open.")
 
 
+class RetrieveTests(unittest.TestCase):
+    def test_chunks_split_and_overlap(self):
+        from forge.browser.retrieve import chunk_text
+        text = "\n".join(f"line {i} " + ("word " * 100) for i in range(10))
+        chunks = chunk_text(text)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 1200 + 200 + 1)
+        self.assertTrue(chunks[1].startswith(chunks[0][-200:]))
+        joined = "\n".join(chunks)
+        for i in range(10):
+            self.assertIn(f"line {i}", joined)
+
+    def test_retrieve_ranks_by_similarity(self):
+        from forge.browser.retrieve import retrieve
+        query = [1.0, 0.0]
+        vectors = [[0.0, 1.0], [1.0, 0.0], [0.7, 0.7]]
+        self.assertEqual(retrieve(query, vectors, top_k=2), [1, 2])
+
+    def test_embed_texts_posts_to_ollama(self):
+        import json as _json
+        import urllib.request as _urlreq
+        from forge.browser import retrieve as retrieve_module
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return _json.dumps(
+                    {"embeddings": [[0.1, 0.2], [0.3, 0.4]]}).encode()
+
+        original = _urlreq.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            seen["data"] = _json.loads(request.data.decode("utf-8"))
+            seen["url"] = request.full_url
+            return Resp()
+
+        _urlreq.urlopen = fake_urlopen
+        try:
+            vectors = retrieve_module.embed_texts(["a", "b"])
+        finally:
+            _urlreq.urlopen = original
+        self.assertEqual(vectors, [[0.1, 0.2], [0.3, 0.4]])
+        self.assertEqual(seen["data"]["model"], "nomic-embed-text")
+        self.assertEqual(seen["data"]["input"], ["a", "b"])
+        self.assertTrue(seen["url"].endswith("/api/embed"))
+
+    def test_page_context_short_page_goes_whole(self):
+        from forge.browser import retrieve as retrieve_module
+        session = chat.ChatSession(model="fake:1b")
+        calls = []
+        original = retrieve_module.embed_texts
+
+        def fake_embed(texts, model=None):
+            calls.append(list(texts))
+            return [[0.0]] * len(texts)
+
+        retrieve_module.embed_texts = fake_embed
+        try:
+            self.assertEqual(
+                retrieve_module.page_context(session, "q", "short text"),
+                "short text")
+        finally:
+            retrieve_module.embed_texts = original
+        self.assertEqual(calls, [])
+
+    def test_page_context_long_page_retrieves_top_chunks(self):
+        from forge.browser import retrieve as retrieve_module
+        session = chat.ChatSession(model="fake:1b")
+        paras = []
+        for i in range(6):
+            paras.append(f"filler{i} " * 150)
+        paras[3] = "needle word " * 90 + paras[3]
+        text = "\n".join(paras)
+        self.assertGreater(len(text), 6000)
+
+        def fake_embed(texts, model=None):
+            vectors = []
+            for t in texts:
+                vectors.append([0.0, 1.0] if "needle" in t else [1.0, 0.0])
+            return vectors
+
+        original = retrieve_module.embed_texts
+        retrieve_module.embed_texts = fake_embed
+        try:
+            context = retrieve_module.page_context(session, "needle", text)
+        finally:
+            retrieve_module.embed_texts = original
+        self.assertIn("needle", context)
+        self.assertLess(len(context), len(text))
+
+    def test_page_context_caches_chunk_embeddings(self):
+        from forge.browser import retrieve as retrieve_module
+        session = chat.ChatSession(model="fake:1b")
+        text = "x" * 7000
+        calls = []
+        original = retrieve_module.embed_texts
+
+        def fake_embed(texts, model=None):
+            calls.append(list(texts))
+            return [[0.5]] * len(texts)
+
+        retrieve_module.embed_texts = fake_embed
+        try:
+            retrieve_module.page_context(session, "q1", text)
+            retrieve_module.page_context(session, "q2", text)
+        finally:
+            retrieve_module.embed_texts = original
+        chunk_calls = [c for c in calls if len(c) > 1]
+        query_calls = [c for c in calls if len(c) == 1]
+        self.assertEqual(len(chunk_calls), 1)
+        self.assertEqual(len(query_calls), 2)
+
+    def test_page_context_falls_back_without_embeddings(self):
+        from forge.browser import retrieve as retrieve_module
+        session = chat.ChatSession(model="fake:1b")
+        original = retrieve_module.embed_texts
+
+        def fake_embed(texts, model=None):
+            raise BrowserError("down")
+
+        retrieve_module.embed_texts = fake_embed
+        try:
+            text = "x" * 7000
+            self.assertEqual(
+                retrieve_module.page_context(session, "q", text), text[:6000])
+        finally:
+            retrieve_module.embed_texts = original
+
+
 class SessionTests(unittest.TestCase):
     def make_session(self, replies):
         session = chat.ChatSession(model="fake:1b")
@@ -318,6 +454,41 @@ class SessionTests(unittest.TestCase):
         answer, _opens = session.ask("hi", on_chunk=marker)
         self.assertEqual(answer, "done")
         self.assertEqual(received, [marker])
+
+    def test_tab_reference_selects_named_tab(self):
+        session = self.make_session(["Tab two says hi."])
+        tabs = [
+            {"title": "First", "url": "http://a.example",
+             "text": "first tab words", "current": True},
+            {"title": "Second", "url": "http://b.example",
+             "text": "second tab words", "current": False},
+        ]
+        answer, _opens = session.ask("@tab2 what does it say", tabs=tabs)
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertTrue(any("Open tabs:" in t and "Second" in t
+                            for t in system_texts))
+        self.assertTrue(any("second tab words" in t for t in system_texts))
+        self.assertFalse(any("first tab words" in t for t in system_texts))
+        self.assertEqual(answer, "Tab two says hi.")
+
+    def test_tab_reference_out_of_range_is_plain(self):
+        session = self.make_session(["There is no tab 9."])
+        tabs = [{"title": "Only", "url": "http://a.example",
+                 "text": "only words", "current": True}]
+        answer, _opens = session.ask("@tab9 what does it say", tabs=tabs)
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertTrue(any("only 1 tabs" in t for t in system_texts))
+        self.assertEqual(answer, "There is no tab 9.")
+
+    def test_tab_mention_without_tabs_is_plain(self):
+        session = self.make_session(["No tabs here."])
+        answer, _opens = session.ask("@tab2 what does it say")
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertTrue(any("has no tabs" in t for t in system_texts))
+        self.assertEqual(answer, "No tabs here.")
 
     def test_plain_answer(self):
         session = self.make_session(["Hello yourself."])

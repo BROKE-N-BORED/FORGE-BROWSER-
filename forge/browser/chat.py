@@ -25,6 +25,7 @@ import urllib.request
 
 from .errors import BrowserError
 from .media import OLLAMA_URL
+from .retrieve import page_context
 
 MAX_ACTIONS = 3          # per user message — keeps small models on rails
 RESULT_CAP = 4500        # chars of engine output handed to the model
@@ -56,7 +57,9 @@ ACTION {"type": "read_page"}
 ACTION {"type": "summarize"}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
-directly with no ACTION line. Never invent page contents, prices, or facts."""
+directly with no ACTION line. Never invent page contents, prices, or facts.
+Tabs are numbered from 1 in the order shown; when the person writes @tab2,
+answer from that tab's text, which is handed to you as its context."""
 
 
 def list_models():
@@ -169,6 +172,7 @@ class ChatSession:
     def __init__(self, model=None):
         self.model = model if model is not None else pick_chat_model()
         self.history = []
+        self._retrieve_cache = {}  # page hash -> (chunks, embeddings)
 
     def _chat(self, messages, on_chunk=None):
         """One brain call. Without on_chunk this waits for the
@@ -217,13 +221,43 @@ class ChatSession:
             raise BrowserError(
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
 
-    def ask(self, user_text, page_text=None, on_action=None, on_chunk=None):
-        """One chat turn. Returns (answer, urls_to_open_in_tabs)."""
+    def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
+            tabs=None):
+        """One chat turn. Returns (answer, urls_to_open_in_tabs).
+        tabs: [{title, url, text, current}] in visible order, for @tabN."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        if page_text:
+        # @tabN picks a tab; otherwise the current tab's text.
+        chosen_text = page_text
+        chosen_title = None
+        if tabs:
+            lines = []
+            for i, tab in enumerate(tabs, 1):
+                marker = " (current)" if tab.get("current") else ""
+                lines.append(f"{i}. {tab.get('title') or 'Untitled'} — "
+                             f"{tab.get('url') or ''}{marker}")
+            tab_note = "Open tabs:\n" + "\n".join(lines)
+            refs = re.findall(r"@tab(\d+)", user_text or "")
+            if refs:
+                n = int(refs[0])
+                if 1 <= n <= len(tabs):
+                    chosen_text = tabs[n - 1].get("text") or ""
+                    chosen_title = tabs[n - 1].get("title") or f"tab {n}"
+                else:
+                    tab_note += (f"\n(The person mentioned @tab{n}, but "
+                                 f"there are only {len(tabs)} tabs — "
+                                 "say so plainly.)")
+            messages.append({"role": "system", "content": tab_note})
+        elif re.search(r"@tab\d+", user_text or ""):
             messages.append({"role": "system",
-                             "content": "Text of the page the user is "
-                                        f"looking at:\n{page_text[:PAGE_CAP]}"})
+                             "content": "The person mentioned a tab (@tabN), "
+                                        "but this chat has no tabs — say so plainly."})
+        if chosen_text:
+            label = "Text of the page the user is looking at"
+            if chosen_title:
+                label = f"Text of {chosen_title} (the tab the user named)"
+            messages.append({"role": "system",
+                             "content": f"{label}:\n"
+                                        f"{page_context(self, user_text, chosen_text)}"})
         messages.extend(self.history[-HISTORY_CAP:])
         messages.append({"role": "user", "content": user_text})
         open_requests = []
@@ -249,12 +283,12 @@ class ChatSession:
                 elif kind == "research":
                     result = _run_research(str(action.get("topic", "") or user_text))
                 elif kind == "read_page":
-                    result = (page_text or "No page text is available "
+                    result = (chosen_text or "No page text is available "
                               "in this chat.")[:RESULT_CAP]
                 elif kind == "summarize":
-                    if page_text:
+                    if chosen_text:
                         from .summarize import summarize_page
-                        result = summarize_page(self, page_text)
+                        result = summarize_page(self, chosen_text)
                     else:
                         result = ("No page text is available in this chat — "
                                   "open a page in the window first.")
