@@ -50,10 +50,14 @@ def create_window(server, profile, start_url=None):
     from .webui import resolve_address
 
     class Window(QtWidgets.QMainWindow):
+        tidy_done = QtCore.Signal(object, str, str)  # view, url, tidy title
+
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Forge Browser")
             self.resize(1240, 820)
+            self._tidy_cache = {}  # url -> tidy title, so a revisit never re-asks
+            self.tidy_done.connect(self._apply_tidy_title)
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.setTabsClosable(True)
             self.tabs.setMovable(True)
@@ -86,7 +90,8 @@ def create_window(server, profile, start_url=None):
             view.setPage(QWebEnginePage(profile, view))
             view.urlChanged.connect(lambda *a: self._sync_address())
             view.titleChanged.connect(lambda t: self._set_tab_title(view, t))
-            view.loadFinished.connect(lambda *a: self._sync_address())
+            view.loadFinished.connect(
+                lambda *a, view=view: self._on_load_finished(view))
             index = self.tabs.addTab(view, "New Tab")
             self.tabs.setCurrentIndex(index)
             view.load(QtCore.QUrl(url or server.home_url))
@@ -94,8 +99,39 @@ def create_window(server, profile, start_url=None):
 
         def _set_tab_title(self, view, title):
             index = self.tabs.indexOf(view)
-            if index >= 0:
-                self.tabs.setTabText(index, (title or "Page")[:28])
+            if index < 0:
+                return
+            self.tabs.setTabText(index, (title or "Page")[:28])
+            # Long, messy titles get a short brain-written one in the
+            # background; the raw title shows until it lands.
+            session = getattr(self, "_chat_session", None)
+            url = view.url().toString()
+            if session is None or not url or url.startswith("http://127.0.0.1"):
+                return
+            if url in self._tidy_cache:
+                self.tabs.setTabText(index, self._tidy_cache[url])
+                return
+            raw = (title or "").strip()
+            if len(raw) <= 28 and len(raw.split()) <= 5:
+                return
+            threading.Thread(target=self._tidy_in_background,
+                             args=(view, url, raw), daemon=True).start()
+
+        def _tidy_in_background(self, view, url, raw):
+            from .titles import tidy_title
+            tidy = tidy_title(self._chat_session, raw, url)
+            self._tidy_cache[url] = tidy
+            self.tidy_done.emit(view, url, tidy)
+
+        def _apply_tidy_title(self, view, url, tidy):
+            index = self.tabs.indexOf(view)
+            if index >= 0 and view.url().toString() == url:
+                self.tabs.setTabText(index, tidy)
+
+        def _on_load_finished(self, view):
+            self._sync_address()
+            from .titles import record_visit
+            record_visit(view.url().toString(), view.title())
 
         def _close_tab(self, index):
             if self.tabs.count() > 1:
@@ -146,6 +182,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     signals = Signals()
     model = pick_chat_model()
     session = ChatSession(model=model)
+    window._chat_session = session  # tab titles tidy against this brain
 
     dock = QtWidgets.QDockWidget("Chat — talk to your browser", window)
     panel = QtWidgets.QWidget()

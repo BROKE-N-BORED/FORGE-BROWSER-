@@ -551,6 +551,80 @@ class CardsTests(unittest.TestCase):
         self.assertIn("research-topic", out.getvalue())
 
 
+class TitlesTests(unittest.TestCase):
+    def test_tidy_title_trims_brain_ramble(self):
+        from forge.browser.titles import tidy_title
+        session = chat.ChatSession(model="fake:1b")
+        session._chat = lambda messages, on_chunk=None: (
+            "The Best Gears In The Whole Wide World Today")
+        self.assertEqual(
+            tidy_title(session,
+                       "The Best Gears In The Whole Wide World Today | Shop",
+                       "http://x.example"),
+            "The Best Gears In The")
+
+    def test_tidy_title_falls_back_without_brain(self):
+        from forge.browser.titles import tidy_title
+        session = chat.ChatSession(model="fake:1b")
+
+        def boom(messages, on_chunk=None):
+            raise BrowserError("down")
+
+        session._chat = boom
+        long_title = "A Very Long Messy Page Title That Goes On And On | Example Site"
+        self.assertEqual(tidy_title(session, long_title), long_title[:40])
+
+    def test_group_items_by_embedding(self):
+        from forge.browser.titles import group_items
+        items = [
+            {"title": "Gears", "url": "http://a.example/1"},
+            {"title": "Wheels", "url": "http://b.example/2"},
+            {"title": "Soup", "url": "http://c.example/3"},
+        ]
+
+        def fake_embed(texts):
+            return [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]
+
+        groups = group_items(items, embed_fn=fake_embed)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual([i["title"] for i in groups[0]["items"]],
+                         ["Gears", "Wheels"])
+        self.assertEqual([i["title"] for i in groups[1]["items"]], ["Soup"])
+
+    def test_group_items_falls_back_to_domain(self):
+        from forge.browser.titles import group_items
+        items = [
+            {"title": "One", "url": "http://shop.example/a"},
+            {"title": "Two", "url": "http://shop.example/b"},
+            {"title": "Three", "url": "http://news.example/c"},
+        ]
+        groups = group_items(items)
+        self.assertEqual([g["name"] for g in groups],
+                         ["shop.example", "news.example"])
+
+    def test_history_records_dedups_and_groups(self):
+        from forge.browser import titles as titles_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_HISTORY_PATH")
+            os.environ["FORGE_BROWSER_HISTORY_PATH"] = os.path.join(tmp, "h.json")
+            try:
+                titles_module.record_visit("http://shop.example/a", "Shop A")
+                titles_module.record_visit("http://news.example/b", "News B")
+                titles_module.record_visit("http://shop.example/a", "Shop A Again")
+                entries = titles_module.load_history()
+                self.assertEqual(len(entries), 2)
+                self.assertEqual(entries[0]["url"], "http://shop.example/a")
+                self.assertEqual(entries[0]["title"], "Shop A Again")
+                groups = titles_module.grouped_history()
+                self.assertEqual([g["name"] for g in groups],
+                                 ["shop.example", "news.example"])
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_HISTORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_HISTORY_PATH"] = old
+
+
 class SessionTests(unittest.TestCase):
     def make_session(self, replies):
         session = chat.ChatSession(model="fake:1b")
@@ -614,6 +688,37 @@ class SessionTests(unittest.TestCase):
         system_texts = [m["content"] for m in first_call if m["role"] == "system"]
         self.assertTrue(any("has no tabs" in t for t in system_texts))
         self.assertEqual(answer, "No tabs here.")
+
+    def test_tab_list_groups_related_tabs(self):
+        from forge.browser import retrieve as retrieve_module
+        session = self.make_session(["grouped answer"])
+        original = retrieve_module.embed_texts
+
+        def fake_embed(texts, model=None):
+            return [[1.0, 0.0] if "gear" in t.lower() or "wheel" in t.lower()
+                    else [0.0, 1.0] for t in texts]
+
+        retrieve_module.embed_texts = fake_embed
+        try:
+            tabs = [
+                {"title": "Gears", "url": "http://a.example/1",
+                 "text": "gears", "current": True},
+                {"title": "Wheels", "url": "http://b.example/2",
+                 "text": "wheels", "current": False},
+                {"title": "Soup", "url": "http://c.example/3",
+                 "text": "soup", "current": False},
+            ]
+            answer, _opens = session.ask("what is open", tabs=tabs)
+        finally:
+            retrieve_module.embed_texts = original
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        tab_note = [t for t in system_texts if t.startswith("Open tabs:")][0]
+        self.assertIn("Group:", tab_note)
+        self.assertIn("1. Gears", tab_note)
+        self.assertIn("2. Wheels", tab_note)
+        self.assertIn("3. Soup", tab_note)
+        self.assertEqual(answer, "grouped answer")
 
     def test_plain_answer(self):
         session = self.make_session(["Hello yourself."])

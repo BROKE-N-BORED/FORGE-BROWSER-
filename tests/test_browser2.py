@@ -654,6 +654,26 @@ class WebUITests(unittest.TestCase):
         finally:
             webui.keyless_search = original
 
+    def test_start_page_shows_grouped_history(self):
+        from forge.browser import titles as titles_module
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_HISTORY_PATH")
+            os.environ["FORGE_BROWSER_HISTORY_PATH"] = os.path.join(tmp, "h.json")
+            try:
+                titles_module.record_visit("http://shop.example/a", "Shop A")
+                titles_module.record_visit("http://news.example/b", "News B")
+                page = webui.start_page()
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_HISTORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_HISTORY_PATH"] = old
+        self.assertIn("Recent", page)
+        self.assertIn("shop.example", page)
+        self.assertIn("Shop A", page)
+        self.assertIn("http://shop.example/a", page)
+
     def test_app_without_qt_says_how_to_fix(self):
         try:
             import PySide6  # noqa: F401

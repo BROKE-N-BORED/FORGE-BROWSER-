@@ -40,7 +40,21 @@ a:hover { text-decoration: underline; }
 
 
 def start_page():
+    from .titles import grouped_history
     status = html.escape(engines.format_status(engines.engine_status()))
+    recent = ""
+    groups = grouped_history()
+    if groups:
+        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Recent</h2>']
+        for group in groups[:4]:
+            parts.append(f'<p style="color:#9a958a;margin:12px 0 4px;">'
+                         f'{html.escape(group["name"])}</p>')
+            for entry in group["items"][:4]:
+                parts.append(
+                    f'<div class="result"><a class="t" href="{html.escape(entry["url"])}">'
+                    f"{html.escape(entry.get('title') or entry['url'])}</a>"
+                    f'<div class="u">{html.escape(entry["url"])}</div></div>')
+        recent = "\n".join(parts)
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
@@ -50,6 +64,7 @@ def start_page():
 <input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
 <button type="submit">Search</button>
 </form>
+{recent}
 <div class="status">{status}</div>
 </div></body></html>"""
 

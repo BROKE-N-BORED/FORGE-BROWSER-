@@ -64,9 +64,17 @@ Joshua's real PC.
 - [ ] **#7 — Cross-tab compare [M].** "Compare these three" → extract the same
   fields (price, specs) from each tab in separate tiny calls, render the table
   in the window. Never one giant prompt.
-- [ ] **#8 — Tidy titles + tab grouping [M].** Fast seat renames messy titles;
+- [~] **#8 — Tidy titles + tab grouping [M].** Fast seat renames messy titles;
   tabs grouped by topic using embeddings; history grouped into resumable
   "journeys".
+  *(Built 2026-11-11: new forge/browser/titles.py — tidy_title (brain,
+  2–5 words, raw fallback), group_items (embedding cosine ≥0.75, domain
+  fallback), history at ~/.forge/history.json (deduped, 200 entries);
+  tabs tidy in the background on titleChanged (URL-cached, local pages
+  skipped); chat's @tab list shows embedding groups; start page shows a
+  Recent section grouped by site. Suite 102/102; stub E2E (tidy + grouped
+  tab note); offscreen Qt smoke — long title became "Gears Guide" in the
+  real tab bar. Real-PC verdict open.)*
 
 ## C. Doing features (scoped hard, on purpose)
 

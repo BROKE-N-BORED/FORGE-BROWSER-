@@ -175,6 +175,7 @@ class ChatSession:
         self.model = model if model is not None else pick_chat_model()
         self.history = []
         self._retrieve_cache = {}  # page hash -> (chunks, embeddings)
+        self._tab_groups_cache = {}  # (title, url) tuple -> grouped tabs
 
     def _chat(self, messages, on_chunk=None):
         """One brain call. Without on_chunk this waits for the
@@ -232,11 +233,23 @@ class ChatSession:
         chosen_text = page_text
         chosen_title = None
         if tabs:
+            from .retrieve import embed_texts
+            from .titles import group_items
+            cache_key = tuple((t.get("title") or "", t.get("url") or "")
+                              for t in tabs)
+            groups = self._tab_groups_cache.get(cache_key)
+            if groups is None:
+                groups = group_items(tabs, embed_fn=embed_texts)
+                self._tab_groups_cache = {cache_key: groups}
+            pos = {id(tab): i + 1 for i, tab in enumerate(tabs)}
             lines = []
-            for i, tab in enumerate(tabs, 1):
-                marker = " (current)" if tab.get("current") else ""
-                lines.append(f"{i}. {tab.get('title') or 'Untitled'} — "
-                             f"{tab.get('url') or ''}{marker}")
+            for group in groups:
+                if len(groups) > 1:
+                    lines.append(f"Group: {group['name']}")
+                for tab in group["items"]:
+                    marker = " (current)" if tab.get("current") else ""
+                    lines.append(f"{pos[id(tab)]}. {tab.get('title') or 'Untitled'} — "
+                                 f"{tab.get('url') or ''}{marker}")
             tab_note = "Open tabs:\n" + "\n".join(lines)
             refs = re.findall(r"@tab(\d+)", user_text or "")
             if refs:
