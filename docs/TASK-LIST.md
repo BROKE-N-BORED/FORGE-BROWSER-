@@ -23,8 +23,14 @@ Joshua's real PC.
   `num_ctx 8192` on every chat call. Highest value-per-line on the list.
   *(Built 2026-11-11: suite 55/55, stub-Ollama E2E confirmed the pick order
   and `think: false` + `num_ctx 8192` on the wire. Real-PC verdict open.)*
-- [ ] **#2 — Streamed answers [S].** Ollama streaming into the chat dock so
+- [~] **#2 — Streamed answers [S].** Ollama streaming into the chat dock so
   words appear as they're generated instead of one long wait.
+  *(Built 2026-11-11: `_chat` streams NDJSON when given on_chunk, `ask`
+  passes it through, dock + terminal CLI show words live via a LiveDisplay
+  filter that holds partial lines and drops ACTION lines. Suite 61/61;
+  stub E2E proved incremental delivery (6 chunks over 1.80 s) + payload;
+  offscreen Qt smoke drove the real dock — answer once, no ACTION leak.
+  Real-PC verdict open.)*
 - [ ] **#3 — Chunk-and-retrieve page feeding [M].** Chunk the current page
   (200–400 tokens), embed with nomic-embed-text, retrieve only the chunks that
   match the question. What makes "chat with my tabs" actually work at 8k context.

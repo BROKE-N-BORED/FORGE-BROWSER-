@@ -110,6 +110,32 @@ def visible_text(text):
     return "\n".join(lines).strip()
 
 
+class LiveDisplay:
+    """Incrementally filters streamed reply text for display.
+
+    Holds partial lines until they end, and drops ACTION lines —
+    the person sees the brain's words as they arrive, not the
+    one-line action protocol. feed() returns the displayable
+    text for a chunk; flush() returns any held remainder."""
+    def __init__(self):
+        self.buf = ""
+
+    def feed(self, delta):
+        self.buf += delta or ""
+        out = []
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            if not line.strip().startswith("ACTION"):
+                out.append(line + "\n")
+        return "".join(out)
+
+    def flush(self):
+        line, self.buf = self.buf, ""
+        if line and not line.strip().startswith("ACTION"):
+            return line
+        return ""
+
+
 # --- engine hands (wrapped so tests can stand in) -----------------
 
 def _run_search(query):
@@ -142,7 +168,13 @@ class ChatSession:
         self.model = model if model is not None else pick_chat_model()
         self.history = []
 
-    def _chat(self, messages):
+    def _chat(self, messages, on_chunk=None):
+        """One brain call. Without on_chunk this waits for the
+        whole reply (stream False). With on_chunk, Ollama streams
+        NDJSON lines and each content piece is handed to on_chunk
+        as it arrives, so words appear while they are generated —
+        at 3–6 tok/s, waiting for the full answer feels broken.
+        Returns the full reply text either way."""
         if not self.model:
             raise BrowserError(
                 "No chat brain: no local model is answering at "
@@ -152,20 +184,38 @@ class ChatSession:
         # slow speed before any answer appears. num_ctx capped at
         # 8192 (see CHAT_NUM_CTX) — the listed 256K would not fit.
         payload = json.dumps({"model": self.model, "messages": messages,
-                              "stream": False, "think": False,
+                              "stream": on_chunk is not None, "think": False,
                               "options": {"num_ctx": CHAT_NUM_CTX}}).encode("utf-8")
         request = urllib.request.Request(
             OLLAMA_URL + "/api/chat", data=payload,
             headers={"Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(request, timeout=240) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                if on_chunk is None:
+                    data = json.loads(response.read().decode("utf-8"))
+                    return (data.get("message") or {}).get("content", "")
+                text = []
+                while True:
+                    line = response.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = json.loads(line.decode("utf-8"))
+                    except ValueError:
+                        continue
+                    content = (data.get("message") or {}).get("content") or ""
+                    if content:
+                        text.append(content)
+                        on_chunk(content)
+                return "".join(text)
         except Exception as exc:
             raise BrowserError(
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
-        return (data.get("message") or {}).get("content", "")
 
-    def ask(self, user_text, page_text=None, on_action=None):
+    def ask(self, user_text, page_text=None, on_action=None, on_chunk=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs)."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if page_text:
@@ -177,7 +227,7 @@ class ChatSession:
         open_requests = []
         answer = ""
         for _ in range(MAX_ACTIONS + 1):
-            reply = self._chat(messages)
+            reply = self._chat(messages, on_chunk)
             messages.append({"role": "assistant", "content": reply})
             action = parse_action(reply)
             if action is None:

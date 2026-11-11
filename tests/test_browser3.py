@@ -99,6 +99,74 @@ class ChatCallTests(unittest.TestCase):
         self.assertIs(seen["data"]["think"], False)
         self.assertEqual(seen["data"]["options"], {"num_ctx": 8192})
 
+    def test_streaming_delivers_chunks_in_order(self):
+        import json as _json
+        import urllib.request as _urlreq
+        seen = {}
+        lines = [
+            b'{"message": {"content": "Hel"}}\n',
+            b'\n',
+            b'{"message": {"content": "lo "}}\n',
+            b'{"message": {"content": "world"}}\n',
+            b'{"done": true}\n',
+            b'\n',
+        ]
+
+        class StreamResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def readline(self):
+                return lines.pop(0) if lines else b""
+
+        original = _urlreq.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            seen["data"] = _json.loads(request.data.decode("utf-8"))
+            return StreamResp()
+
+        _urlreq.urlopen = fake_urlopen
+        chunks = []
+        try:
+            session = chat.ChatSession(model="qwen3.5:4b")
+            result = session._chat([{"role": "user", "content": "hi"}],
+                                   on_chunk=chunks.append)
+        finally:
+            _urlreq.urlopen = original
+        self.assertEqual(result, "Hello world")
+        self.assertEqual(chunks, ["Hel", "lo ", "world"])
+        self.assertIs(seen["data"]["stream"], True)
+        self.assertIs(seen["data"]["think"], False)
+        self.assertEqual(seen["data"]["options"], {"num_ctx": 8192})
+
+
+class LiveDisplayTests(unittest.TestCase):
+    def test_action_lines_never_shown(self):
+        display = chat.LiveDisplay()
+        self.assertEqual(display.feed('Let me look.\nACTION {"type": "search"}\n'), "Let me look.\n")
+        self.assertEqual(display.flush(), "")
+
+    def test_partial_line_held_until_newline(self):
+        display = chat.LiveDisplay()
+        self.assertEqual(display.feed("Hel"), "")
+        self.assertEqual(display.feed("lo world"), "")
+        self.assertEqual(display.feed("\nnext"), "Hello world\n")
+        self.assertEqual(display.flush(), "next")
+
+    def test_action_line_split_across_chunks(self):
+        display = chat.LiveDisplay()
+        self.assertEqual(display.feed('ACT'), "")
+        self.assertEqual(display.feed('ION {"type": "open"}\nDone.'), "")
+        self.assertEqual(display.flush(), "Done.")
+
+    def test_plain_text_passes_through(self):
+        display = chat.LiveDisplay()
+        self.assertEqual(display.feed("one\ntwo\n"), "one\ntwo\n")
+        self.assertEqual(display.flush(), "")
+
 
 class SessionTests(unittest.TestCase):
     def make_session(self, replies):
@@ -106,13 +174,28 @@ class SessionTests(unittest.TestCase):
         queue = list(replies)
         seen = []
 
-        def fake_chat(messages):
+        def fake_chat(messages, on_chunk=None):
             seen.append([dict(m) for m in messages])
             return queue.pop(0)
 
         session._chat = fake_chat
         session.seen = seen
         return session
+
+    def test_ask_passes_on_chunk_through(self):
+        session = self.make_session(["done"])
+        received = []
+        original_chat = session._chat
+
+        def spy(messages, on_chunk=None):
+            received.append(on_chunk)
+            return original_chat(messages, on_chunk)
+
+        session._chat = spy
+        marker = lambda delta: None
+        answer, _opens = session.ask("hi", on_chunk=marker)
+        self.assertEqual(answer, "done")
+        self.assertEqual(received, [marker])
 
     def test_plain_answer(self):
         session = self.make_session(["Hello yourself."])

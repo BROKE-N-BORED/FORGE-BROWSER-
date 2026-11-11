@@ -122,11 +122,11 @@ def create_window(server, profile, start_url=None):
                 view.load(QtCore.QUrl(target))
 
     window = Window()
-    _attach_chat(window, QtCore, QtWidgets)
+    _attach_chat(window, QtCore, QtGui, QtWidgets)
     return window
 
 
-def _attach_chat(window, QtCore, QtWidgets):
+def _attach_chat(window, QtCore, QtGui, QtWidgets):
     """The AI part: a chat dock wired to a local-model ChatSession.
 
     The person types plain language; the brain searches/opens/
@@ -134,11 +134,12 @@ def _attach_chat(window, QtCore, QtWidgets):
     and answers from what it found. No brain (Ollama down) leaves
     the browser fully usable — the dock just says so.
     """
-    from .chat import ChatSession, pick_chat_model
+    from .chat import ChatSession, LiveDisplay, pick_chat_model
 
     class Signals(QtCore.QObject):
         notice = QtCore.Signal(str)
         open_url = QtCore.Signal(str)
+        token = QtCore.Signal(str)
         answer = QtCore.Signal(str)
         failed = QtCore.Signal(str)
 
@@ -172,7 +173,7 @@ def _attach_chat(window, QtCore, QtWidgets):
         send.setEnabled(False)
         return
 
-    state = {"busy": False}
+    state = {"busy": False, "live": False}
 
     def append(who, text):
         log.append(f"<b>{who}:</b> {text}")
@@ -183,18 +184,57 @@ def _attach_chat(window, QtCore, QtWidgets):
         entry.setEnabled(True)
         entry.setFocus()
 
+    def on_token(text):
+        # Streamed words appear as they are generated. The first
+        # token of a turn opens the "Forge Browser:" paragraph;
+        # later tokens keep flowing onto the same line.
+        if not text:
+            return
+        if not state["live"]:
+            state["live"] = True
+            log.append("<b>Forge Browser:</b> ")
+        log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
+        log.insertPlainText(text)
+
+    def on_answer(text):
+        if state["live"]:
+            # The answer already streamed into the log line by line;
+            # re-printing it would duplicate it.
+            state["live"] = False
+            finish()
+        else:
+            append("Forge Browser", text)
+            finish()
+
+    def on_failed(text):
+        state["live"] = False
+        append("Forge Browser", f"⚠ {text}")
+        finish()
+
     signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
     signals.open_url.connect(lambda url: window.new_tab(url))
-    signals.answer.connect(lambda text: (append("Forge Browser", text), finish()))
-    signals.failed.connect(lambda text: (append("Forge Browser", f"⚠ {text}"), finish()))
+    signals.token.connect(on_token)
+    signals.answer.connect(on_answer)
+    signals.failed.connect(on_failed)
 
     def work(text, page_text):
+        display = LiveDisplay()
+
+        def on_chunk(delta):
+            shown = display.feed(delta)
+            if shown:
+                signals.token.emit(shown)
+
         try:
             answer, opens = session.ask(
                 text, page_text=page_text,
-                on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"))
+                on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
+                on_chunk=on_chunk)
             for url in opens:
                 signals.open_url.emit(url)
+            rest = display.flush()
+            if rest:
+                signals.token.emit(rest)
             signals.answer.emit(answer or "(no answer)")
         except Exception as exc:
             signals.failed.emit(str(exc))
@@ -204,6 +244,7 @@ def _attach_chat(window, QtCore, QtWidgets):
         if not text or state["busy"]:
             return
         state["busy"] = True
+        state["live"] = False
         send.setEnabled(False)
         entry.setEnabled(False)
         entry.clear()

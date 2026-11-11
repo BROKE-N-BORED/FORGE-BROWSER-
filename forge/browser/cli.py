@@ -233,7 +233,7 @@ def _cmd_vault(args):
 
 
 def _cmd_chat(args):
-    from .chat import ChatSession
+    from .chat import ChatSession, LiveDisplay
     session = ChatSession()
     print(f"Forge Browser chat — brain: {session.model or 'none'} "
           "(type quit to leave)")
@@ -247,15 +247,28 @@ def _cmd_chat(args):
             return 0
         if not text:
             continue
+        display = LiveDisplay()
+
+        def on_chunk(delta):
+            shown = display.feed(delta)
+            if shown:
+                print(shown, end="", flush=True)
+
         try:
-            answer, opens = session.ask(
-                text, on_action=lambda kind, a: print(f"  … {kind}"))
+            _answer, opens = session.ask(
+                text, on_action=lambda kind, a: print(f"  … {kind}"),
+                on_chunk=on_chunk)
         except Exception as exc:
             print(f"forge browser: {exc}")
             continue
+        # The answer already streamed above, line by line; only
+        # the held remainder is left to print.
+        rest = display.flush()
+        if rest:
+            print(rest, end="", flush=True)
+        print()
         for url in opens:
             print(f"  (open in a tab in the window: {url})")
-        print(f"browser> {answer}")
 
 
 def _cmd_app(args):
