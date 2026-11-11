@@ -29,6 +29,19 @@ MAX_ACTIONS = 3          # per user message — keeps small models on rails
 RESULT_CAP = 4500        # chars of engine output handed to the model
 PAGE_CAP = 6000          # chars of the current page handed to the model
 HISTORY_CAP = 12         # messages kept (plus the system prompt)
+CHAT_NUM_CTX = 8192      # working context for the chat brain — never the
+                         # 256K the model lists; the KV cache would eat the
+                         # machine (Ryzen 3 / 8 GB)
+
+# Ordered brain preference (task #1): each entry is the substrings a model
+# name must contain, in order. qwen3.5:4b first — tools + vision in one
+# model, so no second model ever has to load. Then qwen3:4b (the
+# -instruct-2507 variant included), then the 1.7B fast seat.
+_CHAT_PREFERENCE = (
+    ("qwen3.5", "4b"),
+    ("qwen3", "4b"),
+    ("qwen3", "1.7b"),
+)
 
 _PREFERRED = ("qwen", "llama", "gemma", "phi", "mistral", "minicpm",
               "deepseek", "smol", "tinyllama")
@@ -56,15 +69,21 @@ def list_models():
 
 
 def pick_chat_model(models=None):
-    """Which local model drives the chat. Env wins; then a
-    chat-shaped name; then whatever is there. None = no brain."""
+    """Which local model drives the chat. Env wins; then the
+    ordered preference (qwen3.5:4b → qwen3:4b → qwen3:1.7b);
+    then any chat-shaped name; then whatever is there.
+    None = no brain."""
     if models is None:
         models = list_models()
     wanted = os.environ.get("FORGE_BROWSER_CHAT_MODEL", "").strip()
     if wanted:
         return wanted
-    for name in models:
-        low = name.lower()
+    lowered = [(name, name.lower()) for name in models]
+    for parts in _CHAT_PREFERENCE:
+        for name, low in lowered:
+            if "embed" not in low and all(part in low for part in parts):
+                return name
+    for name, low in lowered:
         if "embed" not in low and any(hint in low for hint in _PREFERRED):
             return name
     return models[0] if models else None
@@ -129,8 +148,12 @@ class ChatSession:
                 "No chat brain: no local model is answering at "
                 f"{OLLAMA_URL}. Start Ollama (and pull a small chat "
                 "model), then try again — browsing itself still works.")
+        # Thinking OFF: every think-token is generated at the same
+        # slow speed before any answer appears. num_ctx capped at
+        # 8192 (see CHAT_NUM_CTX) — the listed 256K would not fit.
         payload = json.dumps({"model": self.model, "messages": messages,
-                              "stream": False}).encode("utf-8")
+                              "stream": False, "think": False,
+                              "options": {"num_ctx": CHAT_NUM_CTX}}).encode("utf-8")
         request = urllib.request.Request(
             OLLAMA_URL + "/api/chat", data=payload,
             headers={"Content-Type": "application/json"})

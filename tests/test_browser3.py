@@ -35,6 +35,24 @@ class PickModelTests(unittest.TestCase):
         models = ["nomic-embed-text", "qwen3:4b", "llama3.2:3b"]
         self.assertEqual(chat.pick_chat_model(models), "qwen3:4b")
 
+    def test_qwen35_4b_wins_over_qwen3_4b(self):
+        # Preference order beats list order: the brain+vision model first.
+        models = ["qwen3:4b", "qwen3.5:4b", "llama3.2:3b"]
+        self.assertEqual(chat.pick_chat_model(models), "qwen3.5:4b")
+
+    def test_4b_wins_over_17b(self):
+        models = ["qwen3:1.7b", "qwen3:4b"]
+        self.assertEqual(chat.pick_chat_model(models), "qwen3:4b")
+
+    def test_instruct_variant_counts_as_4b(self):
+        models = ["qwen3:4b-instruct-2507", "llama3.2:3b"]
+        self.assertEqual(chat.pick_chat_model(models),
+                         "qwen3:4b-instruct-2507")
+
+    def test_family_fallback_when_no_preferred_match(self):
+        models = ["llama3.2:3b", "gemma3:4b"]
+        self.assertEqual(chat.pick_chat_model(models), "llama3.2:3b")
+
     def test_none_when_empty(self):
         self.assertIsNone(chat.pick_chat_model([]))
 
@@ -44,6 +62,42 @@ class PickModelTests(unittest.TestCase):
             self.assertEqual(chat.pick_chat_model(["qwen3:4b"]), "my-model:7b")
         finally:
             del os.environ["FORGE_BROWSER_CHAT_MODEL"]
+
+
+class ChatCallTests(unittest.TestCase):
+    def test_call_disables_thinking_and_caps_context(self):
+        import json as _json
+        import urllib.request as _urlreq
+        seen = {}
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return _json.dumps(
+                    {"message": {"content": "hi"}}).encode("utf-8")
+
+        original = _urlreq.urlopen
+
+        def fake_urlopen(request, timeout=None):
+            seen["data"] = _json.loads(request.data.decode("utf-8"))
+            return Resp()
+
+        _urlreq.urlopen = fake_urlopen
+        try:
+            session = chat.ChatSession(model="qwen3.5:4b")
+            self.assertEqual(
+                session._chat([{"role": "user", "content": "hi"}]), "hi")
+        finally:
+            _urlreq.urlopen = original
+        self.assertEqual(seen["data"]["model"], "qwen3.5:4b")
+        self.assertIs(seen["data"]["stream"], False)
+        self.assertIs(seen["data"]["think"], False)
+        self.assertEqual(seen["data"]["options"], {"num_ctx": 8192})
 
 
 class SessionTests(unittest.TestCase):
