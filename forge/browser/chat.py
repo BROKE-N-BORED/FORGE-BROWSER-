@@ -82,6 +82,9 @@ When the person asks for the morning brief, use the brief action.
 When the person asks to compare tabs, use the compare action with
 the tab numbers and the fields to compare (price, specs, whatever
 they named).
+Research runs in the background while the person keeps browsing —
+when you start it, say so plainly and that the report will open
+when it is done; expect minutes, not seconds.
 Your first action each turn is shown to the person as a plan for
 approval before it runs, and anything that changes what is
 remembered asks again — so propose one clear step at a time,
@@ -154,7 +157,8 @@ def describe_action(kind, action):
     if kind == "open":
         return f"Open {action.get('url', '')} in a new tab"
     if kind == "research":
-        return f"Research \"{action.get('topic', '')}\" across several pages"
+        return (f"Research \"{action.get('topic', '')}\" in the background "
+                f"(the report opens when it is done)")
     if kind == "read_page":
         return "Read the text of the current page"
     if kind == "summarize":
@@ -299,7 +303,8 @@ class ChatSession:
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
 
     def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
-            tabs=None, page_url=None, on_plan=None, on_table=None):
+            tabs=None, page_url=None, on_plan=None, on_table=None,
+            on_progress=None, on_research_done=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs).
         tabs: [{title, url, text, current}] in visible order, for @tabN.
         on_plan(plan_text) -> bool gates the work: the first action
@@ -307,7 +312,9 @@ class ChatSession:
         (remember/forget) ask again each time. None = no gate
         (tests and programmatic use); the window and the CLI pass
         one. on_table(html) receives a comparison table to render
-        in the window. cancel() stops the turn at the next step boundary."""
+        in the window. on_progress(text) carries research progress;
+        on_research_done(report, sources, error) delivers the
+        finished report. cancel() stops the turn at the next step boundary."""
         self._stop_requested = False
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         # Memory: what the person asked to be remembered, when it is
@@ -412,7 +419,26 @@ class ChatSession:
                     if url:
                         open_requests.append(url)
                 elif kind == "research":
-                    result = _run_research(str(action.get("topic", "") or user_text))
+                    # Research runs in the background — the turn does
+                    # not wait minutes for it. Cards still use the
+                    # synchronous _run_research (they need the report).
+                    from .research import research_job_running, start_research_job
+                    topic = str(action.get("topic", "") or user_text)
+                    running = research_job_running()
+                    if running:
+                        result = (f"A research job is already running on "
+                                  f"{running} — wait for it to finish "
+                                  "before starting another.")
+                    else:
+                        start_research_job(
+                            topic, on_progress=on_progress,
+                            on_done=(lambda report, sources, error=None: (
+                                on_research_done(report, sources, error)
+                                if on_research_done else None)))
+                        result = (f"Research on {topic!r} started in the "
+                                  "background — it runs while you browse, "
+                                  "and the report opens when it is done. "
+                                  "Expect minutes, not seconds.")
                 elif kind == "read_page":
                     result = (chosen_text or "No page text is available "
                               "in this chat.")[:RESULT_CAP]

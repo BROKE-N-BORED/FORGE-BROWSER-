@@ -283,6 +283,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         voice_text = QtCore.Signal(str)
         plan = QtCore.Signal(str, object)  # plan text, {"event", "approved"}
         compare_table = QtCore.Signal(str)  # comparison table HTML
+        progress = QtCore.Signal(str)  # research progress line
+        research_done = QtCore.Signal(object, object, object)  # report, sources, error
 
     signals = Signals()
     model = pick_chat_model()
@@ -312,6 +314,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     log = QtWidgets.QTextEdit()
     log.setReadOnly(True)
     layout.addWidget(log)
+    progress_label = QtWidgets.QLabel("")
+    progress_label.setObjectName("research_progress")
+    progress_label.setWordWrap(True)
+    layout.addWidget(progress_label)
     row = QtWidgets.QHBoxLayout()
     entry = QtWidgets.QLineEdit()
     entry.setPlaceholderText("Ask for a page, a search, a summary…")
@@ -381,6 +387,19 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
     signals.open_url.connect(lambda url: window.new_tab(url, agent=True))
     signals.compare_table.connect(lambda html: window.new_tab(html=html))
+    signals.progress.connect(progress_label.setText)
+
+    def on_research_done(report, sources, error):
+        if error:
+            append("Forge Browser", f"⚠ Research failed: {error}")
+            progress_label.setText("Research failed.")
+            return
+        from .research import report_to_html
+        window.new_tab(html=report_to_html(report))
+        append("Forge Browser", "Research done — the report opened in a new tab.")
+        progress_label.setText("Research done.")
+
+    signals.research_done.connect(on_research_done)
     signals.token.connect(on_token)
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
@@ -478,7 +497,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 text, page_text=page_text, tabs=tabs, page_url=page_url,
                 on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
                 on_chunk=on_chunk, on_plan=ask_plan,
-                on_table=lambda html: signals.compare_table.emit(html))
+                on_table=lambda html: signals.compare_table.emit(html),
+                on_progress=lambda text: signals.progress.emit(text),
+                on_research_done=lambda report, sources, error=None:
+                    signals.research_done.emit(report, sources, error))
             for url in opens:
                 signals.open_url.emit(url)
             rest = display.flush()

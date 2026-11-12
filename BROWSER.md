@@ -91,6 +91,16 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Research as a background job
+
+Ask for research in chat and the turn ends at once — the job
+runs behind your browsing, strictly one at a time, with a
+progress line in the dock ("Reading 2 of 6: …"). Expect minutes,
+not seconds. When it finishes, the report opens in its own tab
+and the dock says so. If a job is already running, the next ask
+is told to wait. The terminal `research` command still runs a
+plan synchronously, the way it always has.
+
 ## Cross-tab compare
 
 Say "compare these three" (or "compare @tab1 @tab2 on price") and

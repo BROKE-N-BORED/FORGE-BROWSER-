@@ -262,10 +262,20 @@ def _cmd_chat(args):
                 return False
             return reply in ("y", "yes")
 
+        def on_progress(text):
+            print(f"  [research] {text}", flush=True)
+
+        def on_research_done(report, sources, error=None):
+            if error:
+                print(f"\n[research failed] {error}")
+            else:
+                print(f"\n[research done]\n{report}")
+
         try:
             _answer, opens = session.ask(
                 text, on_action=lambda kind, a: print(f"  … {kind}"),
-                on_chunk=on_chunk, on_plan=ask_plan)
+                on_chunk=on_chunk, on_plan=ask_plan,
+                on_progress=on_progress, on_research_done=on_research_done)
         except Exception as exc:
             print(f"forge browser: {exc}")
             continue

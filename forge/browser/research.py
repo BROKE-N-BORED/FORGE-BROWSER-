@@ -24,9 +24,16 @@ Follows the Research-mode shape Joshua ordered on 2026-11-09
    invents findings.
 """
 
+import html
+import re
+import threading
+
 from .errors import BrowserError
 from .files import fetch_any
 from .search import search
+
+_JOB_LOCK = threading.Lock()
+_CURRENT_JOB = {"topic": None}
 
 
 def make_plan(topic, queries=None, max_pages=6):
@@ -55,11 +62,14 @@ def format_plan(plan):
 
 
 def run_research(plan, approved=False, max_chars_per_source=4000,
-                 search_fn=search, fetch_fn=fetch_any):
+                 search_fn=search, fetch_fn=fetch_any, on_progress=None):
     """Run an approved plan; return (report_markdown, sources).
 
     Sources: [{n, title, url, kind, text, barriers}] — text is the
     source's own words, cut to max_chars_per_source.
+    on_progress(text) is called as the run moves — searching,
+    reading each source, done — so a person watching knows where
+    it is. Research takes minutes, not seconds.
     """
     if not approved:
         raise BrowserError(
@@ -67,6 +77,11 @@ def run_research(plan, approved=False, max_chars_per_source=4000,
             "first and run it only after the go (the plan gate)")
     from .barriers import detect_barriers
 
+    def progress(text):
+        if on_progress is not None:
+            on_progress(text)
+
+    progress(f"Researching '{plan['topic']}' — up to {plan['max_pages']} sources")
     sources = []
     seen_urls = set()
     failures = []
@@ -78,6 +93,7 @@ def run_research(plan, approved=False, max_chars_per_source=4000,
         except BrowserError as exc:
             failures.append(f"search {query!r} failed: {exc}")
             continue
+        progress(f"Searched '{query}' — {len(results)} result(s)")
         for result in results:
             if len(sources) >= plan["max_pages"]:
                 break
@@ -101,7 +117,47 @@ def run_research(plan, approved=False, max_chars_per_source=4000,
                 "barriers": barriers,
                 "query": query,
             })
+            progress(f"Reading {len(sources)} of {plan['max_pages']}: "
+                     f"{sources[-1]['title'] or sources[-1]['url']}")
+    progress(f"Done — {len(sources)} source(s) read" if sources
+             else "Done — no sources could be read")
     return build_report(plan, sources, failures), sources
+
+
+def research_job_running():
+    """Topic of the running research job, or None."""
+    with _JOB_LOCK:
+        return _CURRENT_JOB["topic"]
+
+
+def start_research_job(topic, queries=None, on_progress=None, on_done=None,
+                       search_fn=None, fetch_fn=None):
+    """Start a research job in the background. Returns the topic, or
+    None when a job is already running (strictly sequential — one
+    at a time, no parallel agents). on_done(report, sources, error)
+    runs when the job finishes or fails."""
+    with _JOB_LOCK:
+        if _CURRENT_JOB["topic"] is not None:
+            return None
+        _CURRENT_JOB["topic"] = topic
+
+    def work():
+        try:
+            plan = make_plan(topic, queries=queries)
+            report, sources = run_research(
+                plan, approved=True, on_progress=on_progress,
+                search_fn=search_fn or search, fetch_fn=fetch_fn or fetch_any)
+            if on_done is not None:
+                on_done(report, sources, None)
+        except Exception as exc:
+            if on_done is not None:
+                on_done(None, [], str(exc))
+        finally:
+            with _JOB_LOCK:
+                _CURRENT_JOB["topic"] = None
+
+    threading.Thread(target=work, daemon=True).start()
+    return topic
 
 
 def build_report(plan, sources, failures):
@@ -131,3 +187,57 @@ def build_report(plan, sources, failures):
     for source in sources:
         lines.append(f"[{source['n']}] {source['url']}")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _inline(text):
+    """Bold + links inside one line, everything else escaped."""
+    text = html.escape(text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    return text
+
+
+def report_to_html(report):
+    """The Markdown report as a readable page, for a tab of the window."""
+    title = "Research"
+    for line in (report or "").splitlines():
+        if line.startswith("# Research:"):
+            title = line[len("# Research:"):].strip() or title
+            break
+    parts = []
+    in_list = False
+    for line in (report or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(f"<h3>{_inline(stripped[4:])}</h3>")
+        elif stripped.startswith("## "):
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(f"<h2>{_inline(stripped[3:])}</h2>")
+        elif stripped.startswith("# "):
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(f"<h1>{_inline(stripped[2:])}</h1>")
+        elif stripped.startswith("- "):
+            if not in_list:
+                parts.append("<ul>")
+                in_list = True
+            parts.append(f"<li>{_inline(stripped[2:])}</li>")
+        elif stripped:
+            if in_list:
+                parts.append("</ul>")
+                in_list = False
+            parts.append(f"<p>{_inline(stripped)}</p>")
+    if in_list:
+        parts.append("</ul>")
+    return (f"<!doctype html><html><head><meta charset=\"utf-8\">"
+            f"<title>Research: {html.escape(title)}</title><style>"
+            f"body{{font-family:sans-serif;margin:24px;max-width:800px;color:#222}}"
+            f"h1{{font-size:24px}}h2{{font-size:19px;margin-top:28px}}"
+            f"h3{{font-size:16px}}a{{color:#1a5fb4}}</style></head>"
+            f"<body>{''.join(parts)}</body></html>")

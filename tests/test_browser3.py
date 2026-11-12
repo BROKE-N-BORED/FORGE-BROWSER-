@@ -1020,6 +1020,62 @@ class SessionTests(unittest.TestCase):
             session.ask("hi")
 
 
+class ResearchJobTests(unittest.TestCase):
+    """#11: research runs in the background; the turn doesn't wait."""
+
+    def test_research_action_starts_background_job(self):
+        from unittest import mock
+        from forge.browser import research as research_module
+        captured = {}
+
+        def fake_start(topic, on_progress=None, on_done=None, **kwargs):
+            captured["topic"] = topic
+            captured["on_done"] = on_done
+            return topic
+
+        session = chat.ChatSession(model="fake:1b")
+        queue = ['ACTION {"type": "research", "topic": "gears"}',
+                 "Research is running, I'll show you when it's done."]
+
+        def fake_chat(messages, on_chunk=None):
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        delivered = {}
+        with mock.patch.object(research_module, "start_research_job", fake_start):
+            with mock.patch.object(research_module, "research_job_running",
+                                   return_value=None):
+                answer, _opens = session.ask(
+                    "research gears for me", on_plan=lambda plan: True,
+                    on_research_done=lambda r, s, e=None: delivered.setdefault("report", r))
+        self.assertEqual(captured["topic"], "gears")
+        self.assertEqual(answer, "Research is running, I'll show you when it's done.")
+        captured["on_done"]("# Research: gears\n\ntext", [], None)
+        self.assertIn("Research: gears", delivered["report"])
+
+    def test_research_action_refuses_second_job(self):
+        from unittest import mock
+        from forge.browser import research as research_module
+        session = chat.ChatSession(model="fake:1b")
+        seen = []
+        queue = ['ACTION {"type": "research", "topic": "gears"}', "ok, waiting"]
+
+        def fake_chat(messages, on_chunk=None):
+            seen.append(messages)
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        with mock.patch.object(research_module, "research_job_running",
+                               return_value="bikes"):
+            answer, _opens = session.ask("research gears for me",
+                                         on_plan=lambda plan: True)
+        self.assertEqual(answer, "ok, waiting")
+        result = [m["content"] for m in seen[1]
+                  if m["content"].startswith("RESULT of research")][0]
+        self.assertIn("already running", result)
+        self.assertIn("bikes", result)
+
+
 class CompareTests(unittest.TestCase):
     """#7: cross-tab compare — one tiny call per tab, table in the window."""
 

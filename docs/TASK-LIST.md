@@ -116,9 +116,17 @@ Joshua's real PC.
   marked 🤖 in the tab bar and in the chat's tab list. Suite 128/128;
   Qt offscreen smoke (plan dialog approved, page in a 🤖 tab).
   Real-PC verdict open.)*
-- [ ] **#11 — Research as a background job [S–M, UI only].** The research
+- [~] **#11 — Research as a background job [S–M, UI only].** The research
   runner already works; give it a progress line and let it run while browsing
   continues. Strictly sequential. Expect minutes.
+  *(Built 2026-11-11: research.start_research_job (one job at a
+  time, second start refused; on_progress steps + on_done delivery),
+  report_to_html; chat research ACTION starts the job and ends the
+  turn at once (cards keep the synchronous runner); dock progress
+  label + report tab on completion; CLI chat prints progress and
+  the finished report. Suite 155/155; Qt offscreen smoke (chat free
+  at once, Research tab opened, progress line said done). Real-PC
+  verdict open.)*
 
 ## D. Memory
 

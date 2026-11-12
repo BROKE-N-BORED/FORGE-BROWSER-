@@ -619,6 +619,84 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("[1] http://x.test/a", report)
         self.assertIn("The source says the thing plainly.", report)
 
+    def test_run_research_reports_progress(self):
+        lines = []
+        plan = make_plan("Test topic", queries=["q one"])
+
+        def fake_search(query, max_results=5):
+            from forge.browser.search import SearchResult
+            return [SearchResult(title="Src", url="http://x.test/a", snippet="")]
+
+        class Found:
+            kind = "html"
+            title = "Src Title"
+            text = "The source says the thing plainly."
+
+        report, sources = run_research(
+            plan, approved=True, search_fn=fake_search,
+            fetch_fn=lambda url: Found(),
+            on_progress=lines.append)
+        self.assertTrue(any("Researching" in line for line in lines))
+        self.assertTrue(any("Searched" in line for line in lines))
+        self.assertTrue(any("Reading 1 of" in line for line in lines))
+        self.assertTrue(any(line.startswith("Done") for line in lines))
+
+    def test_start_research_job_runs_in_background(self):
+        import threading
+        from forge.browser.research import research_job_running, start_research_job
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_search(query, max_results=5):
+            from forge.browser.search import SearchResult
+            return [SearchResult(title="Src", url="http://x.test/a", snippet="")]
+
+        class Found:
+            kind = "html"
+            title = "Src Title"
+            text = "The source says the thing plainly."
+
+        def fake_fetch(url):
+            started.set()
+            release.wait(timeout=10)
+            return Found()
+
+        done = {}
+        done_event = threading.Event()
+
+        def on_done(report, sources, error):
+            done["report"] = report
+            done["sources"] = sources
+            done["error"] = error
+            done_event.set()
+
+        topic = start_research_job("Test topic", on_progress=lambda t: None,
+                                   on_done=on_done,
+                                   search_fn=fake_search, fetch_fn=fake_fetch)
+        self.assertEqual(topic, "Test topic")
+        self.assertTrue(started.wait(timeout=5))
+        # Still running: a second job is refused (strictly sequential).
+        self.assertEqual(research_job_running(), "Test topic")
+        self.assertIsNone(start_research_job("Other topic", on_done=on_done))
+        release.set()
+        self.assertTrue(done_event.wait(timeout=5))
+        self.assertIn("The source says the thing plainly.", done["report"])
+        self.assertIsNone(done["error"])
+        self.assertIsNone(research_job_running())
+
+    def test_report_to_html(self):
+        from forge.browser.research import report_to_html
+        report = ("# Research: gears\n\n## Questions\n\n- how do gears work\n\n"
+                  "## What the sources say\n\n### [1] Gear Guide\n\n"
+                  "The **gears** turn. See [the guide](http://g.example/).\n")
+        page = report_to_html(report)
+        self.assertIn("<title>Research: gears</title>", page)
+        self.assertIn("<h1>Research: gears</h1>", page)
+        self.assertIn("<h2>Questions</h2>", page)
+        self.assertIn("<li>how do gears work</li>", page)
+        self.assertIn("<b>gears</b>", page)
+        self.assertIn('<a href="http://g.example/">the guide</a>', page)
+
 
 class WebUITests(unittest.TestCase):
     def test_resolve_address(self):
