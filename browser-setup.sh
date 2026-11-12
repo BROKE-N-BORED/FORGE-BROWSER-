@@ -17,16 +17,32 @@ BASE="$HOME/.local/share/forge-browser"
 mkdir -p "$BASE"
 
 setup_lightpanda() {
+    # Pinned, not nightly: version + SHA-256 from engine-pins.txt
+    # (task #21). The hash is verified before installing.
     case "$(uname -m)" in
-        x86_64) ARCH="x86_64" ;;
-        aarch64|arm64) ARCH="aarch64" ;;
+        x86_64) ASSET="lightpanda-x86_64-linux" ;;
+        aarch64|arm64) ASSET="lightpanda-aarch64-linux" ;;
         *) echo "Lightpanda has no build for $(uname -m)"; exit 1 ;;
     esac
-    URL="https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-$ARCH-linux"
-    echo "Downloading Lightpanda ($ARCH)..."
-    curl -fL -o "$BASE/lightpanda" "$URL"
-    chmod +x "$BASE/lightpanda"
-    echo "Installed: $BASE/lightpanda"
+    PINS="$(dirname "$0")/engine-pins.txt"
+    PIN=$(grep "^$ASSET " "$PINS" 2>/dev/null || echo "")
+    VERSION=$(echo "$PIN" | awk '{print $2}')
+    HASH=$(echo "$PIN" | awk '{print $3}')
+    if [ -z "$VERSION" ] || [ -z "$HASH" ]; then
+        echo "No pin for $ASSET in engine-pins.txt — refusing to guess a version."
+        exit 1
+    fi
+    URL="https://github.com/lightpanda-io/browser/releases/download/$VERSION/$ASSET"
+    echo "Downloading Lightpanda $VERSION ($ASSET)..."
+    curl -fL -o "$BASE/lightpanda.tmp" "$URL"
+    if ! echo "$HASH  $BASE/lightpanda.tmp" | sha256sum -c - >/dev/null 2>&1; then
+        rm -f "$BASE/lightpanda.tmp"
+        echo "Hash check FAILED for Lightpanda $VERSION — nothing installed."
+        exit 1
+    fi
+    chmod +x "$BASE/lightpanda.tmp" && mv "$BASE/lightpanda.tmp" "$BASE/lightpanda"
+    echo "$VERSION $HASH" > "$BASE/lightpanda.version"
+    echo "Installed: $BASE/lightpanda ($VERSION, hash verified)"
     echo "Run it with:  $BASE/lightpanda serve --port 9222"
     echo "Then set:     export FORGE_LIGHTPANDA_URL=http://127.0.0.1:9222"
 }

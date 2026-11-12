@@ -1,0 +1,17 @@
+# Forge Browser engine pins — the exact versions install.sh fetches,
+# and the SHA-256 of the exact bytes. Change a version only by updating
+# the pin AND the hash together: download the release, check its size
+# against the release page, sha256sum it, and record the hash here.
+#
+# Lightpanda 1.0.3 (2026-11-05, latest stable; 1.0.4-rc1 is a release
+# candidate, not pinned). Verified 2026-11-11 against the official
+# release assets — sizes match the release page (77403464 / 74485832).
+lightpanda-x86_64-linux 1.0.3 53eb34da09159dcf8f04865dbfe3e63e9a652062684495aa7ced5ddd7c82e8b0
+lightpanda-aarch64-linux 1.0.3 20a5348bf3b6f71e41088223b188552ab550c1b9c9a9cbd8f099e6f7f3d78549
+#
+# Chromium snapshot revision 1741687 (Chromium 160.0.8156.0 — the
+# revision the v0.5 window was verified with on the real PC).
+# Google publishes no SHA-256 for snapshots; install.sh verifies the
+# download against the MD5 in the object's own Google Cloud Storage
+# metadata instead, plus a zip CRC check before extracting.
+chromium-linux-x64 1741687

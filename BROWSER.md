@@ -158,6 +158,33 @@ therefore not caught here — catching that needs the fetch to
 connect to the address the fence checked, which is out of scope
 for this fix.
 
+## Engine downloads are pinned + verified
+
+The engine binaries install.sh fetches are pinned to exact
+versions, not moving nightlies, and every download is verified
+before it is installed. The pins live in `engine-pins.txt`:
+
+- Lightpanda **1.0.3** (latest stable, 2026-11-05), x86_64 and
+  aarch64, each with a SHA-256 of the exact release bytes.
+  `browser-setup.sh` uses the same pin.
+- Chromium snapshot revision **1741687** (Chromium 160.0.8156.0),
+  the revision the v0.5 window was verified with on the real PC.
+
+Lightpanda is checked with `sha256sum` against the pinned hash;
+a mismatch refuses the install and keeps whatever was there
+before. Google publishes no SHA-256 for Chromium snapshots, so
+the Chromium zip is verified against the MD5 in the object's own
+Google Cloud Storage metadata, plus a zip CRC check before
+extracting; if the metadata cannot be fetched, nothing is
+installed. Install writes a version record next to each engine
+(`lightpanda.version`, `chromium/REVISION`), and `engines`
+reports the installed version / revision. A re-run skips any
+engine whose installed version and hash already match the pin.
+
+To bump a pin: update the version AND the hash in
+`engine-pins.txt` together — download the release, check its
+size against the release page, sha256sum it, and record the hash.
+
 ## Research as a background job
 
 Ask for research in chat and the turn ends at once — the job

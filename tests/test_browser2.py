@@ -967,6 +967,75 @@ class EngineDiscoveryTests(unittest.TestCase):
                     os.environ["FORGE_LIGHTPANDA_BIN"] = old_bin
 
 
+class EnginePinTests(unittest.TestCase):
+    """Task #21: engine downloads are pinned to a version + hash."""
+
+    def _pins(self):
+        root = os.path.join(os.path.dirname(__file__), "..")
+        pins = {}
+        with open(os.path.join(root, "engine-pins.txt"), encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                pins[parts[0]] = parts[1:]
+        return pins
+
+    def test_lightpanda_pins_have_versions_and_hashes(self):
+        import re
+        pins = self._pins()
+        for asset in ("lightpanda-x86_64-linux", "lightpanda-aarch64-linux"):
+            self.assertIn(asset, pins)
+            version, digest = pins[asset]
+            self.assertEqual(version, "1.0.3")
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_chromium_pin_is_a_revision(self):
+        pins = self._pins()
+        self.assertEqual(pins["chromium-linux-x64"], ["1741687"])
+
+    def test_install_scripts_fetch_no_nightly(self):
+        # No unpinned download URL may survive: the nightly tag or
+        # the moving LAST_CHANGE revision. (Comments may mention the
+        # words — the URLs must not be there.)
+        # The versions live in engine-pins.txt (single source of
+        # truth); the scripts read them from there, never hard-code
+        # a version, and never fetch an unpinned URL.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        for name in ("install.sh", "browser-setup.sh"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                script = handle.read()
+            self.assertNotIn("releases/download/nightly/", script, name)
+            self.assertNotIn("LAST_CHANGE?alt=media", script, name)
+            self.assertIn("engine-pins.txt", script, name)
+            self.assertIn("sha256sum", script, name)
+
+    def test_engine_status_reports_installed_versions(self):
+        from unittest import mock
+        from forge.browser import engines as engines_module
+        with tempfile.TemporaryDirectory() as home:
+            base = os.path.join(home, ".local", "share", "forge-browser")
+            os.makedirs(os.path.join(base, "chromium"))
+            with open(os.path.join(base, "lightpanda.version"), "w") as handle:
+                handle.write("1.0.3 53eb34da09159dcf8f04865dbfe3e63e9a652062684495aa7ced5ddd7c82e8b0\n")
+            with open(os.path.join(base, "chromium", "REVISION"), "w") as handle:
+                handle.write("1741687\n")
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                status = engines_module.engine_status()
+        self.assertEqual(status["lightpanda_version"], "1.0.3")
+        self.assertEqual(status["chromium_revision"], "1741687")
+
+    def test_engine_status_reports_none_when_absent(self):
+        from unittest import mock
+        from forge.browser import engines as engines_module
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                status = engines_module.engine_status()
+        self.assertIsNone(status["lightpanda_version"])
+        self.assertIsNone(status["chromium_revision"])
+
+
 class VerifyTests(unittest.TestCase):
     def test_local_page_fallback_and_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:

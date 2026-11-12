@@ -235,8 +235,18 @@ Joshua's real PC.
   not fenced. Suite 176/176 incl. 4 new FenceTests; CLI E2E (127.0.0.1
   refused, --allow-local opens it, 192.168.1.1 + localhost refused).
   Real-PC verdict open.)*
-- [ ] **#21 — [S2] Pin engine downloads.** Lightpanda/Chromium downloads are
+- [~] **#21 — [S2] Pin engine downloads.** Lightpanda/Chromium downloads are
   unpinned nightlies with no checksum. Pin versions + verify hashes.
+  *(Built 2026-11-11: engine-pins.txt pins Lightpanda 1.0.3 with SHA-256s
+  verified against the official release assets — sizes matched the release
+  page — and Chromium revision 1741687. install.sh reads the pins, verifies
+  Lightpanda with sha256sum before installing (mismatch refuses, keeps the
+  old install), verifies the Chromium zip against the MD5 in its GCS object
+  metadata plus a zip CRC check, and writes version records
+  (lightpanda.version, chromium/REVISION) that `engines` reports; re-runs
+  skip an engine whose installed version + hash already match. browser-
+  setup.sh uses the same Lightpanda pin + verify. Suite 181/181.
+  Real-PC verdict open.)*
 - [ ] **#22 — [E9] Download name collisions.** Colliding filenames silently
   overwrite — uniquify names.
 
