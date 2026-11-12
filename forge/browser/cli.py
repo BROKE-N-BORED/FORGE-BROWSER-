@@ -308,6 +308,83 @@ def _cmd_card(args):
     return 0
 
 
+def _cmd_memory(args):
+    from .memory import export_memory, forget, list_entries, remember, search_entries
+    if args.action == "add":
+        if not args.value:
+            print("usage: memory add <what to remember>")
+            return 1
+        entry = remember(args.value, source="cli")
+        print(f"remembered: {entry['text']}")
+        return 0
+    if args.action == "forget":
+        removed = forget(args.value)
+        print(f"forgot {removed} entr{'y' if removed == 1 else 'ies'}"
+              if removed else "nothing matched that")
+        return 0
+    if args.action == "export":
+        path = export_memory(
+            args.value or os.path.expanduser("~/.forge/memory-export.json"))
+        print(f"exported {len(list_entries())} entries to {path}")
+        return 0
+    if args.action == "search":
+        from .retrieve import embed_texts
+        found = search_entries(args.value, top_k=5, embed_fn=embed_texts)
+        for entry in found:
+            print(f"- {entry['text']}")
+        if not found:
+            print("nothing relevant remembered")
+        return 0
+    if args.action == "pages":
+        from .memory import list_pages, search_pages
+        if args.value:
+            from .retrieve import embed_texts
+            found = search_pages(args.value, embed_fn=embed_texts)
+            for entry in found:
+                print(f"{entry['title']} — {entry['url']}\n  {entry['text'][:200]}")
+            if not found:
+                print("nothing in your visited pages matches that")
+        else:
+            for page in list_pages():
+                print(f"{page['title']} — {page['url']} ({page['chunks']} chunks)")
+            if not list_pages():
+                print("no pages remembered yet")
+        return 0
+    entries = list_entries()
+    if not entries:
+        print("nothing remembered yet — say 'remember ...' in chat, "
+              "or: memory add <text>")
+        return 0
+    for entry in entries:
+        print(f"{entry['id']}  {entry['text']}")
+    return 0
+
+
+def _cmd_voice(args):
+    import time
+    from .voice import Recorder, find_recorder, transcribe_recording
+    if find_recorder() is None:
+        print("no microphone recorder found (arecord, parecord, or ffmpeg)")
+        return 1
+    recorder = Recorder()
+    if not recorder.start():
+        print("couldn't start the microphone")
+        return 1
+    print(f"recording for {args.seconds}s — speak now…")
+    time.sleep(args.seconds)
+    path = recorder.stop()
+    if path is None:
+        print("nothing recorded — check the microphone")
+        return 1
+    text = transcribe_recording(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    print(text or "couldn't make out anything in the recording")
+    return 0
+
+
 def _cmd_app(args):
     from .app import run_app
     return run_app(args.url)
@@ -342,6 +419,18 @@ def main(argv=None):
     p.add_argument("question", nargs="?", default="",
                    help="the question or topic the card works on")
     p.set_defaults(func=_cmd_card)
+
+    p = sub.add_parser("memory", help="the remembered facts (list/add/forget/search/export/pages)")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "add", "forget", "search", "export", "pages"])
+    p.add_argument("value", nargs="?", default="",
+                   help="the fact, the search, or the export path")
+    p.set_defaults(func=_cmd_memory)
+
+    p = sub.add_parser("voice", help="record the microphone and transcribe it (local whisper)")
+    p.add_argument("seconds", nargs="?", type=int, default=5,
+                   help="how long to record (default 5)")
+    p.set_defaults(func=_cmd_voice)
 
     p = sub.add_parser("app", help="Forge Browser the program — its own browser window")
     p.add_argument("url", nargs="?", default=None, help="page to start on")

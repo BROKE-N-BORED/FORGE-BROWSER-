@@ -131,7 +131,23 @@ def create_window(server, profile, start_url=None):
         def _on_load_finished(self, view):
             self._sync_address()
             from .titles import record_visit
-            record_visit(view.url().toString(), view.title())
+            url = view.url().toString()
+            title = view.title()
+            record_visit(url, title)
+            # Keep the page's text for later recall ("that thing I
+            # read...") — chunks only, no model call at visit time.
+            if url.startswith("http://127.0.0.1"):
+                return
+
+            def got_page(page_text):
+                from .memory import remember_page
+                threading.Thread(
+                    target=remember_page,
+                    args=(url, title, page_text or ""),
+                    daemon=True).start()
+
+            view.page().runJavaScript(
+                "document.body ? document.body.innerText : ''", got_page)
 
         def _close_tab(self, index):
             if self.tabs.count() > 1:
@@ -178,6 +194,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         token = QtCore.Signal(str)
         answer = QtCore.Signal(str)
         failed = QtCore.Signal(str)
+        voice_text = QtCore.Signal(str)
 
     signals = Signals()
     model = pick_chat_model()
@@ -200,9 +217,12 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     entry.setPlaceholderText("Ask for a page, a search, a summary…")
     send = QtWidgets.QPushButton("Send")
     summarize_btn = QtWidgets.QPushButton("Summarize")
+    mic_btn = QtWidgets.QPushButton("🎤 Hold to talk")
+    mic_btn.setObjectName("voice_button")
     row.addWidget(entry)
     row.addWidget(send)
     row.addWidget(summarize_btn)
+    row.addWidget(mic_btn)
     layout.addLayout(row)
     dock.setWidget(panel)
     dock.setMinimumWidth(320)
@@ -211,6 +231,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         entry.setEnabled(False)
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
+        mic_btn.setEnabled(False)
         return
 
     state = {"busy": False, "live": False}
@@ -258,7 +279,62 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
 
-    def work(text, page_text, tabs=None):
+    def on_voice_text(text):
+        # Transcribed speech lands in the entry for review — the
+        # person reads it and hits Send; it is never sent itself.
+        if not text:
+            append("Forge Browser",
+                   "⚠ Couldn't make out anything in the recording.")
+            return
+        current = entry.text()
+        entry.setText((current + " " + text).strip() if current else text)
+        entry.setFocus()
+
+    signals.voice_text.connect(on_voice_text)
+
+    voice_state = {"recorder": None}
+
+    def on_mic_pressed():
+        from .voice import Recorder, find_recorder
+        if voice_state["recorder"] is not None:
+            return
+        if find_recorder() is None:
+            append("Forge Browser",
+                   "⚠ No microphone recorder found (arecord, parecord, or "
+                   "ffmpeg). Voice input needs one of those installed.")
+            return
+        recorder = Recorder()
+        if not recorder.start():
+            append("Forge Browser", "⚠ Couldn't start the microphone.")
+            return
+        voice_state["recorder"] = recorder
+        mic_btn.setText("● Listening…")
+
+    def on_mic_released():
+        recorder = voice_state["recorder"]
+        voice_state["recorder"] = None
+        mic_btn.setText("🎤 Hold to talk")
+        if recorder is None:
+            return
+        path = recorder.stop()
+        if path is None:
+            append("Forge Browser",
+                   "⚠ Nothing recorded — check the microphone.")
+            return
+        signals.notice.emit("transcribing…")
+
+        def work_voice():
+            from .voice import transcribe_recording
+            text = transcribe_recording(path)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            signals.voice_text.emit(text)
+
+        threading.Thread(target=work_voice, daemon=True).start()
+
+    def work(text, page_text, tabs=None, page_url=None):
         display = LiveDisplay()
 
         def on_chunk(delta):
@@ -268,7 +344,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
         try:
             answer, opens = session.ask(
-                text, page_text=page_text, tabs=tabs,
+                text, page_text=page_text, tabs=tabs, page_url=page_url,
                 on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
                 on_chunk=on_chunk)
             for url in opens:
@@ -348,7 +424,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                              "text": texts[i] or "",
                              "current": i == current})
             page_text = texts[current] if 0 <= current < count else None
-            threading.Thread(target=work, args=(text, page_text, tabs),
+            page_url = tabs[current]["url"] if 0 <= current < count else None
+            threading.Thread(target=work, args=(text, page_text, tabs, page_url),
                              daemon=True).start()
 
         def collect(i, page_text):
@@ -373,6 +450,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     send.clicked.connect(do_send)
     entry.returnPressed.connect(do_send)
     summarize_btn.clicked.connect(do_summarize)
+    mic_btn.pressed.connect(on_mic_pressed)
+    mic_btn.released.connect(on_mic_released)
 
 
 def run_app(start_url=None):

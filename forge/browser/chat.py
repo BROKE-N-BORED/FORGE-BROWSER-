@@ -12,6 +12,10 @@ time with a line like:
     ACTION {"type": "read_page"}
     ACTION {"type": "summarize"}
     ACTION {"type": "card", "name": "summarize-page"}
+    ACTION {"type": "remember", "text": "the person likes dark mode"}
+    ACTION {"type": "forget", "text": "dark mode"}
+    ACTION {"type": "recall"}
+    ACTION {"type": "recall_pages", "query": "that thing about gears"}
 
 The session runs the action with the real engine, hands the
 result back to the model, and the model answers from what it
@@ -57,11 +61,19 @@ ACTION {"type": "research", "topic": "a bigger question"}
 ACTION {"type": "read_page"}
 ACTION {"type": "summarize"}
 ACTION {"type": "card", "name": "summarize-page"}
+ACTION {"type": "remember", "text": "the person likes dark mode"}
+ACTION {"type": "forget", "text": "dark mode"}
+ACTION {"type": "recall"}
+ACTION {"type": "recall_pages", "query": "that thing about gears"}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
 directly with no ACTION line. Never invent page contents, prices, or facts.
 Tabs are numbered from 1 in the order shown; when the person writes @tab2,
-answer from that tab's text, which is handed to you as its context."""
+answer from that tab's text, which is handed to you as its context.
+When the person asks you to remember something, use the remember action
+with their exact words. Recall lists what you remember; forget removes it.
+When the person asks about something they read before ("that thing I read
+last week"), use recall_pages with their words as the query."""
 
 
 def list_models():
@@ -225,10 +237,25 @@ class ChatSession:
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
 
     def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
-            tabs=None):
+            tabs=None, page_url=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs).
         tabs: [{title, url, text, current}] in visible order, for @tabN."""
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Memory: what the person asked to be remembered, when it is
+        # relevant — never on a page that looks sensitive.
+        from .memory import is_sensitive_url, search_entries
+        if page_url is None and tabs:
+            for tab in tabs:
+                if tab.get("current"):
+                    page_url = tab.get("url") or ""
+                    break
+        if not is_sensitive_url(page_url):
+            from .retrieve import embed_texts
+            found = search_entries(user_text, embed_fn=embed_texts)
+            if found:
+                lines = "\n".join(f"- {e['text']}" for e in found)
+                messages.append({"role": "system",
+                                 "content": "Things you asked me to remember:\n" + lines})
         # @tabN picks a tab; otherwise the current tab's text.
         chosen_text = page_text
         chosen_title = None
@@ -315,6 +342,32 @@ class ChatSession:
                                       question=user_text, page_text=chosen_text,
                                       on_action=on_action, on_chunk=on_chunk)
                     break
+                elif kind == "remember":
+                    from .memory import remember
+                    entry = remember(str(action.get("text", "")))
+                    result = (f"Remembered: {entry['text']}" if entry
+                              else "There was nothing to remember.")
+                elif kind == "forget":
+                    from .memory import forget
+                    removed = forget(str(action.get("text", "")))
+                    result = (f"Forgot {removed} remembered thing(s)." if removed
+                              else "I don't have that remembered.")
+                elif kind == "recall":
+                    from .memory import list_entries
+                    entries = list_entries()
+                    result = ("\n".join(f"- {e['text']}" for e in entries)
+                              if entries else "Nothing remembered yet.")
+                elif kind == "recall_pages":
+                    from .memory import search_pages
+                    query = str(action.get("query", "") or user_text)
+                    found = search_pages(query)
+                    if found:
+                        result = "\n\n".join(
+                            f"{e['title']} — {e['url']}\n{e['text']}"
+                            for e in found)
+                    else:
+                        result = ("Nothing in the pages you visited "
+                                  "matches that.")
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:

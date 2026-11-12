@@ -91,6 +91,37 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Voice — hold to talk
+
+The chat dock has a "🎤 Hold to talk" button. Hold it, speak,
+release: the recording is transcribed on this machine (whisper.cpp,
+model `FORGE_WHISPER_MODEL`, default `base` — `base.en` is the
+English-only 148 MB one) and the text lands in the chat box for
+you to read and send — never sent on its own. Recording needs a
+system recorder: `arecord`, `parecord`, or `ffmpeg`. No recorder
+or nothing intelligible, and the dock says so plainly. Terminal
+version: `python3 -m forge.browser voice [seconds]` (default 5).
+
+## Memory — what it remembers
+
+Say "remember ..." in chat (or `python3 -m forge.browser memory add
+"...") and the browser keeps that fact in `~/.forge/memory.json` —
+plain JSON you can read, edit, and export (`memory export
+path.json`). It offers the relevant ones back as context when you
+ask something they bear on, and never records anything on its own:
+no page contents, ever. On pages that look sensitive (banking,
+login, checkout, health) it withholds memory context entirely.
+Chat actions: `remember` / `forget` / `recall`. CLI: `memory`
+(list), `memory search <words>`, `memory forget <words>`.
+
+Pages you visit are kept too, as text chunks in
+`~/.forge/page-memory.json` (never on sensitive pages, never on
+the browser's own local pages). Ask "that thing I read about
+gears" and the brain searches them (`recall_pages` action; CLI:
+`memory pages <words>`). Chunks are stored as text and embedded
+only when you ask — embedding at visit time would keep evicting
+the chat brain from the one-model slot.
+
 ## Commands
 
 From the unzipped folder:

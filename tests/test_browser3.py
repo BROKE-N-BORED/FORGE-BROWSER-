@@ -5,6 +5,7 @@ protocol: ACTION parsing, the action loop and its cap, results
 fed back to the model, tab-open requests, and the no-brain error.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -625,6 +626,151 @@ class TitlesTests(unittest.TestCase):
                     os.environ["FORGE_BROWSER_HISTORY_PATH"] = old
 
 
+class MemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old_path = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+        os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(self.tmp, "m.json")
+
+    def tearDown(self):
+        if self.old_path is None:
+            os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+        else:
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = self.old_path
+
+    def test_remember_dedups(self):
+        from forge.browser.memory import list_entries, remember
+        first = remember("I like dark mode.")
+        second = remember("i like  dark mode.")
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(len(list_entries()), 1)
+
+    def test_forget_by_text_and_id(self):
+        from forge.browser.memory import forget, list_entries, remember
+        entry = remember("My budget is $500.")
+        remember("I like dark mode.")
+        self.assertEqual(forget("budget"), 1)
+        self.assertEqual(len(list_entries()), 1)
+        self.assertEqual(forget(entry["id"]), 0)  # already gone
+        remaining = list_entries()
+        self.assertEqual(forget(remaining[0]["id"]), 1)
+        self.assertEqual(list_entries(), [])
+
+    def test_search_by_embedding(self):
+        from forge.browser.memory import remember, search_entries
+        remember("I like dark mode.")
+        remember("My budget is $500.")
+
+        def fake_embed(texts):
+            return [[1.0, 0.0] if "dark" in t.lower() else [0.0, 1.0]
+                    for t in texts]
+
+        found = search_entries("dark mode please", embed_fn=fake_embed)
+        self.assertEqual([e["text"] for e in found], ["I like dark mode."])
+
+    def test_search_falls_back_to_keywords(self):
+        from forge.browser.memory import remember, search_entries
+        remember("I like dark mode.")
+        remember("My budget is $500.")
+
+        def boom(texts):
+            raise BrowserError("down")
+
+        found = search_entries("what is my budget", embed_fn=boom)
+        self.assertEqual([e["text"] for e in found], ["My budget is $500."])
+
+    def test_sensitive_urls(self):
+        from forge.browser.memory import is_sensitive_url
+        self.assertTrue(is_sensitive_url("https://mybank.example/login"))
+        self.assertTrue(is_sensitive_url("https://checkout.example/pay"))
+        self.assertFalse(is_sensitive_url("https://news.example/gears"))
+        self.assertFalse(is_sensitive_url(""))
+
+    def test_export_writes_json(self):
+        from forge.browser.memory import export_memory, remember
+        remember("I like dark mode.")
+        path = os.path.join(self.tmp, "out.json")
+        self.assertEqual(export_memory(path), path)
+        with open(path) as handle:
+            data = json.load(handle)
+        self.assertEqual([e["text"] for e in data["entries"]],
+                         ["I like dark mode."])
+
+    def test_page_memory_stores_chunks_as_text(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_PAGE_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = os.path.join(tmp, "p.json")
+            try:
+                text = ("Gears turn wheels. " * 40)
+                self.assertTrue(memory_module.remember_page(
+                    "http://gears.example/guide", "Gear Guide", text))
+                pages = memory_module.list_pages()
+                self.assertEqual(len(pages), 1)
+                self.assertEqual(pages[0]["url"], "http://gears.example/guide")
+                # No embeddings stored — chunks are plain text.
+                with open(os.path.join(tmp, "p.json")) as handle:
+                    data = json.load(handle)
+                self.assertNotIn("embedding", json.dumps(data))
+                # Sensitive, local, and thin pages are skipped.
+                self.assertFalse(memory_module.remember_page(
+                    "http://mybank.example/login", "Bank", text))
+                self.assertFalse(memory_module.remember_page(
+                    "http://127.0.0.1:9/", "Local", text))
+                self.assertFalse(memory_module.remember_page(
+                    "http://x.example/", "Thin", "hi"))
+                self.assertEqual(len(memory_module.list_pages()), 1)
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_PAGE_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = old
+
+    def test_search_pages_ranks_by_embedding(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_PAGE_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = os.path.join(tmp, "p.json")
+            try:
+                memory_module.remember_page(
+                    "http://gears.example/", "Gears", "Gears turn wheels. " * 40)
+                memory_module.remember_page(
+                    "http://soup.example/", "Soup", "Soup is warm food. " * 40)
+
+                def fake_embed(texts, model=None):
+                    return [[1.0, 0.0] if "gear" in t.lower() else [0.0, 1.0]
+                            for t in texts]
+
+                found = memory_module.search_pages("gears", embed_fn=fake_embed)
+                self.assertEqual([f["url"] for f in found],
+                                 ["http://gears.example/"])
+                self.assertIn("Gears turn wheels", found[0]["text"])
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_PAGE_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = old
+
+    def test_search_pages_empty_without_embeddings(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_PAGE_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = os.path.join(tmp, "p.json")
+            try:
+                memory_module.remember_page(
+                    "http://gears.example/", "Gears", "Gears turn wheels. " * 40)
+
+                def boom(texts, model=None):
+                    raise BrowserError("down")
+
+                self.assertEqual(memory_module.search_pages("gears", embed_fn=boom), [])
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_PAGE_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = old
+
+
 class SessionTests(unittest.TestCase):
     def make_session(self, replies):
         session = chat.ChatSession(model="fake:1b")
@@ -720,6 +866,104 @@ class SessionTests(unittest.TestCase):
         self.assertIn("3. Soup", tab_note)
         self.assertEqual(answer, "grouped answer")
 
+    def test_memory_context_offered_when_relevant(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(tmp, "m.json")
+            try:
+                memory_module.remember("I like dark mode.")
+                session = self.make_session(["Use dark mode then."])
+                answer, _opens = session.ask("should I use dark mode?")
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEMORY_PATH"] = old
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertTrue(any("I like dark mode." in t for t in system_texts))
+        self.assertEqual(answer, "Use dark mode then.")
+
+    def test_memory_withheld_on_sensitive_page(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(tmp, "m.json")
+            try:
+                memory_module.remember("I like dark mode.")
+                session = self.make_session(["Use dark mode then."])
+                answer, _opens = session.ask(
+                    "should I use dark mode?",
+                    page_url="https://mybank.example/login")
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEMORY_PATH"] = old
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertFalse(any("I like dark mode." in t for t in system_texts))
+
+    def test_remember_action_stores_fact(self):
+        from forge.browser.memory import list_entries
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(tmp, "m.json")
+            try:
+                session = chat.ChatSession(model="fake:1b")
+                queue = ['ACTION {"type": "remember", "text": "I like dark mode."}',
+                         "Got it, remembered."]
+
+                def fake_chat(messages, on_chunk=None):
+                    return queue.pop(0)
+
+                session._chat = fake_chat
+                answer, _opens = session.ask("remember that I like dark mode")
+                stored = [e["text"] for e in list_entries()]
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEMORY_PATH"] = old
+        self.assertEqual(answer, "Got it, remembered.")
+        self.assertEqual(stored, ["I like dark mode."])
+
+    def test_recall_pages_action_searches_visited_pages(self):
+        from forge.browser import memory as memory_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_PAGE_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = os.path.join(tmp, "p.json")
+            try:
+                memory_module.remember_page(
+                    "http://gears.example/", "Gear Guide",
+                    "Gears turn wheels. " * 40)
+                original = memory_module.search_pages
+
+                def fake_search(query, top_k=3, embed_fn=None):
+                    return [{"url": "http://gears.example/", "title": "Gear Guide",
+                             "text": "Gears turn wheels.", "score": 0.9}]
+
+                memory_module.search_pages = fake_search
+                session = chat.ChatSession(model="fake:1b")
+                queue = ['ACTION {"type": "recall_pages", "query": "gears"}',
+                         "You read about gears turning wheels."]
+
+                def fake_chat(messages, on_chunk=None):
+                    return queue.pop(0)
+
+                session._chat = fake_chat
+                try:
+                    answer, _opens = session.ask("that thing I read about gears")
+                finally:
+                    memory_module.search_pages = original
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_PAGE_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_PAGE_MEMORY_PATH"] = old
+        self.assertEqual(answer, "You read about gears turning wheels.")
+
     def test_plain_answer(self):
         session = self.make_session(["Hello yourself."])
         answer, opens = session.ask("hi")
@@ -774,6 +1018,109 @@ class SessionTests(unittest.TestCase):
             chat.pick_chat_model = original
         with self.assertRaises(BrowserError):
             session.ask("hi")
+
+
+class VoiceTests(unittest.TestCase):
+    """Push-to-talk recording against a fake arecord on PATH."""
+
+    def _fake_bin(self, tmp, write_bytes=True):
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        script = os.path.join(bindir, "arecord")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         "for last; do :; done\n"
+                         + ('head -c 100 /dev/zero > "$last"\n' if write_bytes else "")
+                         + "sleep 30\n")
+        os.chmod(script, 0o755)
+        return bindir
+
+    def test_find_recorder_none_without_any(self):
+        from unittest import mock
+        from forge.browser.voice import find_recorder
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"PATH": tmp}):
+                self.assertIsNone(find_recorder())
+
+    def test_find_recorder_finds_fake_arecord(self):
+        from unittest import mock
+        from forge.browser.voice import find_recorder
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = self._fake_bin(tmp)
+            with mock.patch.dict(
+                    os.environ, {"PATH": bindir + os.pathsep + os.environ["PATH"]}):
+                self.assertEqual(find_recorder(), "arecord")
+
+    def test_recorder_records_and_stops(self):
+        import time
+        from unittest import mock
+        from forge.browser.voice import Recorder
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = self._fake_bin(tmp)
+            with mock.patch.dict(
+                    os.environ, {"PATH": bindir + os.pathsep + os.environ["PATH"]}):
+                recorder = Recorder()
+                self.assertTrue(recorder.start())
+                time.sleep(0.3)
+                path = recorder.stop()
+                self.assertIsNotNone(path)
+                self.assertEqual(os.path.getsize(path), 100)
+                os.unlink(path)
+
+    def test_recorder_nothing_recorded_returns_none(self):
+        import time
+        from unittest import mock
+        from forge.browser.voice import Recorder
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = self._fake_bin(tmp, write_bytes=False)
+            with mock.patch.dict(
+                    os.environ, {"PATH": bindir + os.pathsep + os.environ["PATH"]}):
+                recorder = Recorder()
+                self.assertTrue(recorder.start())
+                time.sleep(0.3)
+                self.assertIsNone(recorder.stop())
+
+    def test_transcribe_recording_delegates(self):
+        from unittest import mock
+        from forge.browser import voice as voice_module
+        with mock.patch.object(voice_module, "transcribe_saved_audio",
+                               return_value="hello") as patched:
+            self.assertEqual(voice_module.transcribe_recording("/tmp/x.wav"),
+                             "hello")
+            patched.assert_called_once_with("/tmp/x.wav")
+
+    def test_cli_voice_records_and_prints(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from forge.browser import cli as cli_module
+        from forge.browser import voice as voice_module
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = self._fake_bin(tmp)
+            with mock.patch.dict(
+                    os.environ, {"PATH": bindir + os.pathsep + os.environ["PATH"]}):
+                with mock.patch.object(voice_module, "transcribe_recording",
+                                       return_value="hello from the mic"):
+                    args = mock.Mock(seconds=1)
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        code = cli_module._cmd_voice(args)
+        self.assertEqual(code, 0)
+        self.assertIn("hello from the mic", out.getvalue())
+
+    def test_cli_voice_no_recorder(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from forge.browser import cli as cli_module
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"PATH": tmp}):
+                args = mock.Mock(seconds=1)
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    code = cli_module._cmd_voice(args)
+        self.assertEqual(code, 1)
+        self.assertIn("no microphone recorder", out.getvalue())
 
 
 if __name__ == "__main__":

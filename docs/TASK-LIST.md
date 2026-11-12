@@ -98,16 +98,31 @@ Joshua's real PC.
 
 ## D. Memory
 
-- [ ] **#12 — Local memory store [M–L].** Visited pages chunked + embedded
+- [~] **#12 — Local memory store [M–L].** Visited pages chunked + embedded
   into a local file store; chat can answer "that thing I read last week…".
   Plus a short interests file the person can read, edit, and delete. Off for
   sensitive sites; nothing ever leaves the disk.
+  *(Built 2026-11-11: new forge/browser/memory.py — facts store at
+  ~/.forge/memory.json (remember/forget/recall, dedup, embedding
+  search with keyword fallback, JSON export, sensitive-URL
+  withholding); page store at ~/.forge/page-memory.json (chunks kept
+  as TEXT, embedded only on explicit recall — embedding at visit
+  time would keep evicting the chat brain; recall_pages ACTION +
+  `memory pages` CLI). Suite 115/115; stub E2E (facts + pages + CLI).
+  Real-PC verdict open.)*
 
 ## E. Voice
 
-- [ ] **#13 — Push-to-talk [M].** Hold a button (or a key), speak the command,
+- [~] **#13 — Push-to-talk [M].** Hold a button (or a key), speak the command,
   whisper.cpp base.en transcribes, text lands in the chat box.
   Record-then-transcribe; no wake word, no always-listening.
+  *(Built 2026-11-11: new forge/browser/voice.py — Recorder over
+  arecord/parecord/ffmpeg (16 kHz mono WAV, killed on release,
+  empty recordings refused); dock "🎤 Hold to talk" button (button
+  reads "● Listening…" while held, text lands in the entry for
+  review, never auto-sent); `voice [seconds]` CLI. Suite 122/122;
+  Qt offscreen smoke (fake arecord + stub transcriber: hold →
+  "hello from the mic" in the entry). Real-PC verdict open.)*
 
 ## F. The window itself
 
