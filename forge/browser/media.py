@@ -69,7 +69,12 @@ def installed_models():
 
 
 def pick_vision_model():
-    """The configured/installed local vision seat's model name, or None."""
+    """The configured/installed local vision seat's model name, or None.
+    A pick saved in the seats file wins; then the env var."""
+    from .seats import load_seats
+    picked = load_seats().get("vision")
+    if picked:
+        return picked
     override = os.environ.get("FORGE_VISION_MODEL", "").strip()
     if override:
         return override

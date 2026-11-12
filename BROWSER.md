@@ -91,6 +91,35 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Model picker + AI controls
+
+The chat dock has three seat dropdowns — Brain, Fast, Vision —
+fed by `ollama list`, plus a master AI switch and one toggle per
+feature (Chat, Tidy titles, Memory). Picks live in
+`~/.forge/seats.json` and apply at once; a pick beats the env
+var (`FORGE_BROWSER_CHAT_MODEL`, `FORGE_VISION_MODEL`), which
+beats the automatic choice. "(auto)" means no pick saved.
+
+- Brain: the model the dock chats with. Picking one switches
+  the session live; the header shows what is driving the chat.
+- Fast: the model that writes short tab titles. None (the
+  default) means the brain does it — no extra model swap on a
+  one-model machine.
+- Vision: the model that describes images. Used by `describe`
+  and by fetch-any on image files.
+- AI off: every AI feature stops — chat, tidy titles, memory
+  context and page recording, summarize, brief, compare,
+  research, and voice. The browser itself keeps working.
+- Chat off: the dock is quiet, but tidy titles and memory keep
+  running. Tidy titles off: tabs keep their raw titles.
+  Memory off: remembered facts are never offered as context
+  and pages are not recorded for recall.
+
+The terminal has the same controls: `seats` lists the picks
+and toggles; `seats brain qwen3:4b`, `seats brain auto`,
+`seats ai off`, `seats tidy_titles off`. Terminal chat refuses
+to start while AI or Chat is off.
+
 ## Research as a background job
 
 Ask for research in chat and the turn ends at once — the job

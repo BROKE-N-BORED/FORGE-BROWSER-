@@ -234,6 +234,12 @@ def _cmd_vault(args):
 
 def _cmd_chat(args):
     from .chat import ChatSession, LiveDisplay
+    from .seats import load_seats
+    seats = load_seats()
+    if not seats["ai_enabled"] or not seats["features"]["chat"]:
+        print("AI is off — turn it back on in the browser's chat dock "
+              "(or delete ~/.forge/seats.json).")
+        return 0
     session = ChatSession()
     print(f"Forge Browser chat — brain: {session.model or 'none'} "
           "(type quit to leave)")
@@ -423,6 +429,37 @@ def _cmd_app(args):
     return run_app(args.url)
 
 
+def _cmd_seats(args):
+    """The dock picker, from the terminal: `seats` lists the picks
+    and toggles; `seats brain qwen3:4b` picks a brain; `seats brain
+    auto` clears the pick; `seats ai off` kills all AI features."""
+    from .seats import load_seats, set_feature, set_seat
+    seats = load_seats()
+    if args.what is None:
+        for key in ("brain", "fast", "vision"):
+            print(f"{key:8} {seats[key] or '(auto)'}")
+        print(f"ai: {'on' if seats['ai_enabled'] else 'off'}")
+        for name, on in seats["features"].items():
+            print(f"{name:8} {'on' if on else 'off'}")
+        return 0
+    if args.what in ("brain", "fast", "vision"):
+        if args.value is None:
+            print(f"{args.what}: {seats[args.what] or '(auto)'}")
+            return 0
+        set_seat(args.what, None if args.value == "auto" else args.value)
+        print(f"{args.what}: {args.value}")
+        return 0
+    if args.what in ("ai", "chat", "tidy_titles", "memory"):
+        if args.value not in ("on", "off"):
+            print(f"usage: seats {args.what} on|off")
+            return 1
+        set_feature(args.what, args.value == "on")
+        print(f"{args.what}: {args.value}")
+        return 0
+    print(f"unknown seat or feature: {args.what}")
+    return 1
+
+
 def _cmd_open(args):
     from .cdp import open_browser_window
     result = open_browser_window(args.url)
@@ -466,6 +503,15 @@ def main(argv=None):
     p = sub.add_parser("preview", help="two lines about where a link goes (fetched on demand)")
     p.add_argument("url")
     p.set_defaults(func=_cmd_preview)
+
+    p = sub.add_parser("seats", help="the model seats + AI toggles (same as the dock picker)")
+    p.add_argument("what", nargs="?", default=None,
+                   choices=["brain", "fast", "vision", "ai", "chat",
+                            "tidy_titles", "memory"],
+                   help="seat or feature to show/set")
+    p.add_argument("value", nargs="?", default=None,
+                   help="model name, 'auto', or on|off")
+    p.set_defaults(func=_cmd_seats)
 
     p = sub.add_parser("voice", help="record the microphone and transcribe it (local whisper)")
     p.add_argument("seconds", nargs="?", type=int, default=5,

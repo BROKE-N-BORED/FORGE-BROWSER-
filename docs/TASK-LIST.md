@@ -158,9 +158,20 @@ Joshua's real PC.
 
 ## F. The window itself
 
-- [ ] **#14 — Model picker in the chat dock [S].** Brain / fast / vision seat
+- [~] **#14 — Model picker in the chat dock [S].** Brain / fast / vision seat
   dropdowns fed by `ollama list` instead of env vars. Plus Firefox-style AI
   controls: per-feature on/off and one master AI kill-switch.
+  *(Built 2026-11-11: new forge/browser/seats.py (~/.forge/seats.json;
+  saved pick beats env var beats auto); dock Brain/Fast/Vision
+  dropdowns + ↻ refresh + AI master + Chat/Tidy titles/Memory toggles,
+  all live (brain switches the session, fast drives tidy titles via a
+  cached session, vision drives describe); master off kills chat,
+  tidy, memory, summarize/brief/compare/research/voice; terminal
+  `seats` subcommand mirrors the picker and terminal chat refuses
+  while AI/Chat is off. Suite 163/163; stub E2E (seats CLI,
+  kill-switch, picks driving brain + vision); Qt offscreen smoke
+  (picker live, kill-switch disables Send, tidy toggle keeps raw
+  titles). Real-PC verdict open.)*
 - [~] **#15 — Morning brief card [M, needs #12].** On first launch of the day
   (or on demand): a card on the start page summarizing yesterday's browsing
   from the local memory store.

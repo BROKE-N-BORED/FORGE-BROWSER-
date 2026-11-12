@@ -125,9 +125,13 @@ def create_window(server, profile, start_url=None):
             self.tabs.setTabText(index, self._agent_mark(view) + (title or "Page")[:28])
             # Long, messy titles get a short brain-written one in the
             # background; the raw title shows until it lands.
+            # The tidy-titles toggle (or the master AI switch) turns
+            # this off entirely.
+            from .seats import seats_enabled
             session = getattr(self, "_chat_session", None)
             url = view.url().toString()
-            if session is None or not url or url.startswith("http://127.0.0.1"):
+            if (session is None or not url or url.startswith("http://127.0.0.1")
+                    or not seats_enabled("tidy_titles")):
                 return
             if url in self._tidy_cache:
                 self.tabs.setTabText(index, self._agent_mark(view) + self._tidy_cache[url])
@@ -138,9 +142,24 @@ def create_window(server, profile, start_url=None):
             threading.Thread(target=self._tidy_in_background,
                              args=(view, url, raw), daemon=True).start()
 
+        def _tidy_session(self):
+            """The fast seat for tidy titles, or the brain when no
+            fast seat is picked (same model, no extra swap)."""
+            from .chat import ChatSession
+            from .seats import pick_fast_model
+            fast = pick_fast_model()
+            session = getattr(self, "_chat_session", None)
+            if not fast or session is None or fast == session.model:
+                return session
+            cached = getattr(self, "_fast_session", None)
+            if cached is None or cached.model != fast:
+                cached = ChatSession(model=fast)
+                self._fast_session = cached
+            return cached
+
         def _tidy_in_background(self, view, url, raw):
             from .titles import tidy_title
-            tidy = tidy_title(self._chat_session, raw, url)
+            tidy = tidy_title(self._tidy_session(), raw, url)
             self._tidy_cache[url] = tidy
             self.tidy_done.emit(view, url, tidy)
 
@@ -157,7 +176,10 @@ def create_window(server, profile, start_url=None):
             record_visit(url, title)
             # Keep the page's text for later recall ("that thing I
             # read...") — chunks only, no model call at visit time.
-            if url.startswith("http://127.0.0.1"):
+            # The memory toggle (or the master AI switch) turns
+            # this off entirely.
+            from .seats import seats_enabled
+            if url.startswith("http://127.0.0.1") or not seats_enabled("memory"):
                 return
 
             def got_page(page_text):
@@ -337,24 +359,118 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     dock.setWidget(panel)
     dock.setMinimumWidth(320)
     window.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
-    if not model:
-        entry.setEnabled(False)
-        send.setEnabled(False)
-        summarize_btn.setEnabled(False)
-        mic_btn.setEnabled(False)
-        return
 
     state = {"busy": False, "live": False}
+
+    # --- Model picker + AI controls (task #14) -----------------
+    # Three seat dropdowns fed by `ollama list`, plus Firefox-style
+    # toggles: one master AI kill-switch and one per feature. Picks
+    # live in ~/.forge/seats.json and apply at once.
+    from .chat import list_models as _list_models
+    from .seats import load_seats, set_feature, set_seat
+
+    seat_row = QtWidgets.QHBoxLayout()
+    combos = {}
+    for label, key in (("Brain", "brain"), ("Fast", "fast"), ("Vision", "vision")):
+        seat_row.addWidget(QtWidgets.QLabel(label))
+        combo = QtWidgets.QComboBox()
+        combo.setObjectName(f"{key}_combo")
+        combos[key] = combo
+        seat_row.addWidget(combo)
+    refresh_btn = QtWidgets.QPushButton("↻")
+    refresh_btn.setObjectName("refresh_seats")
+    refresh_btn.setToolTip("Re-read the models Ollama has installed")
+    seat_row.addWidget(refresh_btn)
+    layout.addLayout(seat_row)
+
+    toggle_row = QtWidgets.QHBoxLayout()
+    ai_toggle = QtWidgets.QCheckBox("AI")
+    ai_toggle.setObjectName("ai_toggle")
+    chat_toggle = QtWidgets.QCheckBox("Chat")
+    chat_toggle.setObjectName("chat_toggle")
+    tidy_toggle = QtWidgets.QCheckBox("Tidy titles")
+    tidy_toggle.setObjectName("tidy_toggle")
+    memory_toggle = QtWidgets.QCheckBox("Memory")
+    memory_toggle.setObjectName("memory_toggle")
+    for box in (ai_toggle, chat_toggle, tidy_toggle, memory_toggle):
+        toggle_row.addWidget(box)
+    layout.addLayout(toggle_row)
+
+    def apply_ai_state():
+        """Header + which controls are live, from the seats file
+        and whether a brain is answering. Never re-enables the
+        send controls mid-turn."""
+        seats = load_seats()
+        ai_on = seats["ai_enabled"]
+        chat_on = seats["features"]["chat"]
+        if not ai_on:
+            header.setText("AI is off — turn it on below to use chat, "
+                           "tidy titles, and memory.")
+        elif not chat_on:
+            header.setText("Chat is off — turn it on below to talk "
+                           "to the browser.")
+        elif not session.model:
+            header.setText("Brain: none answering — start Ollama, "
+                           "then ↻. Browsing still works.")
+        else:
+            header.setText(f"Brain: {session.model} (local, no key, no account)")
+        chat_ok = ai_on and chat_on and bool(session.model)
+        busy = state["busy"]
+        entry.setEnabled(chat_ok and not busy)
+        send.setEnabled(chat_ok and not busy)
+        summarize_btn.setEnabled(chat_ok and not busy)
+        mic_btn.setEnabled(chat_ok and not busy)
+        ai_toggle.setChecked(ai_on)
+        chat_toggle.setChecked(chat_on)
+        tidy_toggle.setChecked(seats["features"]["tidy_titles"])
+        memory_toggle.setChecked(seats["features"]["memory"])
+        for box in (chat_toggle, tidy_toggle, memory_toggle):
+            box.setEnabled(ai_on)
+
+    def fill_seat_combos():
+        models = _list_models()
+        seats = load_seats()
+        for key, combo in combos.items():
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(auto)")
+            combo.addItems(models)
+            pick = seats.get(key)
+            combo.setCurrentText(pick if pick in models else "(auto)")
+            combo.blockSignals(False)
+
+    def on_seat_changed(key):
+        def handler():
+            text = combos[key].currentText()
+            set_seat(key, None if text == "(auto)" else text)
+            if key == "brain":
+                from .chat import pick_chat_model
+                session.model = pick_chat_model()
+                apply_ai_state()
+            elif key == "fast":
+                window._fast_session = None
+        return handler
+
+    for key in combos:
+        combos[key].currentTextChanged.connect(on_seat_changed(key))
+    refresh_btn.clicked.connect(lambda: (fill_seat_combos(), apply_ai_state()))
+    ai_toggle.toggled.connect(lambda on: (set_feature("ai", on), apply_ai_state()))
+    chat_toggle.toggled.connect(lambda on: (set_feature("chat", on), apply_ai_state()))
+    tidy_toggle.toggled.connect(
+        lambda on: (set_feature("tidy_titles", on), apply_ai_state()))
+    memory_toggle.toggled.connect(
+        lambda on: (set_feature("memory", on), apply_ai_state()))
+    fill_seat_combos()
+    apply_ai_state()
 
     def append(who, text):
         log.append(f"<b>{who}:</b> {text}")
 
     def finish():
         state["busy"] = False
-        send.setEnabled(True)
-        summarize_btn.setEnabled(True)
         stop_btn.setEnabled(False)
-        entry.setEnabled(True)
+        apply_ai_state()
+        entry.setFocus()
         entry.setFocus()
 
     def on_token(text):

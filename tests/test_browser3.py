@@ -60,10 +60,24 @@ class PickModelTests(unittest.TestCase):
 
     def test_env_wins(self):
         os.environ["FORGE_BROWSER_CHAT_MODEL"] = "my-model:7b"
+        os.environ["FORGE_BROWSER_SEATS_PATH"] = "/tmp/fb-no-seats-here.json"
         try:
             self.assertEqual(chat.pick_chat_model(["qwen3:4b"]), "my-model:7b")
         finally:
             del os.environ["FORGE_BROWSER_CHAT_MODEL"]
+            del os.environ["FORGE_BROWSER_SEATS_PATH"]
+
+    def test_seats_pick_beats_env(self):
+        from forge.browser import seats as seats_module
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["FORGE_BROWSER_SEATS_PATH"] = os.path.join(tmp, "seats.json")
+            os.environ["FORGE_BROWSER_CHAT_MODEL"] = "my-model:7b"
+            try:
+                seats_module.set_seat("brain", "qwen3:4b")
+                self.assertEqual(chat.pick_chat_model(["qwen3:4b"]), "qwen3:4b")
+            finally:
+                del os.environ["FORGE_BROWSER_CHAT_MODEL"]
+                del os.environ["FORGE_BROWSER_SEATS_PATH"]
 
 
 class ChatCallTests(unittest.TestCase):
@@ -885,6 +899,28 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(any("I like dark mode." in t for t in system_texts))
         self.assertEqual(answer, "Use dark mode then.")
 
+    def test_memory_withheld_when_feature_off(self):
+        from forge.browser import memory as memory_module
+        from forge.browser import seats as seats_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(tmp, "m.json")
+            os.environ["FORGE_BROWSER_SEATS_PATH"] = os.path.join(tmp, "seats.json")
+            try:
+                memory_module.remember("I like dark mode.")
+                seats_module.set_feature("memory", False)
+                session = self.make_session(["Use dark mode then."])
+                answer, _opens = session.ask("should I use dark mode?")
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEMORY_PATH"] = old
+                del os.environ["FORGE_BROWSER_SEATS_PATH"]
+        first_call = session.seen[0]
+        system_texts = [m["content"] for m in first_call if m["role"] == "system"]
+        self.assertFalse(any("I like dark mode." in t for t in system_texts))
+
     def test_memory_withheld_on_sensitive_page(self):
         from forge.browser import memory as memory_module
         with tempfile.TemporaryDirectory() as tmp:
@@ -1018,6 +1054,64 @@ class SessionTests(unittest.TestCase):
             chat.pick_chat_model = original
         with self.assertRaises(BrowserError):
             session.ask("hi")
+
+
+class SeatsTests(unittest.TestCase):
+    """#14: seat picks + AI toggles saved in the seats file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["FORGE_BROWSER_SEATS_PATH"] = os.path.join(
+            self.tmp.name, "seats.json")
+
+    def tearDown(self):
+        del os.environ["FORGE_BROWSER_SEATS_PATH"]
+        self.tmp.cleanup()
+
+    def test_defaults_all_on_no_picks(self):
+        from forge.browser.seats import load_seats
+        seats = load_seats()
+        self.assertIsNone(seats["brain"])
+        self.assertIsNone(seats["fast"])
+        self.assertIsNone(seats["vision"])
+        self.assertTrue(seats["ai_enabled"])
+        self.assertTrue(all(seats["features"].values()))
+
+    def test_set_seat_round_trips_and_clears(self):
+        from forge.browser.seats import load_seats, set_seat
+        set_seat("brain", "qwen3:4b")
+        self.assertEqual(load_seats()["brain"], "qwen3:4b")
+        set_seat("brain", None)
+        self.assertIsNone(load_seats()["brain"])
+        set_seat("vision", "  ")
+        self.assertIsNone(load_seats()["vision"])
+
+    def test_master_switch_kills_every_feature(self):
+        from forge.browser.seats import seats_enabled, set_feature
+        set_feature("ai", False)
+        for feature in ("chat", "tidy_titles", "memory"):
+            self.assertFalse(seats_enabled(feature))
+
+    def test_feature_toggle_kills_only_that_feature(self):
+        from forge.browser.seats import seats_enabled, set_feature
+        set_feature("tidy_titles", False)
+        self.assertFalse(seats_enabled("tidy_titles"))
+        self.assertTrue(seats_enabled("chat"))
+        self.assertTrue(seats_enabled("memory"))
+
+    def test_fast_pick_defaults_to_none(self):
+        from forge.browser.seats import pick_fast_model, set_seat
+        self.assertIsNone(pick_fast_model())
+        set_seat("fast", "qwen3:1.7b")
+        self.assertEqual(pick_fast_model(), "qwen3:1.7b")
+
+    def test_vision_pick_beats_auto_choice(self):
+        from unittest import mock
+        from forge.browser import media, seats as seats_module
+        seats_module.set_seat("vision", "moondream:1.8b")
+        with mock.patch.object(media, "installed_models",
+                               return_value=["qwen3.5:4b"]):
+            self.assertEqual(media.pick_vision_model(), "moondream:1.8b")
 
 
 class ResearchJobTests(unittest.TestCase):

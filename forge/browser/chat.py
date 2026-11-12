@@ -103,12 +103,16 @@ def list_models():
 
 
 def pick_chat_model(models=None):
-    """Which local model drives the chat. Env wins; then the
-    ordered preference (qwen3.5:4b → qwen3:4b → qwen3:1.7b);
-    then any chat-shaped name; then whatever is there.
-    None = no brain."""
+    """Which local model drives the chat. A pick saved in the
+    seats file wins; then the env var; then the ordered
+    preference (qwen3.5:4b → qwen3:4b → qwen3:1.7b); then any
+    chat-shaped name; then whatever is there. None = no brain."""
     if models is None:
         models = list_models()
+    from .seats import load_seats
+    picked = load_seats().get("brain")
+    if picked:
+        return picked
     wanted = os.environ.get("FORGE_BROWSER_CHAT_MODEL", "").strip()
     if wanted:
         return wanted
@@ -325,7 +329,8 @@ class ChatSession:
                 if tab.get("current"):
                     page_url = tab.get("url") or ""
                     break
-        if not is_sensitive_url(page_url):
+        from .seats import seats_enabled
+        if seats_enabled("memory") and not is_sensitive_url(page_url):
             from .retrieve import embed_texts
             found = search_entries(user_text, embed_fn=embed_texts)
             if found:
