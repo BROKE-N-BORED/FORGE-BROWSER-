@@ -674,6 +674,34 @@ class WebUITests(unittest.TestCase):
         self.assertIn("Shop A", page)
         self.assertIn("http://shop.example/a", page)
 
+    def test_start_page_shows_morning_brief(self):
+        import json
+        from unittest import mock
+        from forge.browser import brief as brief_module
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                forge_dir = os.path.join(tmp, ".forge")
+                os.makedirs(forge_dir)
+                day = brief_module.yesterday_date()
+                with open(os.path.join(forge_dir, f"brief-{day}.json"), "w") as handle:
+                    json.dump({"date": day, "summary": "You were reading about gears.",
+                               "pages": [{"url": "http://gears.example/",
+                                          "title": "Gear Guide"}]}, handle)
+                page = webui.start_page()
+        self.assertIn("Morning brief", page)
+        self.assertIn("You were reading about gears.", page)
+        self.assertIn("Gear Guide", page)
+
+    def test_start_page_brief_missing_note(self):
+        from unittest import mock
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                page = webui.start_page()
+        self.assertIn("Morning brief", page)
+        self.assertIn("No brief yet", page)
+
     def test_app_without_qt_says_how_to_fix(self):
         try:
             import PySide6  # noqa: F401

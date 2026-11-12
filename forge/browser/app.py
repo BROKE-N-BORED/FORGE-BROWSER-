@@ -210,6 +210,18 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     session = ChatSession(model=model)
     window._chat_session = session  # tab titles tidy against this brain
 
+    def _build_brief_in_background():
+        # The morning brief builds once a day in the background; the
+        # start page shows it on its next load. A failed brain call
+        # is not cached, so the next launch retries.
+        from .brief import build_brief
+        try:
+            build_brief(session)
+        except Exception:
+            pass
+
+    threading.Thread(target=_build_brief_in_background, daemon=True).start()
+
     dock = QtWidgets.QDockWidget("Chat — talk to your browser", window)
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)

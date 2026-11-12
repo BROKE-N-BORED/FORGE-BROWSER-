@@ -16,6 +16,7 @@ time with a line like:
     ACTION {"type": "forget", "text": "dark mode"}
     ACTION {"type": "recall"}
     ACTION {"type": "recall_pages", "query": "that thing about gears"}
+    ACTION {"type": "brief"}
 
 The session runs the action with the real engine, hands the
 result back to the model, and the model answers from what it
@@ -65,6 +66,7 @@ ACTION {"type": "remember", "text": "the person likes dark mode"}
 ACTION {"type": "forget", "text": "dark mode"}
 ACTION {"type": "recall"}
 ACTION {"type": "recall_pages", "query": "that thing about gears"}
+ACTION {"type": "brief"}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
 directly with no ACTION line. Never invent page contents, prices, or facts.
@@ -74,6 +76,7 @@ When the person asks you to remember something, use the remember action
 with their exact words. Recall lists what you remember; forget removes it.
 When the person asks about something they read before ("that thing I read
 last week"), use recall_pages with their words as the query.
+When the person asks for the morning brief, use the brief action.
 Your first action each turn is shown to the person as a plan for
 approval before it runs, and anything that changes what is
 remembered asks again — so propose one clear step at a time,
@@ -161,6 +164,8 @@ def describe_action(kind, action):
         return "List what has been remembered"
     if kind == "recall_pages":
         return f"Search pages you visited for \"{action.get('query', '')}\""
+    if kind == "brief":
+        return "Build the morning brief from yesterday's pages"
     return f"Run the {kind} action"
 
 
@@ -230,6 +235,11 @@ class ChatSession:
         call already in flight finishes first — Stop lands between
         steps, never mid-word."""
         self._stop_requested = True
+
+    def ask_once(self, prompt):
+        """One brain call with no action loop — for one-shot jobs
+        like the morning brief. Returns the reply text."""
+        return self._chat([{"role": "user", "content": prompt}])
 
     def _chat(self, messages, on_chunk=None):
         """One brain call. Without on_chunk this waits for the
@@ -436,6 +446,9 @@ class ChatSession:
                     else:
                         result = ("Nothing in the pages you visited "
                                   "matches that.")
+                elif kind == "brief":
+                    from .brief import brief_text, build_brief
+                    result = brief_text(build_brief(self))
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:

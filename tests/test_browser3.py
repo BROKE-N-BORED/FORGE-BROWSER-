@@ -1020,6 +1020,143 @@ class SessionTests(unittest.TestCase):
             session.ask("hi")
 
 
+class BriefTests(unittest.TestCase):
+    """#15: the morning brief, from the local memory store."""
+
+    def _seed(self, tmp, now):
+        import datetime
+        import time as _time
+        yesterday = datetime.date.fromtimestamp(now) - datetime.timedelta(days=1)
+        yday_start = _time.mktime(yesterday.timetuple())
+        today_start = _time.mktime(
+            datetime.date.fromtimestamp(now).timetuple())
+        page_path = os.path.join(tmp, "p.json")
+        with open(page_path, "w") as handle:
+            json.dump({"pages": [
+                {"url": "http://gears.example/", "title": "Gear Guide",
+                 "at": yday_start + 36000, "chunks": ["Gears turn wheels."]},
+                {"url": "http://today.example/", "title": "Today Page",
+                 "at": today_start + 36000, "chunks": ["Today stuff."]}]}, handle)
+        history_path = os.path.join(tmp, "h.json")
+        with open(history_path, "w") as handle:
+            json.dump([
+                {"url": "http://soup.example/", "title": "Soup",
+                 "at": yday_start + 72000},
+                {"url": "http://gears.example/", "title": "Gear Guide",
+                 "at": yday_start + 1000}], handle)
+        return page_path, history_path, yday_start
+
+    def _env(self, tmp, page_path, history_path):
+        from unittest import mock
+        return mock.patch.dict(os.environ, {
+            "HOME": tmp,
+            "FORGE_BROWSER_PAGE_MEMORY_PATH": page_path,
+            "FORGE_BROWSER_HISTORY_PATH": history_path})
+
+    def test_yesterday_pages_filters_by_date(self):
+        import time as _time
+        from forge.browser import brief as brief_module
+        now = _time.mktime((2026, 11, 11, 12, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as tmp:
+            page_path, history_path, _start = self._seed(tmp, now)
+            with self._env(tmp, page_path, history_path):
+                pages = brief_module.yesterday_pages(now=now)
+        self.assertEqual([p["url"] for p in pages],
+                         ["http://soup.example/", "http://gears.example/"])
+        self.assertEqual(pages[1]["text"], "Gears turn wheels.")
+
+    def test_build_brief_summarizes_and_caches(self):
+        import time as _time
+        from unittest import mock
+        from forge.browser import brief as brief_module
+        now = _time.mktime((2026, 11, 11, 12, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as tmp:
+            page_path, history_path, _start = self._seed(tmp, now)
+            with self._env(tmp, page_path, history_path):
+                session = mock.Mock(model="fake:1b")
+                session.ask_once.return_value = "You were reading about gears."
+                first = brief_module.build_brief(session, now=now)
+                self.assertEqual(first["summary"],
+                                 "You were reading about gears.")
+                self.assertEqual(len(first["pages"]), 2)
+                session.ask_once.side_effect = Exception("brain down")
+                second = brief_module.build_brief(session, now=now)
+                self.assertEqual(second, first)
+                self.assertEqual(session.ask_once.call_count, 1)
+
+    def test_build_brief_no_brain_lists_pages(self):
+        import time as _time
+        from forge.browser import brief as brief_module
+        now = _time.mktime((2026, 11, 11, 12, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as tmp:
+            page_path, history_path, _start = self._seed(tmp, now)
+            with self._env(tmp, page_path, history_path):
+                brief = brief_module.build_brief(None, now=now)
+            self.assertIsNone(brief["summary"])
+            self.assertEqual(len(brief["pages"]), 2)
+            self.assertTrue(os.path.exists(
+                os.path.join(tmp, ".forge", "brief-2026-11-10.json")))
+
+    def test_build_brief_failed_brain_not_cached(self):
+        import time as _time
+        from unittest import mock
+        from forge.browser import brief as brief_module
+        now = _time.mktime((2026, 11, 11, 12, 0, 0, 0, 0, -1))
+        with tempfile.TemporaryDirectory() as tmp:
+            page_path, history_path, _start = self._seed(tmp, now)
+            with self._env(tmp, page_path, history_path):
+                session = mock.Mock(model="fake:1b")
+                session.ask_once.side_effect = Exception("brain down")
+                first = brief_module.build_brief(session, now=now)
+                self.assertIsNone(first["summary"])
+                self.assertFalse(os.path.exists(
+                    os.path.join(tmp, ".forge", "brief-2026-11-10.json")))
+                second = brief_module.build_brief(session, now=now)
+                self.assertEqual(session.ask_once.call_count, 2)
+
+    def test_brief_text_empty_day(self):
+        from forge.browser import brief as brief_module
+        self.assertIn("Nothing to brief",
+                      brief_module.brief_text({"date": "2026-11-10",
+                                               "pages": [], "summary": None}))
+
+    def test_chat_brief_action(self):
+        import datetime
+        import time as _time
+        yesterday = datetime.date.today() - datetime.timedelta(days=1)
+        at = _time.mktime(yesterday.timetuple()) + 36000
+        with tempfile.TemporaryDirectory() as tmp:
+            page_path = os.path.join(tmp, "p.json")
+            with open(page_path, "w") as handle:
+                json.dump({"pages": [
+                    {"url": "http://gears.example/", "title": "Gear Guide",
+                     "at": at, "chunks": ["Gears turn wheels."]}]}, handle)
+            history_path = os.path.join(tmp, "h.json")
+            with open(history_path, "w") as handle:
+                json.dump([], handle)
+            with self._env(tmp, page_path, history_path):
+                seen = []
+                queue = ['ACTION {"type": "brief"}',
+                         "You were reading about gears.",
+                         "here's your brief"]
+                session = chat.ChatSession(model="fake:1b")
+
+                def fake_chat(messages, on_chunk=None):
+                    seen.append(messages)
+                    return queue.pop(0)
+
+                session._chat = fake_chat
+                answer, _opens = session.ask("give me my morning brief",
+                                             on_plan=lambda plan: True)
+        self.assertEqual(answer, "here's your brief")
+        # The brief's page list and summary reached the brain as the
+        # ACTION result (chunk text itself is not in the brief text).
+        result = [m["content"] for m in seen[2]
+                  if m["content"].startswith("RESULT of brief")][0]
+        self.assertIn("Gear Guide", result)
+        self.assertIn("You were reading about gears.", result)
+
+
 class PlanGateTests(unittest.TestCase):
     """#10: the plan gate, the submit re-ask, and Stop."""
 

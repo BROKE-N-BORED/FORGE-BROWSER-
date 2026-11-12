@@ -393,6 +393,14 @@ def _cmd_voice(args):
     return 0
 
 
+def _cmd_brief(args):
+    from .brief import brief_text, build_brief
+    from .chat import ChatSession
+    session = ChatSession()
+    print(brief_text(build_brief(session if session.model else None)))
+    return 0
+
+
 def _cmd_app(args):
     from .app import run_app
     return run_app(args.url)
@@ -434,6 +442,9 @@ def main(argv=None):
     p.add_argument("value", nargs="?", default="",
                    help="the fact, the search, or the export path")
     p.set_defaults(func=_cmd_memory)
+
+    p = sub.add_parser("brief", help="the morning brief — what yesterday's browsing was about")
+    p.set_defaults(func=_cmd_brief)
 
     p = sub.add_parser("voice", help="record the microphone and transcribe it (local whisper)")
     p.add_argument("seconds", nargs="?", type=int, default=5,

@@ -137,9 +137,16 @@ Joshua's real PC.
 - [ ] **#14 — Model picker in the chat dock [S].** Brain / fast / vision seat
   dropdowns fed by `ollama list` instead of env vars. Plus Firefox-style AI
   controls: per-feature on/off and one master AI kill-switch.
-- [ ] **#15 — Morning brief card [M, needs #12].** On first launch of the day
+- [~] **#15 — Morning brief card [M, needs #12].** On first launch of the day
   (or on demand): a card on the start page summarizing yesterday's browsing
   from the local memory store.
+  *(Built 2026-11-11: new forge/browser/brief.py — yesterday's
+  pages from the page store + history, brain-written summary via
+  ChatSession.ask_once, cached once a day at ~/.forge/brief-<date>.json
+  (a failed brain call is NOT cached); start page shows the cached
+  brief or a plain "no brief yet" note; `brief` chat ACTION + `brief`
+  CLI; background build on launch. Suite 136/136; stub E2E (CLI
+  brief built, cached, reused). Real-PC verdict open.)*
 - [ ] **#16 — Chat progress honesty [S].** Extend the dock's "working: …" line
   with elapsed time and a cancel button per turn (pairs with #10's Stop).
 

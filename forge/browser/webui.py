@@ -40,8 +40,29 @@ a:hover { text-decoration: underline; }
 
 
 def start_page():
+    from .brief import load_brief, yesterday_date
     from .titles import grouped_history
     status = html.escape(engines.format_status(engines.engine_status()))
+    day = yesterday_date()
+    cached = load_brief(day)
+    if cached is None:
+        brief = ('<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>'
+                 '<p class="sub">No brief yet for yesterday — it builds in the '
+                 'background after launch, or ask for it in chat.</p>')
+    elif not cached["pages"]:
+        brief = ('<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>'
+                 f'<p class="sub">Nothing to brief for {html.escape(day)} — '
+                 'no pages yesterday.</p>')
+    else:
+        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>']
+        if cached.get("summary"):
+            parts.append(f'<p>{html.escape(cached["summary"])}</p>')
+        for page in cached["pages"][:6]:
+            parts.append(
+                f'<div class="result"><a class="t" href="{html.escape(page["url"])}">'
+                f"{html.escape(page['title'])}</a>"
+                f'<div class="u">{html.escape(page["url"])}</div></div>')
+        brief = "\n".join(parts)
     recent = ""
     groups = grouped_history()
     if groups:
@@ -64,6 +85,7 @@ def start_page():
 <input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
 <button type="submit">Search</button>
 </form>
+{brief}
 {recent}
 <div class="status">{status}</div>
 </div></body></html>"""

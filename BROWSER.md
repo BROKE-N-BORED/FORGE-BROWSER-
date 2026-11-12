@@ -91,6 +91,18 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Morning brief
+
+On first launch of the day the browser builds, in the background,
+a short card about what yesterday's browsing was about — from the
+local memory store, cached at `~/.forge/brief-YYYY-MM-DD.json`
+(yesterday's date) and shown on the start page the next time it
+loads. The brain writes the summary when one is answering;
+otherwise the card is the plain list of pages. A day with no
+pages says so, and a failed brain call is not cached — the next
+launch retries. On demand: ask "give me my morning brief" in
+chat, or `python3 -m forge.browser brief` in the terminal.
+
 ## Plan, run, interrupt
 
 The brain never acts on its own. When it wants to do something,

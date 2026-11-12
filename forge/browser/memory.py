@@ -258,3 +258,9 @@ def list_pages():
     """Stored pages, newest first: url, title, chunk count."""
     return [{"url": p["url"], "title": p["title"], "at": p.get("at", 0),
              "chunks": len(p["chunks"])} for p in _load_pages()]
+
+
+def page_texts():
+    """Stored pages with their chunks (for the morning brief)."""
+    return [{"url": p["url"], "title": p["title"], "at": p.get("at", 0),
+             "chunks": list(p["chunks"])} for p in _load_pages()]
