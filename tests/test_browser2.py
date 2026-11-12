@@ -412,7 +412,9 @@ class FileTests(unittest.TestCase):
 
 
 class DownloadCapTests(unittest.TestCase):
-    """Task #17: no download may fill the machine's memory."""
+    """Task #17: no download may fill the machine's memory. Files
+    stream to disk with no size cap (Joshua's call, 2026-11-11);
+    only reads into memory are capped."""
 
     @classmethod
     def setUpClass(cls):
@@ -459,6 +461,20 @@ class DownloadCapTests(unittest.TestCase):
         self.assertEqual(size, 2048)
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), b"x" * 2048)
+
+    def test_no_file_cap_by_default(self):
+        # Joshua's call (2026-11-11): downloads need no cap — his
+        # machine has plenty of storage. The default is uncapped;
+        # only an explicit max_bytes refuses (see the test above).
+        path = os.path.join(self.tmp, "uncapped.bin")
+        _url, _headers, size = http_get_to_file(
+            self.base + "/big.bin", path, allow_local=True)
+        self.assertEqual(size, 2048)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_no_file_cap_constant(self):
+        from forge.browser import _http
+        self.assertFalse(hasattr(_http, "MAX_FILE_BYTES"))
 
     def test_fetch_any_binary_past_memory_cap(self):
         # A binary over the in-memory cap still downloads — it

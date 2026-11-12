@@ -6,12 +6,17 @@ it, and turns every failure into a BrowserError in plain words. No
 cookies are stored, no headers beyond User-Agent / Accept are sent,
 and there is no key or token of any kind to send.
 
-Download caps (task #17): nothing is ever read into memory without
-a limit. In-memory bodies stop at MAX_BODY_BYTES; files saved to
-disk stream there in chunks and stop at MAX_FILE_BYTES. A declared
-Content-Length over the cap is refused from the headers alone, and
-the cap counts decompressed bytes, so a gzip bomb cannot sneak past
-a small wire size. On a refusal the partial file is removed.
+Download limits (task #17, revised 2026-11-11 at Joshua's order —
+downloads need no cap, his machine has plenty of storage): files
+saved to disk stream there in chunks with NO size limit; his disk
+is the only limit. The one limit that stays is in-memory bodies,
+capped at MAX_BODY_BYTES — that is a RAM guard on an 8 GB machine,
+not a download cap: a big text file is saved to disk and reported
+as saved, never refused. A declared Content-Length over the
+in-memory cap is refused from the headers alone, and the cap
+counts decompressed bytes, so a gzip bomb cannot sneak past a
+small wire size. An explicit max_bytes passed to http_get_to_file
+still refuses over that size and removes the partial file.
 """
 
 import ipaddress
@@ -79,11 +84,11 @@ def check_fetch_url(url, allow_local=False):
 USER_AGENT = "ForgeBrowser/0.1 (Code Forge; +https://github.com/BROKE-N-BORED/CODE-FORGE)"
 DEFAULT_TIMEOUT = 20  # seconds
 
-# 32 MiB in memory (pages, PDFs, text) and 512 MiB streamed to disk
-# (images, audio, video). On an 8 GB machine the browser + model
-# already hold most of the RAM; no single download may add more.
+# 32 MiB in memory (pages, PDFs, text). On an 8 GB machine the
+# browser + model already hold most of the RAM; no single read into
+# memory may add more. Downloads to disk have NO cap (Joshua's
+# call, 2026-11-11) — the disk is the limit, not the browser.
 MAX_BODY_BYTES = 32 * 1024 * 1024
-MAX_FILE_BYTES = 512 * 1024 * 1024
 _CHUNK = 65536
 
 
@@ -96,8 +101,9 @@ def _refuse_too_big(url, size, cap):
 
 def _precheck_length(headers, max_bytes, url):
     """Refuse from the declared Content-Length alone, before any
-    body bytes are read."""
-    if headers is None:
+    body bytes are read. max_bytes None means no cap — nothing
+    to refuse."""
+    if headers is None or max_bytes is None:
         return
     length = headers.get("Content-Length")
     if length is None:
@@ -112,7 +118,8 @@ def _precheck_length(headers, max_bytes, url):
 
 def _iter_chunks(response, max_bytes, url):
     """Yield body chunks, enforcing the cap on the bytes the caller
-    keeps — decompressed bytes when the server sent gzip."""
+    keeps — decompressed bytes when the server sent gzip. max_bytes
+    None means no cap: every chunk is yielded."""
     gzipped = response.headers.get("Content-Encoding") == "gzip"
     decoder = zlib.decompressobj(31) if gzipped else None
     total = 0
@@ -127,7 +134,7 @@ def _iter_chunks(response, max_bytes, url):
                 f"the site sent a download Forge Browser could not "
                 f"decompress ({url})") from exc
         total += len(chunk)
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             _refuse_too_big(url, total, max_bytes)
         if chunk:
             yield chunk
@@ -139,7 +146,7 @@ def _iter_chunks(response, max_bytes, url):
                 f"the site sent a download Forge Browser could not "
                 f"decompress ({url})") from exc
         total += len(tail)
-        if total > max_bytes:
+        if max_bytes is not None and total > max_bytes:
             _refuse_too_big(url, total, max_bytes)
         if tail:
             yield tail
@@ -174,13 +181,15 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES,
         raise BrowserError(f"timed out after {timeout}s reading {url}") from exc
 
 
-def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_FILE_BYTES,
+def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=None,
                      allow_local=False):
     """Stream ``url`` straight to ``path``; RAM stays flat no
     matter the size. Returns (final_url, headers, size_bytes).
-    Over max_bytes the download is refused and the partial file
-    is removed. Raises BrowserError in plain words on failure.
-    Local addresses are refused unless allow_local (task #20)."""
+    No size limit by default — the disk is the limit (Joshua's
+    call, 2026-11-11). An explicit max_bytes still refuses over
+    that size and removes the partial file. Raises BrowserError
+    in plain words on failure. Local addresses are refused
+    unless allow_local (task #20)."""
     check_fetch_url(url, allow_local=allow_local)
     try:
         with urllib.request.urlopen(_request(url), timeout=timeout) as response:

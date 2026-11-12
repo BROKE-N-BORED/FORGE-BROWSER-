@@ -203,7 +203,13 @@ Joshua's real PC.
   to disk, Content-Length refused from headers, cap counts decompressed
   bytes (gzip bombs refused), partial files removed; fetch_any streams
   to a temp file first and reads text back only under the memory cap.
-  Suite 75/75 incl. 6 new cap tests. Real-PC verdict open.)*
+  Suite 75/75 incl. 6 new cap tests. REVISED same day at Joshua's order
+  ("downloads don't need a cap, my computer has plenty of storage"):
+  the 512 MiB file cap is GONE — downloads stream to disk with no size
+  limit, his disk is the only limit. The 32 MiB in-memory guard stays:
+  that is RAM protection on an 8 GB machine, and it never refuses a
+  download — a big text file is saved to disk instead of read.
+  Real-PC verdict open.)*
 - [~] **#18 — [E2] Markdown table separator row.** html2md tables currently
   aren't valid Markdown tables.
   *(Fixed 2026-11-11: html2md now emits `| --- | --- |` after the first

@@ -255,11 +255,12 @@ def fetch_any(url, timeout=30, describe=True, transcribe=True,
     """Fetch any URL and return a FileResult for whatever it is.
 
     The download streams straight to a temp file first (task #17),
-    so RAM stays flat no matter the size — the file cap, not memory,
-    is the limit. Text kinds are read back only when they fit the
-    in-memory cap; anything bigger is kept on disk and reported
-    as saved, never half-read. Local addresses are refused unless
-    allow_local (task #20).
+    so RAM stays flat no matter the size — there is no file-size
+    cap (Joshua's call, 2026-11-11: his disk is the limit). Text
+    kinds are read back only when they fit the in-memory cap;
+    anything bigger is kept on disk and reported as saved, never
+    half-read. Local addresses are refused unless allow_local
+    (task #20).
     """
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
