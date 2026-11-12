@@ -77,7 +77,9 @@ def verify_in_browser(target, workspace, engine="auto", session_factory=None):
             return result
         except BrowserError as exc:
             # No engine available: fall back to the plain read and say so.
-            page = _plain_fetch(url)
+            # The page is verify's own throwaway local server, so the
+            # fetch fence is explicitly allowed here (task #20).
+            page = _plain_fetch(url, allow_local=True)
             result["text"] = page.markdown
             result["rendered"] = False
             result["note"] = (f"no browser engine available ({exc}); "

@@ -8,20 +8,26 @@ page that needs rendering would then read as empty and the model
 would trust it.
 """
 
+from ._http import check_fetch_url
 from .cdp import BrowserSession
 from .errors import BrowserError
 
 
-def render(url, engine="auto", max_chars=12000, offset=0, timeout=25):
-    """Render ``url`` in a local engine and return a Page (rendered=True)."""
+def render(url, engine="auto", max_chars=12000, offset=0, timeout=25,
+           allow_local=False):
+    """Render ``url`` in a local engine and return a Page (rendered=True).
+    Local addresses are refused unless allow_local (task #20) — the
+    check runs before an engine is even started."""
     if not url.startswith(("http://", "https://")):
         raise BrowserError(f"render only takes http(s) pages — refused {url!r}")
+    check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
         return session.page(url, max_chars=max_chars, offset=offset)
 
 
-def snapshot(url, engine="auto", timeout=25):
+def snapshot(url, engine="auto", timeout=25, allow_local=False):
     """The page's accessibility snapshot plus its numbered elements."""
+    check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
         session.navigate(url)
         return {
@@ -33,8 +39,9 @@ def snapshot(url, engine="auto", timeout=25):
         }
 
 
-def screenshot(url, path, engine="auto", timeout=25):
+def screenshot(url, path, engine="auto", timeout=25, allow_local=False):
     """Save a PNG screenshot of ``url`` to ``path``; returns the path."""
+    check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
         session.navigate(url)
         return session.screenshot(path)

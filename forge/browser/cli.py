@@ -54,7 +54,8 @@ def _cmd_search(args):
 
 
 def _cmd_fetch(args):
-    page = fetch(args.url, max_chars=args.max_chars, offset=args.offset)
+    page = fetch(args.url, max_chars=args.max_chars, offset=args.offset,
+                 allow_local=args.allow_local)
     if args.json:
         _print_json(page.to_dict())
         return 0
@@ -71,7 +72,7 @@ def _cmd_fetch(args):
 
 def _cmd_fetch_any(args):
     from .files import fetch_any
-    result = fetch_any(args.url)
+    result = fetch_any(args.url, allow_local=args.allow_local)
     if args.json:
         _print_json(result.to_dict())
         return 0
@@ -88,7 +89,8 @@ def _cmd_fetch_any(args):
 
 def _cmd_render(args):
     from .render import render
-    page = render(args.url, max_chars=args.max_chars, offset=args.offset)
+    page = render(args.url, max_chars=args.max_chars, offset=args.offset,
+                  allow_local=args.allow_local)
     if args.json:
         _print_json(page.to_dict())
         return 0
@@ -103,7 +105,7 @@ def _cmd_render(args):
 
 def _cmd_snapshot(args):
     from .render import snapshot
-    data = snapshot(args.url)
+    data = snapshot(args.url, allow_local=args.allow_local)
     if args.json:
         _print_json(data)
         return 0
@@ -118,7 +120,7 @@ def _cmd_snapshot(args):
 
 def _cmd_screenshot(args):
     from .render import screenshot
-    path = screenshot(args.url, args.out)
+    path = screenshot(args.url, args.out, allow_local=args.allow_local)
     print(f"Screenshot saved: {path}")
     return 0
 
@@ -544,11 +546,15 @@ def main(argv=None):
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--max-chars", type=int, default=12000)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--allow-local", action="store_true",
+                   help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_fetch)
 
     p = sub.add_parser("fetch-any", help="fetch any file type (PDF, image, audio, data...)")
     p.add_argument("url")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--allow-local", action="store_true",
+                   help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_fetch_any)
 
     p = sub.add_parser("render", help="fetch the page after JavaScript, via a local engine")
@@ -556,16 +562,22 @@ def main(argv=None):
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--max-chars", type=int, default=12000)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--allow-local", action="store_true",
+                   help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_render)
 
     p = sub.add_parser("snapshot", help="accessibility snapshot + numbered elements")
     p.add_argument("url")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--allow-local", action="store_true",
+                   help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_snapshot)
 
     p = sub.add_parser("screenshot", help="save a PNG screenshot of a rendered page")
     p.add_argument("url")
     p.add_argument("--out", required=True)
+    p.add_argument("--allow-local", action="store_true",
+                   help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_screenshot)
 
     p = sub.add_parser("describe", help="describe an image with the local vision seat")

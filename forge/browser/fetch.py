@@ -50,11 +50,14 @@ class Page:
         }
 
 
-def fetch(url, max_chars=DEFAULT_MAX_CHARS, offset=0, timeout=20):
+def fetch(url, max_chars=DEFAULT_MAX_CHARS, offset=0, timeout=20,
+          allow_local=False):
     """Fetch ``url`` and return a Page of clean Markdown.
 
     Only http(s) URLs are fetched; anything else is refused in plain
-    words, matching Forge's existing Browse posture.
+    words, matching Forge's existing Browse posture. Local addresses
+    (127.0.0.1, the LAN) are refused unless allow_local — the verify
+    flow passes it for its own throwaway local page.
     """
     scheme = urlparse(url).scheme.lower()
     if scheme not in ("http", "https"):
@@ -67,7 +70,8 @@ def fetch(url, max_chars=DEFAULT_MAX_CHARS, offset=0, timeout=20):
     if max_chars <= 0:
         raise BrowserError("max_chars must be at least 1")
 
-    final_url, headers, body = http_get(url, timeout=timeout)
+    final_url, headers, body = http_get(url, timeout=timeout,
+                                        allow_local=allow_local)
     content_type = ""
     if headers is not None:
         content_type = (headers.get_content_type() or "").lower()

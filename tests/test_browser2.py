@@ -352,34 +352,34 @@ class FileTests(unittest.TestCase):
                b"1 0 obj<</Length " + str(len(cmap)).encode() + b">>stream\n" + cmap + b"\nendstream endobj\n"
                b"2 0 obj<</Length " + str(len(content)).encode() + b">>stream\n" + content + b"\nendstream endobj\n")
         self.assertEqual(extract_pdf_text(pdf), "Hi")
-        result = fetch_any(self.base + "/doc.pdf")
+        result = fetch_any(self.base + "/doc.pdf", allow_local=True)
         self.assertEqual(result.kind, "pdf")
         self.assertIn("Hello PDF World", result.text)
 
     def test_image_saved_and_honest_note(self):
-        result = fetch_any(self.base + "/pic.png")
+        result = fetch_any(self.base + "/pic.png", allow_local=True)
         self.assertEqual(result.kind, "image")
         self.assertTrue(os.path.isfile(result.saved_path))
         self.assertEqual(result.text, "")  # no seat: nothing invented
         self.assertTrue(any("no local vision seat" in n for n in result.notes))
 
     def test_json_and_csv(self):
-        result = fetch_any(self.base + "/data.json")
+        result = fetch_any(self.base + "/data.json", allow_local=True)
         self.assertEqual(result.kind, "text")
         self.assertIn('"a": 1', result.text)
-        result = fetch_any(self.base + "/table.csv")
+        result = fetch_any(self.base + "/table.csv", allow_local=True)
         self.assertIn("| name | value |", result.text)
         self.assertIn("| alpha | 1 |", result.text)
 
     def test_audio_saved_with_note(self):
-        result = fetch_any(self.base + "/song.mp3")
+        result = fetch_any(self.base + "/song.mp3", allow_local=True)
         self.assertEqual(result.kind, "audio")
         self.assertTrue(os.path.isfile(result.saved_path))
 
     def test_gated_page_barriers_from_raw_html(self):
         # The gate is markup-only: no visible phrase says captcha or
         # login, so only detection on the raw HTML can catch it.
-        result = fetch_any(self.base + "/gated.html")
+        result = fetch_any(self.base + "/gated.html", allow_local=True)
         self.assertEqual(result.kind, "html")
         self.assertIn("Welcome to the article about gears.", result.text)
         kinds = [b["kind"] for b in result.barriers]
@@ -409,28 +409,28 @@ class DownloadCapTests(unittest.TestCase):
     def test_declared_length_refused_fast(self):
         started = time.monotonic()
         with self.assertRaises(BrowserError) as caught:
-            http_get(self.base + "/declared-big.bin", max_bytes=1024)
+            http_get(self.base + "/declared-big.bin", max_bytes=1024, allow_local=True)
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertIn("5000", str(caught.exception))
         self.assertIn("1024", str(caught.exception))
 
     def test_chunked_body_refused_over_cap(self):
         with self.assertRaises(BrowserError):
-            http_get(self.base + "/big-chunked.bin", max_bytes=1024)
+            http_get(self.base + "/big-chunked.bin", max_bytes=1024, allow_local=True)
 
     def test_gzip_bomb_refused_on_decompressed_size(self):
         # ~50 bytes on the wire, 5000 bytes out — the cap counts
         # decompressed bytes, so the bomb is refused.
         with self.assertRaises(BrowserError):
-            http_get(self.base + "/bomb.gz", max_bytes=1024)
+            http_get(self.base + "/bomb.gz", max_bytes=1024, allow_local=True)
 
     def test_get_to_file_caps_and_removes_partial(self):
         path = os.path.join(self.tmp, "partial.bin")
         with self.assertRaises(BrowserError):
-            http_get_to_file(self.base + "/big.bin", path, max_bytes=1024)
+            http_get_to_file(self.base + "/big.bin", path, max_bytes=1024, allow_local=True)
         self.assertFalse(os.path.exists(path))
         _url, _headers, size = http_get_to_file(
-            self.base + "/big.bin", path, max_bytes=4096)
+            self.base + "/big.bin", path, max_bytes=4096, allow_local=True)
         self.assertEqual(size, 2048)
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), b"x" * 2048)
@@ -441,7 +441,7 @@ class DownloadCapTests(unittest.TestCase):
         old = files_module.MAX_BODY_BYTES
         files_module.MAX_BODY_BYTES = 1024
         try:
-            result = fetch_any(self.base + "/big.bin")
+            result = fetch_any(self.base + "/big.bin", allow_local=True)
         finally:
             files_module.MAX_BODY_BYTES = old
         self.assertEqual(result.kind, "binary")
@@ -452,7 +452,7 @@ class DownloadCapTests(unittest.TestCase):
         old = files_module.MAX_BODY_BYTES
         files_module.MAX_BODY_BYTES = 1024
         try:
-            result = fetch_any(self.base + "/big.txt")
+            result = fetch_any(self.base + "/big.txt", allow_local=True)
         finally:
             files_module.MAX_BODY_BYTES = old
         self.assertEqual(result.kind, "text")

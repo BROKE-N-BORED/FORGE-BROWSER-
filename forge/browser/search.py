@@ -78,7 +78,10 @@ def parse_searxng_json(text, max_results):
 
 def search_searxng(query, max_results, base_url, timeout=20):
     endpoint = base_url.rstrip("/") + "/search?q=" + quote_plus(query) + "&format=json"
-    _, headers, body = http_get(endpoint, timeout=timeout)
+    # The instance is the person's own configuration
+    # (FORGE_SEARXNG_URL) — pointing the browser at it is itself
+    # the explicit local-allow switch, so the fence is passed here.
+    _, headers, body = http_get(endpoint, timeout=timeout, allow_local=True)
     results = parse_searxng_json(decode_body(body, headers), max_results)
     for result in results:
         result.engine = result.engine or "searxng"

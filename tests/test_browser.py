@@ -221,7 +221,8 @@ class SearxngBackendTests(_ServerCase):
 
 class FetchTests(_ServerCase):
     def test_fetch_local_page(self):
-        page = fetch(self.base + "/page.html")
+        # The test server is local — the fence is explicitly allowed.
+        page = fetch(self.base + "/page.html", allow_local=True)
         self.assertEqual(page.title, "Fixture Page")
         self.assertIn("# Real Heading", page.markdown)
         self.assertEqual(page.final_url, self.base + "/page.html")
@@ -229,11 +230,12 @@ class FetchTests(_ServerCase):
         self.assertIsNone(page.next_offset)
 
     def test_fetch_paging_covers_the_whole_page(self):
-        full = fetch(self.base + "/page.html", max_chars=100000)
+        full = fetch(self.base + "/page.html", max_chars=100000, allow_local=True)
         seen = ""
         offset = 0
         while True:
-            page = fetch(self.base + "/page.html", max_chars=50, offset=offset)
+            page = fetch(self.base + "/page.html", max_chars=50, offset=offset,
+                         allow_local=True)
             seen += page.markdown
             if page.next_offset is None:
                 break
@@ -247,8 +249,47 @@ class FetchTests(_ServerCase):
 
     def test_fetch_404_is_plain_error(self):
         with self.assertRaises(BrowserError) as caught:
-            fetch(self.base + "/missing")
+            fetch(self.base + "/missing", allow_local=True)
         self.assertIn("404", str(caught.exception))
+
+
+class FenceTests(_ServerCase):
+    """Task #20: the fetch fence refuses local addresses by default."""
+
+    def test_loopback_refused(self):
+        from forge.browser.files import fetch_any
+        for url in ("http://127.0.0.1:9/x", "http://127.0.0.2/x",
+                    "http://[::1]/x", "http://localhost:11434/",
+                    "http://192.168.1.1/", "http://10.0.0.5/",
+                    "http://172.16.0.9/"):
+            with self.assertRaises(BrowserError, msg=url) as caught:
+                fetch(url)
+            self.assertIn("local addresses", str(caught.exception))
+            with self.assertRaises(BrowserError, msg=url):
+                fetch_any(url)
+
+    def test_public_literal_passes_the_fence(self):
+        from forge.browser._http import check_fetch_url
+        check_fetch_url("http://93.184.216.34/")  # a public IP: no raise
+        check_fetch_url("https://example.org/")  # a public name: no raise
+
+    def test_env_switch_opens_local(self):
+        old = os.environ.get("FORGE_BROWSER_ALLOW_LOCAL")
+        os.environ["FORGE_BROWSER_ALLOW_LOCAL"] = "1"
+        try:
+            page = fetch(self.base + "/page.html")
+        finally:
+            if old is None:
+                del os.environ["FORGE_BROWSER_ALLOW_LOCAL"]
+            else:
+                os.environ["FORGE_BROWSER_ALLOW_LOCAL"] = old
+        self.assertEqual(page.title, "Fixture Page")
+
+    def test_render_refuses_local_before_engine(self):
+        from forge.browser.render import render
+        with self.assertRaises(BrowserError) as caught:
+            render("http://127.0.0.1:9/")
+        self.assertIn("local addresses", str(caught.exception))
 
 
 class CliTests(_ServerCase):
@@ -260,7 +301,8 @@ class CliTests(_ServerCase):
         )
 
     def test_cli_fetch_json(self):
-        proc = self._run_cli("fetch", self.base + "/page.html", "--json")
+        proc = self._run_cli("fetch", self.base + "/page.html", "--json",
+                             "--allow-local")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         data = json.loads(proc.stdout)
         self.assertEqual(data["title"], "Fixture Page")

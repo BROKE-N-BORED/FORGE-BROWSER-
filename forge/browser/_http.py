@@ -14,12 +14,67 @@ the cap counts decompressed bytes, so a gzip bomb cannot sneak past
 a small wire size. On a refusal the partial file is removed.
 """
 
+import ipaddress
 import os
+import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 
 from .errors import BrowserError
+
+
+def _allow_local_switch():
+    """The explicit local-allow switch: FORGE_BROWSER_ALLOW_LOCAL=1."""
+    return os.environ.get("FORGE_BROWSER_ALLOW_LOCAL", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def check_fetch_url(url, allow_local=False):
+    """Refuse a fetch to a non-public address, unless local fetching
+    was explicitly allowed (allow_local=True, or the
+    FORGE_BROWSER_ALLOW_LOCAL env switch).
+
+    Refused: loopback (127.0.0.0/8, ::1), RFC 1918 LAN ranges,
+    link-local, and the localhost / *.local names.
+
+    DNS names are NOT resolved here, deliberately: in proxied
+    environments a public name can resolve to a non-global address
+    (this sandbox's resolver answers example.org with a CGNAT
+    address), so resolving would refuse ordinary browsing. A name
+    that points at a private address is therefore not caught by
+    this fence — catching that needs the fetch to connect to the
+    address the fence checked, which is a bigger change than this
+    item. The fence stops the steering that matters: literal local
+    addresses (the router admin page, Ollama on 127.0.0.1:11434,
+    a file server on the LAN) and localhost names. The verify flow
+    (which serves its own throwaway local page) passes
+    allow_local=True.
+    """
+    if allow_local or _allow_local_switch():
+        return
+    host = (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
+    if not host:
+        raise BrowserError(f"cannot fetch {url!r} — it has no host to check")
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        raise BrowserError(
+            f"Forge Browser doesn't fetch local addresses ({host}) unless "
+            "local fetching is allowed — pass allow_local=True, or "
+            "--allow-local on the command line, or set "
+            "FORGE_BROWSER_ALLOW_LOCAL=1. The verify flow for project "
+            "pages allows it on its own.")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return  # a DNS name: not resolved here (see the docstring)
+    if not address.is_global:
+        raise BrowserError(
+            f"Forge Browser doesn't fetch local addresses ({host}) "
+            "unless local fetching is allowed — pass allow_local=True, "
+            "or --allow-local on the command line, or set "
+            "FORGE_BROWSER_ALLOW_LOCAL=1. The verify flow for project "
+            "pages allows it on its own.")
 
 USER_AGENT = "ForgeBrowser/0.1 (Code Forge; +https://github.com/BROKE-N-BORED/CODE-FORGE)"
 DEFAULT_TIMEOUT = 20  # seconds
@@ -97,12 +152,15 @@ def _request(url):
     )
 
 
-def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES):
+def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES,
+             allow_local=False):
     """GET ``url``; return (final_url, headers, body_bytes).
 
     The body is read in chunks and refused over max_bytes.
     Raises BrowserError with a plain-words message on any failure.
+    Local addresses are refused unless allow_local (task #20).
     """
+    check_fetch_url(url, allow_local=allow_local)
     try:
         with urllib.request.urlopen(_request(url), timeout=timeout) as response:
             _precheck_length(response.headers, max_bytes, url)
@@ -116,11 +174,14 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES):
         raise BrowserError(f"timed out after {timeout}s reading {url}") from exc
 
 
-def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_FILE_BYTES):
+def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_FILE_BYTES,
+                     allow_local=False):
     """Stream ``url`` straight to ``path``; RAM stays flat no
     matter the size. Returns (final_url, headers, size_bytes).
     Over max_bytes the download is refused and the partial file
-    is removed. Raises BrowserError in plain words on failure."""
+    is removed. Raises BrowserError in plain words on failure.
+    Local addresses are refused unless allow_local (task #20)."""
+    check_fetch_url(url, allow_local=allow_local)
     try:
         with urllib.request.urlopen(_request(url), timeout=timeout) as response:
             _precheck_length(response.headers, max_bytes, url)

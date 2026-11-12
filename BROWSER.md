@@ -132,6 +132,32 @@ says "Failed after 5s." Terminal chat prints the same honesty:
 each step line carries its seconds, and the turn ends with
 "(took 23s)".
 
+## Fetch address fence
+
+Fetch, fetch-any, render, snapshot, and screenshot refuse local
+addresses by default: loopback (127.0.0.0/8, ::1), the LAN ranges
+(10/8, 172.16/12, 192.168/16), link-local, and localhost /
+*.local names. A page or a prompt can no longer steer the browser
+at the router admin page, Ollama on 127.0.0.1:11434, or a file
+server on the LAN. The refusal says so in plain words and names
+the switch.
+
+To fetch a local address on purpose: `--allow-local` on the
+command line, `allow_local=True` in code, or
+`FORGE_BROWSER_ALLOW_LOCAL=1`. A locally hosted SearXNG instance
+you configured (FORGE_SEARXNG_URL) is allowed the same way — the
+configuration is the switch. The verify flow for project pages
+allows its own throwaway local server on its own. The browser
+window itself is not fenced: the person driving it can open
+anything, including the start page it serves locally.
+
+DNS names are not resolved by the fence (a public name can resolve
+to a non-global address behind a proxy, so resolving would refuse
+ordinary browsing). A name that points at a private address is
+therefore not caught here — catching that needs the fetch to
+connect to the address the fence checked, which is out of scope
+for this fix.
+
 ## Research as a background job
 
 Ask for research in chat and the turn ends at once — the job

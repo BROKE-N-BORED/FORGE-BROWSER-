@@ -221,9 +221,20 @@ Joshua's real PC.
   still gets the text fallback. Suite 172/172 incl. 3 new tests; live
   check: a markup-only gated page now reports captcha + login and the
   report carries both Note lines. Real-PC verdict open.)*
-- [ ] **#20 — [S3] Fetch address fence.** The fetcher will happily fetch
+- [~] **#20 — [S3] Fetch address fence.** The fetcher will happily fetch
   127.0.0.1 / LAN addresses; add a fence with an explicit local-allow switch
   (the verify flow needs local pages; plain fetching doesn't).
+  *(Built 2026-11-11: _http.check_fetch_url — refuses loopback, RFC 1918,
+  link-local, localhost/*.local literals; DNS names deliberately NOT
+  resolved (this sandbox's resolver answers example.org with a CGNAT
+  address, so resolving would refuse ordinary browsing — documented);
+  wired into http_get/http_get_to_file/fetch/fetch_any/render/snapshot/
+  screenshot; switch = allow_local param, --allow-local on the CLI, or
+  FORGE_BROWSER_ALLOW_LOCAL=1; a configured local SearXNG instance and
+  the verify flow pass allow_local on their own; the window itself is
+  not fenced. Suite 176/176 incl. 4 new FenceTests; CLI E2E (127.0.0.1
+  refused, --allow-local opens it, 192.168.1.1 + localhost refused).
+  Real-PC verdict open.)*
 - [ ] **#21 — [S2] Pin engine downloads.** Lightpanda/Chromium downloads are
   unpinned nightlies with no checksum. Pin versions + verify hashes.
 - [ ] **#22 — [E9] Download name collisions.** Colliding filenames silently
