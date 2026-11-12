@@ -13,7 +13,14 @@ from what it actually found.
 local [Ollama](https://ollama.com) model running on your own machine.
 Search is keyless. Nothing is tracked.
 
-## Run it
+## Install it (no terminal)
+
+Unzip the release, then double-click **Install Forge Browser**.
+It installs the program, puts its icon in your app menu, and
+offers to open it. No terminal, no commands. (If your file
+manager asks what to do with it, choose Run.)
+
+## Run it (terminal)
 
 ```sh
 sh install.sh   # engines + the app venv (PySide6), one time
@@ -53,5 +60,5 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-50 checks, offline, including the chat protocol with a stubbed
+184 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.

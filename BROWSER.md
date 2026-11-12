@@ -18,8 +18,14 @@ Qt/PySide6, installed into its own venv by install.sh.
 
 ## Install (standalone)
 
-Unzip the zip anywhere, for example `~/forge-browser/`. Open a
-terminal in the unzipped folder, then:
+**No terminal:** unzip the release, then double-click **Install
+Forge Browser**. It installs the program under
+`~/.local/share/forge-browser-app`, adds Forge Browser to the app
+menu with its icon, and offers to open it. Re-running it updates
+the program. (If the file manager asks what to do, choose Run.)
+
+**Terminal:** unzip the zip anywhere, for example
+`~/forge-browser/`. Open a terminal in the unzipped folder, then:
 
 ```
 sh install.sh     # checks Python, installs/updates the engines, builds the app venv, runs the test suite

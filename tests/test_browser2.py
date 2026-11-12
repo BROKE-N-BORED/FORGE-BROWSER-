@@ -1077,6 +1077,49 @@ class EnginePinTests(unittest.TestCase):
         self.assertIsNone(status["chromium_revision"])
 
 
+class InstallerTests(unittest.TestCase):
+    """The double-click installer (Release retrofit, 2026-11-12):
+    the icon, the installer script, and the launcher that starts it
+    must all be present and well-formed."""
+
+    def _root(self):
+        return os.path.join(os.path.dirname(__file__), "..")
+
+    def test_icon_is_valid_svg(self):
+        import xml.etree.ElementTree as ET
+        root = ET.parse(os.path.join(self._root(),
+                                     "forge-browser.svg")).getroot()
+        self.assertTrue(root.tag.endswith("svg"))
+        self.assertEqual(root.get("width"), "512")
+        self.assertEqual(root.get("height"), "512")
+
+    def test_installer_launcher_is_valid(self):
+        path = os.path.join(self._root(), "Install Forge Browser.desktop")
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        self.assertEqual(lines[0], "[Desktop Entry]")
+        fields = dict(line.split("=", 1) for line in lines[1:]
+                      if "=" in line)
+        self.assertEqual(fields["Type"], "Application")
+        self.assertEqual(fields["Name"], "Install Forge Browser")
+        self.assertIn("install-app.sh", fields["Exec"])
+        self.assertEqual(fields["Terminal"], "false")
+
+    def test_install_scripts_parse(self):
+        import subprocess
+        for name in ("install-app.sh", "install.sh", "run.sh",
+                     "browser-setup.sh", "test-forge-browser.sh"):
+            result = subprocess.run(
+                ["sh", "-n", os.path.join(self._root(), name)],
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
+
+    def test_install_gui_compiles(self):
+        import py_compile
+        py_compile.compile(os.path.join(self._root(), "install-gui.py"),
+                           doraise=True)
+
+
 class VerifyTests(unittest.TestCase):
     def test_local_page_fallback_and_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
