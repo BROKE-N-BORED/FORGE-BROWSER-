@@ -308,7 +308,7 @@ class ChatSession:
 
     def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
             tabs=None, page_url=None, on_plan=None, on_table=None,
-            on_progress=None, on_research_done=None):
+            on_progress=None, on_research_done=None, on_step=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs).
         tabs: [{title, url, text, current}] in visible order, for @tabN.
         on_plan(plan_text) -> bool gates the work: the first action
@@ -318,7 +318,11 @@ class ChatSession:
         one. on_table(html) receives a comparison table to render
         in the window. on_progress(text) carries research progress;
         on_research_done(report, sources, error) delivers the
-        finished report. cancel() stops the turn at the next step boundary."""
+        finished report. on_step(step) names what the turn is doing
+        right now — "thinking" while the brain generates, the action
+        kind while an action runs — so the window can show an honest
+        working line with elapsed time. cancel() stops the turn at
+        the next step boundary."""
         self._stop_requested = False
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         # Memory: what the person asked to be remembered, when it is
@@ -391,6 +395,8 @@ class ChatSession:
             if self._stop_requested:
                 answer = "Stopped."
                 break
+            if on_step:
+                on_step("thinking")
             reply = self._chat(messages, on_chunk)
             messages.append({"role": "assistant", "content": reply})
             action = parse_action(reply)
@@ -414,6 +420,8 @@ class ChatSession:
                         continue
             if on_action:
                 on_action(kind, action)
+            if on_step:
+                on_step(kind)
             actions_run += 1
             try:
                 if kind == "search":

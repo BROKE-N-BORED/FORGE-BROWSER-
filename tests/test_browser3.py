@@ -899,6 +899,16 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(any("I like dark mode." in t for t in system_texts))
         self.assertEqual(answer, "Use dark mode then.")
 
+    def test_on_step_names_thinking_then_action(self):
+        session = self.make_session(
+            ['ACTION {"type": "read_page"}', "Here is the page."])
+        steps = []
+        answer, _opens = session.ask(
+            "what does the page say", page_text="page words here",
+            on_step=steps.append)
+        self.assertEqual(steps, ["thinking", "read_page", "thinking"])
+        self.assertEqual(answer, "Here is the page.")
+
     def test_memory_withheld_when_feature_off(self):
         from forge.browser import memory as memory_module
         from forge.browser import seats as seats_module
@@ -1054,6 +1064,26 @@ class SessionTests(unittest.TestCase):
             chat.pick_chat_model = original
         with self.assertRaises(BrowserError):
             session.ask("hi")
+
+
+class TurnStatusTests(unittest.TestCase):
+    """#16: the dock's working line, with elapsed time."""
+
+    def test_status_line_names_step_and_seconds(self):
+        from forge.browser.app import turn_status_text
+        self.assertEqual(turn_status_text("search", 100.0, now=112.0),
+                         "working: search… — 12s")
+        self.assertEqual(turn_status_text("thinking", 100.0, now=100.4),
+                         "working: thinking… — 0s")
+
+    def test_done_line_by_outcome(self):
+        from forge.browser.app import turn_done_text
+        self.assertEqual(turn_done_text("done", 100.0, now=123.0),
+                         "Done in 23s.")
+        self.assertEqual(turn_done_text("stopped", 100.0, now=108.0),
+                         "Stopped after 8s.")
+        self.assertEqual(turn_done_text("failed", 100.0, now=105.0),
+                         "Failed after 5s.")
 
 
 class SeatsTests(unittest.TestCase):

@@ -182,8 +182,17 @@ Joshua's real PC.
   brief or a plain "no brief yet" note; `brief` chat ACTION + `brief`
   CLI; background build on launch. Suite 136/136; stub E2E (CLI
   brief built, cached, reused). Real-PC verdict open.)*
-- [ ] **#16 — Chat progress honesty [S].** Extend the dock's "working: …" line
+- [~] **#16 — Chat progress honesty [S].** Extend the dock's "working: …" line
   with elapsed time and a cancel button per turn (pairs with #10's Stop).
+  *(Built 2026-11-11: chat.ask gained on_step ("thinking" while the
+  brain generates, the action kind while it runs); the dock's working
+  line moved from log spam to a turn_status label ticking every second
+  ("working: search… — 12s") and closing with "Done in 23s." /
+  "Stopped after 9s." / "Failed after 5s."; #10's Stop button is the
+  per-turn cancel, live for the whole turn; terminal chat prints step
+  seconds + "(took Ns)". Suite 166/166; stub E2E (terminal "(took 2s)");
+  Qt offscreen smoke (line ticked 0s→1s, Stop ended the turn,
+  "Stopped after 8s."; rerun twice, 9s both times). Real-PC verdict open.)*
 
 ## G. Engine-room hardening [FIX] — defects in the shipped build
 

@@ -120,6 +120,18 @@ and toggles; `seats brain qwen3:4b`, `seats brain auto`,
 `seats ai off`, `seats tidy_titles off`. Terminal chat refuses
 to start while AI or Chat is off.
 
+## Chat progress honesty
+
+While a turn runs, the dock shows a working line under the log —
+"working: search… — 12s" — naming the step (thinking, search,
+open, …) and ticking once a second. The Stop button is live for
+the whole turn; hitting it stops the turn at the next step
+boundary, and the line then says how long it took: "Stopped
+after 9s." A finished turn says "Done in 23s."; a failed one
+says "Failed after 5s." Terminal chat prints the same honesty:
+each step line carries its seconds, and the turn ends with
+"(took 23s)".
+
 ## Research as a background job
 
 Ask for research in chat and the turn ends at once — the job

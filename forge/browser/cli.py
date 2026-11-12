@@ -27,6 +27,7 @@ import getpass
 import json
 import os
 import sys
+import time
 
 from .errors import BrowserError
 from .fetch import fetch
@@ -254,6 +255,7 @@ def _cmd_chat(args):
         if not text:
             continue
         display = LiveDisplay()
+        turn_started = time.monotonic()
 
         def on_chunk(delta):
             shown = display.feed(delta)
@@ -277,9 +279,13 @@ def _cmd_chat(args):
             else:
                 print(f"\n[research done]\n{report}")
 
+        def on_action(kind, action):
+            elapsed = int(time.monotonic() - turn_started)
+            print(f"  … {kind} ({elapsed}s)", flush=True)
+
         try:
             _answer, opens = session.ask(
-                text, on_action=lambda kind, a: print(f"  … {kind}"),
+                text, on_action=on_action,
                 on_chunk=on_chunk, on_plan=ask_plan,
                 on_progress=on_progress, on_research_done=on_research_done)
         except Exception as exc:
@@ -290,7 +296,7 @@ def _cmd_chat(args):
         rest = display.flush()
         if rest:
             print(rest, end="", flush=True)
-        print()
+        print(f"\n(took {int(time.monotonic() - turn_started)}s)")
         for url in opens:
             print(f"  (open in a tab in the window: {url})")
 

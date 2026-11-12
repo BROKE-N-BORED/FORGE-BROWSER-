@@ -18,11 +18,29 @@ this module without Qt is safe; run_app() says what to do.
 
 import os
 import threading
+import time
 
 from .errors import BrowserError
 from .preview import DWELL_MS
 
 _QT = None
+
+
+def turn_status_text(step, started, now=None):
+    """The dock's working line: 'working: search… — 12s'."""
+    elapsed = int((time.monotonic() if now is None else now) - started)
+    return f"working: {step}… — {elapsed}s"
+
+
+def turn_done_text(outcome, started, now=None):
+    """The dock's finished line: 'Done in 12s.' / 'Stopped after 12s.'
+    / 'Failed after 12s.'"""
+    elapsed = int((time.monotonic() if now is None else now) - started)
+    if outcome == "stopped":
+        return f"Stopped after {elapsed}s."
+    if outcome == "failed":
+        return f"Failed after {elapsed}s."
+    return f"Done in {elapsed}s."
 
 
 def _load_qt():
@@ -302,6 +320,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         token = QtCore.Signal(str)
         answer = QtCore.Signal(str)
         failed = QtCore.Signal(str)
+        step = QtCore.Signal(str)  # what the turn is doing right now
         voice_text = QtCore.Signal(str)
         plan = QtCore.Signal(str, object)  # plan text, {"event", "approved"}
         compare_table = QtCore.Signal(str)  # comparison table HTML
@@ -336,6 +355,13 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     log = QtWidgets.QTextEdit()
     log.setReadOnly(True)
     layout.addWidget(log)
+    # The working line: what this turn is doing, and how long it
+    # has taken. It ticks every second while a turn is busy, and
+    # says how long the turn took when it ends.
+    status_label = QtWidgets.QLabel("")
+    status_label.setObjectName("turn_status")
+    status_label.setWordWrap(True)
+    layout.addWidget(status_label)
     progress_label = QtWidgets.QLabel("")
     progress_label.setObjectName("research_progress")
     progress_label.setWordWrap(True)
@@ -361,6 +387,28 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     window.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     state = {"busy": False, "live": False}
+    turn = {"step": "thinking", "started": None}
+
+    def on_step(kind):
+        # The worker names the step; the label shows it at once,
+        # with the seconds so far.
+        turn["step"] = kind
+        if state["busy"] and turn["started"] is not None:
+            status_label.setText(turn_status_text(kind, turn["started"]))
+
+    signals.step.connect(on_step)
+
+    def tick_turn_clock():
+        # Once a second, while a turn is busy, refresh the elapsed
+        # time on the working line.
+        if state["busy"] and turn["started"] is not None:
+            status_label.setText(
+                turn_status_text(turn["step"], turn["started"]))
+
+    turn_timer = QtCore.QTimer(window)
+    turn_timer.setInterval(1000)
+    turn_timer.timeout.connect(tick_turn_clock)
+    turn_timer.start()
 
     # --- Model picker + AI controls (task #14) -----------------
     # Three seat dropdowns fed by `ollama list`, plus Firefox-style
@@ -466,11 +514,13 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def append(who, text):
         log.append(f"<b>{who}:</b> {text}")
 
-    def finish():
+    def finish(outcome="done"):
         state["busy"] = False
         stop_btn.setEnabled(False)
+        if turn["started"] is not None:
+            status_label.setText(turn_done_text(outcome, turn["started"]))
+            turn["started"] = None
         apply_ai_state()
-        entry.setFocus()
         entry.setFocus()
 
     def on_token(text):
@@ -486,19 +536,20 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         log.insertPlainText(text)
 
     def on_answer(text):
+        outcome = "stopped" if (text or "").strip() == "Stopped." else "done"
         if state["live"]:
             # The answer already streamed into the log line by line;
             # re-printing it would duplicate it.
             state["live"] = False
-            finish()
+            finish(outcome)
         else:
             append("Forge Browser", text)
-            finish()
+            finish(outcome)
 
     def on_failed(text):
         state["live"] = False
         append("Forge Browser", f"⚠ {text}")
-        finish()
+        finish("failed")
 
     signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
     signals.open_url.connect(lambda url: window.new_tab(url, agent=True))
@@ -611,7 +662,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         try:
             answer, opens = session.ask(
                 text, page_text=page_text, tabs=tabs, page_url=page_url,
-                on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
+                on_step=lambda kind: signals.step.emit(kind),
                 on_chunk=on_chunk, on_plan=ask_plan,
                 on_table=lambda html: signals.compare_table.emit(html),
                 on_progress=lambda text: signals.progress.emit(text),
@@ -635,7 +686,6 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 signals.token.emit(shown)
 
         try:
-            signals.notice.emit("working: summarizing…")
             from .summarize import summarize_page
             summary = summarize_page(session, page_text, on_chunk=on_chunk)
             rest = display.flush()
@@ -650,6 +700,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         state["busy"] = True
         state["live"] = False
+        turn["step"] = "summarizing"
+        turn["started"] = time.monotonic()
+        status_label.setText(turn_status_text("summarizing", turn["started"]))
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
         entry.setEnabled(False)
@@ -671,6 +724,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         state["busy"] = True
         state["live"] = False
+        turn["step"] = "thinking"
+        turn["started"] = time.monotonic()
+        status_label.setText(turn_status_text("thinking", turn["started"]))
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
         stop_btn.setEnabled(True)
