@@ -57,6 +57,7 @@ def create_window(server, profile, start_url=None):
             self.setWindowTitle("Forge Browser")
             self.resize(1240, 820)
             self._tidy_cache = {}  # url -> tidy title, so a revisit never re-asks
+            self._agent_tab_ids = set()  # id(view) of tabs the brain opened
             self.tidy_done.connect(self._apply_tidy_title)
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.setTabsClosable(True)
@@ -85,7 +86,7 @@ def create_window(server, profile, start_url=None):
         def _view(self):
             return self.tabs.currentWidget()
 
-        def new_tab(self, url=None):
+        def new_tab(self, url=None, agent=False):
             view = QWebEngineView()
             view.setPage(QWebEnginePage(profile, view))
             view.urlChanged.connect(lambda *a: self._sync_address())
@@ -93,15 +94,21 @@ def create_window(server, profile, start_url=None):
             view.loadFinished.connect(
                 lambda *a, view=view: self._on_load_finished(view))
             index = self.tabs.addTab(view, "New Tab")
+            if agent:
+                self._agent_tab_ids.add(id(view))
+                self.tabs.setTabText(index, "🤖 New Tab")
             self.tabs.setCurrentIndex(index)
             view.load(QtCore.QUrl(url or server.home_url))
             return view
+
+        def _agent_mark(self, view):
+            return "🤖 " if id(view) in self._agent_tab_ids else ""
 
         def _set_tab_title(self, view, title):
             index = self.tabs.indexOf(view)
             if index < 0:
                 return
-            self.tabs.setTabText(index, (title or "Page")[:28])
+            self.tabs.setTabText(index, self._agent_mark(view) + (title or "Page")[:28])
             # Long, messy titles get a short brain-written one in the
             # background; the raw title shows until it lands.
             session = getattr(self, "_chat_session", None)
@@ -109,7 +116,7 @@ def create_window(server, profile, start_url=None):
             if session is None or not url or url.startswith("http://127.0.0.1"):
                 return
             if url in self._tidy_cache:
-                self.tabs.setTabText(index, self._tidy_cache[url])
+                self.tabs.setTabText(index, self._agent_mark(view) + self._tidy_cache[url])
                 return
             raw = (title or "").strip()
             if len(raw) <= 28 and len(raw.split()) <= 5:
@@ -126,7 +133,7 @@ def create_window(server, profile, start_url=None):
         def _apply_tidy_title(self, view, url, tidy):
             index = self.tabs.indexOf(view)
             if index >= 0 and view.url().toString() == url:
-                self.tabs.setTabText(index, tidy)
+                self.tabs.setTabText(index, self._agent_mark(view) + tidy)
 
         def _on_load_finished(self, view):
             self._sync_address()
@@ -152,6 +159,7 @@ def create_window(server, profile, start_url=None):
         def _close_tab(self, index):
             if self.tabs.count() > 1:
                 widget = self.tabs.widget(index)
+                self._agent_tab_ids.discard(id(widget))
                 self.tabs.removeTab(index)
                 widget.deleteLater()
 
@@ -195,6 +203,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         answer = QtCore.Signal(str)
         failed = QtCore.Signal(str)
         voice_text = QtCore.Signal(str)
+        plan = QtCore.Signal(str, object)  # plan text, {"event", "approved"}
 
     signals = Signals()
     model = pick_chat_model()
@@ -219,10 +228,14 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     summarize_btn = QtWidgets.QPushButton("Summarize")
     mic_btn = QtWidgets.QPushButton("🎤 Hold to talk")
     mic_btn.setObjectName("voice_button")
+    stop_btn = QtWidgets.QPushButton("Stop")
+    stop_btn.setObjectName("stop_button")
+    stop_btn.setEnabled(False)
     row.addWidget(entry)
     row.addWidget(send)
     row.addWidget(summarize_btn)
     row.addWidget(mic_btn)
+    row.addWidget(stop_btn)
     layout.addLayout(row)
     dock.setWidget(panel)
     dock.setMinimumWidth(320)
@@ -243,6 +256,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         state["busy"] = False
         send.setEnabled(True)
         summarize_btn.setEnabled(True)
+        stop_btn.setEnabled(False)
         entry.setEnabled(True)
         entry.setFocus()
 
@@ -274,10 +288,35 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         finish()
 
     signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
-    signals.open_url.connect(lambda url: window.new_tab(url))
+    signals.open_url.connect(lambda url: window.new_tab(url, agent=True))
     signals.token.connect(on_token)
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
+
+    def on_plan(plan_text, state):
+        # Runs on the GUI thread; the worker waits on state["event"].
+        # Nothing runs until the person says yes.
+        append("Forge Browser", f"Plan: {plan_text}")
+        answer = QtWidgets.QMessageBox.question(
+            window, "Forge Browser — approve this step?",
+            f"The browser wants to:\n\n{plan_text}\n\nAllow it?",
+            QtWidgets.QMessageBox.StandardButton.Yes |
+            QtWidgets.QMessageBox.StandardButton.No)
+        state["approved"] = (
+            answer == QtWidgets.QMessageBox.StandardButton.Yes)
+        state["event"].set()
+
+    signals.plan.connect(on_plan)
+
+    def ask_plan(plan_text):
+        # Called from the worker thread; blocks it until the person
+        # answers the dialog on the GUI thread.
+        state = {"event": threading.Event(), "approved": False}
+        signals.plan.emit(plan_text, state)
+        state["event"].wait()
+        return state["approved"]
+
+    stop_btn.clicked.connect(lambda: session.cancel())
 
     def on_voice_text(text):
         # Transcribed speech lands in the entry for review — the
@@ -346,7 +385,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             answer, opens = session.ask(
                 text, page_text=page_text, tabs=tabs, page_url=page_url,
                 on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
-                on_chunk=on_chunk)
+                on_chunk=on_chunk, on_plan=ask_plan)
             for url in opens:
                 signals.open_url.emit(url)
             rest = display.flush()
@@ -403,6 +442,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         state["live"] = False
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
+        stop_btn.setEnabled(True)
         entry.setEnabled(False)
         entry.clear()
         append("You", text)
@@ -422,7 +462,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 tabs.append({"title": view.title() if view is not None else "",
                              "url": view.url().toString() if view is not None else "",
                              "text": texts[i] or "",
-                             "current": i == current})
+                             "current": i == current,
+                             "agent": (view is not None and
+                                       id(view) in window._agent_tab_ids)})
             page_text = texts[current] if 0 <= current < count else None
             page_url = tabs[current]["url"] if 0 <= current < count else None
             threading.Thread(target=work, args=(text, page_text, tabs, page_url),

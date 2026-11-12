@@ -91,6 +91,18 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Plan, run, interrupt
+
+The brain never acts on its own. When it wants to do something,
+it shows the plan first — "Search the web for gears", "Open
+example.org in a new tab" — and waits for your yes in a dialog
+(the terminal asks on its own line). Anything that changes what
+is remembered asks again, even inside an approved turn. Pages
+the brain opens land in tabs marked 🤖, so you can see at a
+glance which tabs it opened and which are yours. The Stop button
+ends the turn at the next step — a brain call already in flight
+finishes first, then it stops, and nothing after it runs.
+
 ## Voice — hold to talk
 
 The chat dock has a "🎤 Hold to talk" button. Hold it, speak,

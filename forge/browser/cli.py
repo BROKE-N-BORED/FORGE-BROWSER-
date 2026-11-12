@@ -254,10 +254,18 @@ def _cmd_chat(args):
             if shown:
                 print(shown, end="", flush=True)
 
+        def ask_plan(plan_text):
+            print(f"\nPlan: {plan_text}")
+            try:
+                reply = input("Allow it? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return False
+            return reply in ("y", "yes")
+
         try:
             _answer, opens = session.ask(
                 text, on_action=lambda kind, a: print(f"  … {kind}"),
-                on_chunk=on_chunk)
+                on_chunk=on_chunk, on_plan=ask_plan)
         except Exception as exc:
             print(f"forge browser: {exc}")
             continue

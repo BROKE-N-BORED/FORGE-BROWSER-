@@ -1020,6 +1020,129 @@ class SessionTests(unittest.TestCase):
             session.ask("hi")
 
 
+class PlanGateTests(unittest.TestCase):
+    """#10: the plan gate, the submit re-ask, and Stop."""
+
+    def _session_with_queue(self, queue):
+        session = chat.ChatSession(model="fake:1b")
+
+        def fake_chat(messages, on_chunk=None):
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        return session
+
+    def test_describe_action_plain_words(self):
+        self.assertEqual(
+            chat.describe_action("search", {"query": "gears"}),
+            'Search the web for "gears"')
+        self.assertEqual(
+            chat.describe_action("open", {"url": "http://x.example/"}),
+            "Open http://x.example/ in a new tab")
+        self.assertEqual(
+            chat.describe_action("remember", {"text": "I like dark mode."}),
+            'Remember: "I like dark mode."')
+        self.assertEqual(chat.describe_action("mystery", {}),
+                         "Run the mystery action")
+
+    def test_plan_gate_approves_first_action(self):
+        from unittest import mock
+        plans = []
+        session = self._session_with_queue(
+            ['ACTION {"type": "search", "query": "gears"}', "done"])
+        with mock.patch.object(chat, "_run_search",
+                               return_value="results") as run:
+            answer, _opens = session.ask(
+                "find gears",
+                on_plan=lambda plan: plans.append(plan) or True)
+        run.assert_called_once_with("gears")
+        self.assertEqual(plans, ['Search the web for "gears"'])
+        self.assertEqual(answer, "done")
+
+    def test_plan_gate_denies_first_action(self):
+        from unittest import mock
+        session = self._session_with_queue(
+            ['ACTION {"type": "search", "query": "gears"}', "done"])
+        with mock.patch.object(chat, "_run_search",
+                               return_value="results") as run:
+            answer, _opens = session.ask("find gears", on_plan=lambda plan: False)
+        run.assert_not_called()
+        self.assertEqual(answer, "Okay — I didn't do that.")
+
+    def test_submit_action_reasks_inside_approved_turn(self):
+        from unittest import mock
+        plans = []
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_MEMORY_PATH")
+            os.environ["FORGE_BROWSER_MEMORY_PATH"] = os.path.join(tmp, "m.json")
+            try:
+                session = self._session_with_queue(
+                    ['ACTION {"type": "search", "query": "gears"}',
+                     'ACTION {"type": "remember", "text": "I like dark mode."}',
+                     "all set"])
+
+                def gate(plan):
+                    plans.append(plan)
+                    return len(plans) == 1  # approve the search, refuse the remember
+
+                with mock.patch.object(chat, "_run_search",
+                                       return_value="results"):
+                    answer, _opens = session.ask("find gears, then remember it",
+                                                 on_plan=gate)
+                from forge.browser.memory import list_entries
+                stored = list_entries()
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEMORY_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEMORY_PATH"] = old
+        self.assertEqual(len(plans), 2)
+        self.assertIn("changes what I remember", plans[1])
+        self.assertEqual(stored, [])
+        self.assertEqual(answer, "all set")
+
+    def test_cancel_stops_between_steps(self):
+        from unittest import mock
+        calls = []
+        queue = ['ACTION {"type": "search", "query": "gears"}', "never reached"]
+        session = chat.ChatSession(model="fake:1b")
+
+        def counting_chat(messages, on_chunk=None):
+            calls.append(1)
+            return queue.pop(0)
+
+        session._chat = counting_chat
+
+        def on_action(kind, action):
+            if kind == "search":
+                session.cancel()
+
+        with mock.patch.object(chat, "_run_search", return_value="results"):
+            answer, _opens = session.ask("find gears", on_action=on_action,
+                                         on_plan=lambda plan: True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(answer, "Stopped.")
+
+    def test_tab_note_marks_agent_tabs(self):
+        seen = {}
+
+        def fake_chat(messages, on_chunk=None):
+            seen["messages"] = messages
+            return "ok"
+
+        session = chat.ChatSession(model="fake:1b")
+        session._chat = fake_chat
+        session.ask("hi", tabs=[
+            {"title": "Gear Guide", "url": "http://g.example/",
+             "text": "gears", "current": True, "agent": True},
+            {"title": "Soup", "url": "http://s.example/",
+             "text": "soup", "current": False, "agent": False}])
+        note = [m["content"] for m in seen["messages"]
+                if m["content"].startswith("Open tabs:")][0]
+        self.assertIn("🤖 Gear Guide", note)
+        self.assertNotIn("🤖 Soup", note)
+
+
 class VoiceTests(unittest.TestCase):
     """Push-to-talk recording against a fake arecord on PATH."""
 

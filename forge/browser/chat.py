@@ -73,7 +73,11 @@ answer from that tab's text, which is handed to you as its context.
 When the person asks you to remember something, use the remember action
 with their exact words. Recall lists what you remember; forget removes it.
 When the person asks about something they read before ("that thing I read
-last week"), use recall_pages with their words as the query."""
+last week"), use recall_pages with their words as the query.
+Your first action each turn is shown to the person as a plan for
+approval before it runs, and anything that changes what is
+remembered asks again — so propose one clear step at a time,
+never a vague one, and never act as if a step already happened."""
 
 
 def list_models():
@@ -127,6 +131,37 @@ def visible_text(text):
     lines = [ln for ln in (text or "").splitlines()
              if not ln.strip().startswith("ACTION")]
     return "\n".join(lines).strip()
+
+
+# Actions that change something the person keeps (their memory
+# file) — these ask again even inside an approved turn.
+SUBMIT_ACTIONS = {"remember", "forget"}
+
+
+def describe_action(kind, action):
+    """One action in plain words, for the plan-approval dialog."""
+    action = action or {}
+    if kind == "search":
+        return f"Search the web for \"{action.get('query', '')}\""
+    if kind == "open":
+        return f"Open {action.get('url', '')} in a new tab"
+    if kind == "research":
+        return f"Research \"{action.get('topic', '')}\" across several pages"
+    if kind == "read_page":
+        return "Read the text of the current page"
+    if kind == "summarize":
+        return "Summarize the current page"
+    if kind == "card":
+        return f"Run the \"{action.get('name', '')}\" workflow card"
+    if kind == "remember":
+        return f"Remember: \"{action.get('text', '')}\""
+    if kind == "forget":
+        return f"Forget anything about \"{action.get('text', '')}\""
+    if kind == "recall":
+        return "List what has been remembered"
+    if kind == "recall_pages":
+        return f"Search pages you visited for \"{action.get('query', '')}\""
+    return f"Run the {kind} action"
 
 
 class LiveDisplay:
@@ -188,6 +223,13 @@ class ChatSession:
         self.history = []
         self._retrieve_cache = {}  # page hash -> (chunks, embeddings)
         self._tab_groups_cache = {}  # (title, url) tuple -> grouped tabs
+        self._stop_requested = False  # set by cancel(); read between steps
+
+    def cancel(self):
+        """Stop the running turn at the next step boundary. A brain
+        call already in flight finishes first — Stop lands between
+        steps, never mid-word."""
+        self._stop_requested = True
 
     def _chat(self, messages, on_chunk=None):
         """One brain call. Without on_chunk this waits for the
@@ -237,9 +279,15 @@ class ChatSession:
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
 
     def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
-            tabs=None, page_url=None):
+            tabs=None, page_url=None, on_plan=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs).
-        tabs: [{title, url, text, current}] in visible order, for @tabN."""
+        tabs: [{title, url, text, current}] in visible order, for @tabN.
+        on_plan(plan_text) -> bool gates the work: the first action
+        of the turn runs only when it approves, and submit actions
+        (remember/forget) ask again each time. None = no gate
+        (tests and programmatic use); the window and the CLI pass
+        one. cancel() stops the turn at the next step boundary."""
+        self._stop_requested = False
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         # Memory: what the person asked to be remembered, when it is
         # relevant — never on a page that looks sensitive.
@@ -275,7 +323,8 @@ class ChatSession:
                     lines.append(f"Group: {group['name']}")
                 for tab in group["items"]:
                     marker = " (current)" if tab.get("current") else ""
-                    lines.append(f"{pos[id(tab)]}. {tab.get('title') or 'Untitled'} — "
+                    agent = "🤖 " if tab.get("agent") else ""
+                    lines.append(f"{pos[id(tab)]}. {agent}{tab.get('title') or 'Untitled'} — "
                                  f"{tab.get('url') or ''}{marker}")
             tab_note = "Open tabs:\n" + "\n".join(lines)
             refs = re.findall(r"@tab(\d+)", user_text or "")
@@ -304,7 +353,11 @@ class ChatSession:
         messages.append({"role": "user", "content": user_text})
         open_requests = []
         answer = ""
+        actions_run = 0
         for _ in range(MAX_ACTIONS + 1):
+            if self._stop_requested:
+                answer = "Stopped."
+                break
             reply = self._chat(messages, on_chunk)
             messages.append({"role": "assistant", "content": reply})
             action = parse_action(reply)
@@ -312,8 +365,23 @@ class ChatSession:
                 answer = visible_text(reply)
                 break
             kind = action.get("type")
+            # The plan gate: first action of the turn needs approval;
+            # submit actions ask again each time, even when approved.
+            if on_plan is not None:
+                plan = describe_action(kind, action)
+                if actions_run == 0:
+                    if not on_plan(plan):
+                        answer = "Okay — I didn't do that."
+                        break
+                elif kind in SUBMIT_ACTIONS:
+                    if not on_plan(plan + " (this changes what I remember)"):
+                        messages.append({"role": "user", "content":
+                                         f"RESULT of {kind}:\n"
+                                         "The person said no to that."})
+                        continue
             if on_action:
                 on_action(kind, action)
+            actions_run += 1
             try:
                 if kind == "search":
                     result = _run_search(str(action.get("query", "")))

@@ -89,9 +89,17 @@ Joshua's real PC.
   summarize-page, tl-dr, key-facts, explain-like-im-new, find-price,
   research-topic — all 6 run against a stub brain in E2E. Suite 95/95.
   Real-PC verdict open.)*
-- [ ] **#10 — Plan → Run → Interrupt [L].** Brain shows its step plan first;
+- [~] **#10 — Plan → Run → Interrupt [L].** Brain shows its step plan first;
   person approves; each step runs visibly in a marked tab; a Stop button
   actually stops it. Confirm before anything that submits (purchase, post, send).
+  *(Built 2026-11-11: chat.ask on_plan gate — first action of a
+  turn needs approval, remember/forget re-ask every time, plain-word
+  describe_action; ChatSession.cancel() stops the turn between
+  steps; dock dialog (worker waits on an event) + "Plan:" log line +
+  Stop button (enabled only mid-turn); tabs the brain opens are
+  marked 🤖 in the tab bar and in the chat's tab list. Suite 128/128;
+  Qt offscreen smoke (plan dialog approved, page in a 🤖 tab).
+  Real-PC verdict open.)*
 - [ ] **#11 — Research as a background job [S–M, UI only].** The research
   runner already works; give it a progress line and let it run while browsing
   continues. Strictly sequential. Expect minutes.
