@@ -127,6 +127,10 @@ class HtmlToMarkdownTests(unittest.TestCase):
         self.assertIn("1. first", markdown)
         self.assertIn("```\ncode line 1", markdown)
         self.assertIn("| Name | Value |", markdown)
+        self.assertIn("| --- | --- |", markdown)
+        # The separator sits between header and first data row.
+        self.assertLess(markdown.index("| --- | --- |"),
+                        markdown.index("| alpha | 1 |"))
         self.assertIn("| alpha | 1 |", markdown)
         self.assertNotIn("should not appear", markdown)
         self.assertNotIn("Menu noise", markdown)
@@ -134,6 +138,27 @@ class HtmlToMarkdownTests(unittest.TestCase):
         urls = [link["url"] for link in links]
         self.assertIn("http://site.test/docs/page.html", urls)
         self.assertIn("https://example.org/abs", urls)
+
+    def test_table_separator_matches_column_count(self):
+        html = ("<table><tr><th>A</th><th>B</th><th>C</th></tr>"
+                "<tr><td>1</td><td>2</td><td>3</td></tr></table>")
+        _title, markdown, _links = html_to_markdown(html, "http://site.test/")
+        self.assertIn("| --- | --- | --- |", markdown)
+
+    def test_second_table_gets_its_own_separator(self):
+        html = ("<table><tr><th>A</th></tr><tr><td>1</td></tr></table>"
+                "<p>between</p>"
+                "<table><tr><th>B</th></tr><tr><td>2</td></tr></table>")
+        _title, markdown, _links = html_to_markdown(html, "http://site.test/")
+        self.assertEqual(markdown.count("| --- |"), 2)
+
+    def test_empty_leading_row_does_not_steal_separator(self):
+        html = ("<table><tr><td></td><td></td></tr>"
+                "<tr><th>Name</th><th>Value</th></tr>"
+                "<tr><td>alpha</td><td>1</td></tr></table>")
+        _title, markdown, _links = html_to_markdown(html, "http://site.test/")
+        self.assertIn("| --- | --- |", markdown)
+        self.assertEqual(markdown.count("| --- | --- |"), 1)
 
 
 class SearchParserTests(unittest.TestCase):

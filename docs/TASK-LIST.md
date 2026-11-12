@@ -204,8 +204,13 @@ Joshua's real PC.
   bytes (gzip bombs refused), partial files removed; fetch_any streams
   to a temp file first and reads text back only under the memory cap.
   Suite 75/75 incl. 6 new cap tests. Real-PC verdict open.)*
-- [ ] **#18 — [E2] Markdown table separator row.** html2md tables currently
+- [~] **#18 — [E2] Markdown table separator row.** html2md tables currently
   aren't valid Markdown tables.
+  *(Fixed 2026-11-11: html2md now emits `| --- | --- |` after the first
+  emitted row of each table (first row = header, same shape as the CSV
+  path in files.py); empty leading rows don't steal the separator; the
+  counter resets per table. Suite 169/169 incl. 3 new table tests.
+  Real-PC verdict open.)*
 - [ ] **#19 — [E3] Barrier detection on raw HTML.** Research scans extracted
   Markdown, so markup markers like password fields and captcha classes can
   never fire.

@@ -43,6 +43,7 @@ class _MarkdownParser(HTMLParser):
         self._heading_prefix = None
         self._row_cells = None
         self._cell_text = None
+        self._table_rows = 0  # rows emitted in the current table
 
     # -- helpers ------------------------------------------------------
     def _emit(self, text):
@@ -111,6 +112,8 @@ class _MarkdownParser(HTMLParser):
         elif tag == "blockquote":
             self._newline(2)
             self._emit("> ")
+        elif tag == "table":
+            self._table_rows = 0
         elif tag == "tr":
             self._row_cells = []
         elif tag in ("td", "th") and self._row_cells is not None:
@@ -153,6 +156,15 @@ class _MarkdownParser(HTMLParser):
             if any(self._row_cells):
                 self._newline(1)
                 self._emit("| " + " | ".join(self._row_cells) + " |")
+                if self._table_rows == 0:
+                    # The first row is the header — a Markdown table
+                    # needs the separator row under it, or viewers
+                    # render it as plain text lines. Same shape as
+                    # the CSV path in files.py.
+                    self._newline(1)
+                    self._emit("| " + " | ".join(
+                        "---" for _ in self._row_cells) + " |")
+                self._table_rows += 1
             self._row_cells = None
         elif tag in _BLOCK_END:
             self._newline(2)
