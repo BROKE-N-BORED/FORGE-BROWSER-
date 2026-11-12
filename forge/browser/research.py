@@ -106,7 +106,18 @@ def run_research(plan, approved=False, max_chars_per_source=4000,
                 failures.append(f"could not read {result.url}: {exc}")
                 continue
             text = getattr(found, "text", "") or ""
-            barriers = detect_barriers(text, result.url) if found.kind == "html" else []
+            # Barriers the fetcher found in the raw HTML (markup
+            # markers) plus anything the extracted text still shows
+            # (visible phrases) — one kind each, no duplicates. A
+            # fetch that never ran detection leaves barriers empty
+            # and the text check still catches what it can.
+            barriers = list(getattr(found, "barriers", []) or [])
+            if found.kind == "html":
+                seen_kinds = {b.get("kind") for b in barriers}
+                for barrier in detect_barriers(text, result.url):
+                    if barrier.get("kind") not in seen_kinds:
+                        seen_kinds.add(barrier.get("kind"))
+                        barriers.append(barrier)
             sources.append({
                 "n": len(sources) + 1,
                 "title": getattr(found, "title", "") or result.title,

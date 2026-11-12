@@ -299,6 +299,14 @@ class _FileHandler(BaseHTTPRequestHandler):
             "/song.mp3": ("audio/mpeg", b"not-real-audio"),
             "/big.bin": ("application/octet-stream", b"x" * 2048),
             "/big.txt": ("text/plain", b"y" * 2048),
+            # A gate with NO visible barrier phrase: only the markup
+            # gives it away (a recaptcha div, a password field).
+            "/gated.html": ("text/html",
+                            b"<html><head><title>Gated</title></head><body>"
+                            b"<div class=\"g-recaptcha\"></div>"
+                            b"<form><input type=\"password\" name=\"pw\"></form>"
+                            b"<p>Welcome to the article about gears.</p>"
+                            b"</body></html>"),
         }
         content_type, body = routes.get(self.path, ("text/plain", b"missing"))
         self.send_response(200 if self.path in routes else 404)
@@ -367,6 +375,15 @@ class FileTests(unittest.TestCase):
         result = fetch_any(self.base + "/song.mp3")
         self.assertEqual(result.kind, "audio")
         self.assertTrue(os.path.isfile(result.saved_path))
+
+    def test_gated_page_barriers_from_raw_html(self):
+        # The gate is markup-only: no visible phrase says captcha or
+        # login, so only detection on the raw HTML can catch it.
+        result = fetch_any(self.base + "/gated.html")
+        self.assertEqual(result.kind, "html")
+        self.assertIn("Welcome to the article about gears.", result.text)
+        kinds = [b["kind"] for b in result.barriers]
+        self.assertEqual(kinds, ["captcha", "login"])
 
 
 class DownloadCapTests(unittest.TestCase):
@@ -683,6 +700,60 @@ class ResearchTests(unittest.TestCase):
         self.assertIn("The source says the thing plainly.", done["report"])
         self.assertIsNone(done["error"])
         self.assertIsNone(research_job_running())
+
+    def test_research_keeps_fetch_side_barriers(self):
+        # A fetcher that already detected a captcha in the raw HTML:
+        # research must carry it into the source, not lose it.
+        plan = make_plan("Test topic", queries=["q one"])
+
+        def fake_search(query, max_results=5):
+            from forge.browser.search import SearchResult
+            return [SearchResult(title="Src", url="http://x.test/a", snippet="")]
+
+        class Found:
+            kind = "html"
+            title = "Src Title"
+            text = "The source says the thing plainly."
+            barriers = [{"kind": "captcha", "needs_human": True, "note": "x"}]
+
+        _report, sources = run_research(
+            plan, approved=True, search_fn=fake_search,
+            fetch_fn=lambda url: Found())
+        self.assertEqual([b["kind"] for b in sources[0]["barriers"]],
+                         ["captcha"])
+
+    def test_research_text_fallback_and_no_duplicates(self):
+        # A fetcher that never ran detection: the visible phrase in
+        # the extracted text still catches the login — and a kind
+        # found both ways appears exactly once.
+        plan = make_plan("Test topic", queries=["q one"])
+
+        def fake_search(query, max_results=5):
+            from forge.browser.search import SearchResult
+            return [SearchResult(title="Src", url="http://x.test/a", snippet="")]
+
+        class Found:
+            kind = "html"
+            title = "Src Title"
+            text = "Please sign in to continue reading."
+            barriers = [{"kind": "login", "needs_human": True, "note": "x"}]
+
+        _report, sources = run_research(
+            plan, approved=True, search_fn=fake_search,
+            fetch_fn=lambda url: Found())
+        self.assertEqual([b["kind"] for b in sources[0]["barriers"]],
+                         ["login"])
+
+        class PlainFound:
+            kind = "html"
+            title = "Src Title"
+            text = "Please sign in to continue reading."
+
+        _report, sources = run_research(
+            plan, approved=True, search_fn=fake_search,
+            fetch_fn=lambda url: PlainFound())
+        self.assertEqual([b["kind"] for b in sources[0]["barriers"]],
+                         ["login"])
 
     def test_report_to_html(self):
         from forge.browser.research import report_to_html

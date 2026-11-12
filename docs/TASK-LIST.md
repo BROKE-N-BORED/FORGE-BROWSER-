@@ -211,9 +211,16 @@ Joshua's real PC.
   path in files.py); empty leading rows don't steal the separator; the
   counter resets per table. Suite 169/169 incl. 3 new table tests.
   Real-PC verdict open.)*
-- [ ] **#19 — [E3] Barrier detection on raw HTML.** Research scans extracted
+- [~] **#19 — [E3] Barrier detection on raw HTML.** Research scans extracted
   Markdown, so markup markers like password fields and captcha classes can
   never fire.
+  *(Fixed 2026-11-11: fetch_any now runs detect_barriers on the raw HTML
+  while it still has it and carries the result on FileResult.barriers
+  (also in to_dict); research merges those with what the extracted text
+  still shows, one entry per kind — a fetcher that never ran detection
+  still gets the text fallback. Suite 172/172 incl. 3 new tests; live
+  check: a markup-only gated page now reports captcha + login and the
+  report carries both Note lines. Real-PC verdict open.)*
 - [ ] **#20 — [S3] Fetch address fence.** The fetcher will happily fetch
   127.0.0.1 / LAN addresses; add a fence with an explicit local-allow switch
   (the verify flow needs local pages; plain fetching doesn't).

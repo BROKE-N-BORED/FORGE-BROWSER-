@@ -67,12 +67,14 @@ class FileResult:
     content_type: str = ""
     size_bytes: int = 0
     notes: list = field(default_factory=list)
+    barriers: list = field(default_factory=list)  # gates, from the RAW html
 
     def to_dict(self):
         return {"url": self.url, "final_url": self.final_url, "kind": self.kind,
                 "title": self.title, "text": self.text,
                 "saved_path": self.saved_path, "content_type": self.content_type,
-                "size_bytes": self.size_bytes, "notes": self.notes}
+                "size_bytes": self.size_bytes, "notes": self.notes,
+                "barriers": self.barriers}
 
 
 def media_dir():
@@ -292,6 +294,12 @@ def fetch_any(url, timeout=30, describe=True, transcribe=True):
 
         if kind == "html":
             text = decode_body(body, headers)
+            # Barrier detection runs on the RAW html, here, while it
+            # still exists — the markup markers (password fields,
+            # captcha class names) can never appear in the extracted
+            # Markdown, so detecting later would miss them.
+            from .barriers import detect_barriers
+            result.barriers = detect_barriers(text, final_url)
             result.title, result.text, _ = html_to_markdown(text, final_url)
         elif kind == "pdf":
             result.text = extract_pdf_text(body)
