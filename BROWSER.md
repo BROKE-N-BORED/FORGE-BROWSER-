@@ -91,6 +91,16 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Link previews
+
+Rest on a link for a moment and a small box by the cursor shows
+two lines about where it goes — the destination's title plus the
+first lines of its own text. Nothing is fetched on hover alone
+and nothing is prefetched; the fetch happens only after the short
+dwell, and the result is cached by URL so a second hover costs
+nothing. Images, audio, and files say what they are instead.
+Terminal version: `python3 -m forge.browser preview <url>`.
+
 ## Morning brief
 
 On first launch of the day the browser builds, in the background,

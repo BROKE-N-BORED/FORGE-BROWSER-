@@ -1020,6 +1020,92 @@ class SessionTests(unittest.TestCase):
             session.ask("hi")
 
 
+class PreviewTests(unittest.TestCase):
+    """#6: link previews — two lines, on demand, cached."""
+
+    def setUp(self):
+        from forge.browser import preview as preview_module
+        preview_module.clear_preview_cache()
+
+    def _result(self, kind="html", title="Gear Guide",
+                text="Gears turn wheels.\nMore about gears.", size=1234):
+        from forge.browser.files import FileResult
+        return FileResult(url="http://gears.example/",
+                          final_url="http://gears.example/",
+                          kind=kind, title=title, text=text, size_bytes=size)
+
+    def test_preview_two_lines_and_cached(self):
+        from forge.browser import preview as preview_module
+        calls = []
+
+        def fake(url):
+            calls.append(url)
+            return self._result()
+
+        # Title line + one snippet line (the first two source lines,
+        # joined). The second hover on the same link costs no fetch.
+        self.assertEqual(
+            preview_module.preview_url("http://gears.example/", fetcher=fake),
+            "Gear Guide\nGears turn wheels. More about gears.")
+        self.assertEqual(
+            preview_module.preview_url("http://gears.example/", fetcher=fake),
+            "Gear Guide\nGears turn wheels. More about gears.")
+        self.assertEqual(len(calls), 1)
+
+    def test_preview_empty_and_anchor(self):
+        from forge.browser import preview as preview_module
+        self.assertEqual(preview_module.preview_url(""), "")
+        self.assertEqual(preview_module.preview_url("#section"), "")
+
+    def test_preview_fetch_failure(self):
+        from forge.browser import preview as preview_module
+
+        def boom(url):
+            raise Exception("down")
+
+        self.assertEqual(
+            preview_module.preview_url("http://x.example/", fetcher=boom),
+            "Couldn't fetch that link.")
+
+    def test_preview_binary_kinds(self):
+        from forge.browser import preview as preview_module
+        self.assertEqual(
+            preview_module.preview_url(
+                "http://x.example/pic.png",
+                fetcher=lambda u: self._result(kind="image", title="",
+                                               text="", size=42000)),
+            "image file, 41 KB.")
+        self.assertEqual(
+            preview_module.preview_url(
+                "http://x.example/f.bin",
+                fetcher=lambda u: self._result(kind="binary", title="Data",
+                                               text="", size=10)),
+            "Data — couldn't read it as text (unknown type).")
+
+    def test_preview_no_readable_text(self):
+        from forge.browser import preview as preview_module
+        self.assertEqual(
+            preview_module.preview_url(
+                "http://x.example/empty",
+                fetcher=lambda u: self._result(title="", text="   \n\n")),
+            "That page has no readable text.")
+
+    def test_cli_preview(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from forge.browser import cli as cli_module
+        from forge.browser import preview as preview_module
+        with mock.patch.object(preview_module, "preview_url",
+                               return_value="Gear Guide\nGears turn wheels."):
+            args = mock.Mock(url="http://gears.example/")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli_module._cmd_preview(args)
+        self.assertEqual(code, 0)
+        self.assertIn("Gear Guide", out.getvalue())
+
+
 class BriefTests(unittest.TestCase):
     """#15: the morning brief, from the local memory store."""
 

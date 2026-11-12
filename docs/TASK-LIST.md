@@ -59,8 +59,15 @@ Joshua's real PC.
   both streaming live. Suite 75/75; stub E2E (6 maps + 1 reduce, cache
   hit = 0 calls, changed text re-summarizes); offscreen Qt smoke drove
   the real button — summary once in the log. Real-PC verdict open.)*
-- [ ] **#6 — Link previews [M].** Hover a link, get a 2-line summary of where
+- [~] **#6 — Link previews [M].** Hover a link, get a 2-line summary of where
   it goes. On demand only — no prefetching (would thrash the CPU).
+  *(Built 2026-11-11: new forge/browser/preview.py — destination
+  title + first text lines (no model call), binary kinds named
+  plainly, cached by URL (50 entries); window hovers via the
+  page's linkHovered signal + 600ms dwell, popup by the cursor,
+  hidden when the hover or the page moves on; `preview <url>` CLI.
+  Suite 142/142; Qt offscreen smoke (real hover → "Forge Browser"
+  preview of the home page). Real-PC verdict open.)*
 - [ ] **#7 — Cross-tab compare [M].** "Compare these three" → extract the same
   fields (price, specs) from each tab in separate tiny calls, render the table
   in the window. Never one giant prompt.

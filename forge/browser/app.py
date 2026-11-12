@@ -20,6 +20,7 @@ import os
 import threading
 
 from .errors import BrowserError
+from .preview import DWELL_MS
 
 _QT = None
 
@@ -51,6 +52,7 @@ def create_window(server, profile, start_url=None):
 
     class Window(QtWidgets.QMainWindow):
         tidy_done = QtCore.Signal(object, str, str)  # view, url, tidy title
+        preview_ready = QtCore.Signal(str, str)  # url, preview text
 
         def __init__(self):
             super().__init__()
@@ -58,7 +60,14 @@ def create_window(server, profile, start_url=None):
             self.resize(1240, 820)
             self._tidy_cache = {}  # url -> tidy title, so a revisit never re-asks
             self._agent_tab_ids = set()  # id(view) of tabs the brain opened
+            self._preview_url = ""
+            self._preview_popup = None
+            self._preview_label = None
+            self._preview_timer = QtCore.QTimer(self)
+            self._preview_timer.setSingleShot(True)
+            self._preview_timer.timeout.connect(self._fetch_link_preview)
             self.tidy_done.connect(self._apply_tidy_title)
+            self.preview_ready.connect(self._display_preview)
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.setTabsClosable(True)
             self.tabs.setMovable(True)
@@ -91,6 +100,8 @@ def create_window(server, profile, start_url=None):
             view.setPage(QWebEnginePage(profile, view))
             view.urlChanged.connect(lambda *a: self._sync_address())
             view.titleChanged.connect(lambda t: self._set_tab_title(view, t))
+            view.page().linkHovered.connect(
+                lambda url, view=view: self._on_link_hovered(view, url))
             view.loadFinished.connect(
                 lambda *a, view=view: self._on_load_finished(view))
             index = self.tabs.addTab(view, "New Tab")
@@ -170,6 +181,70 @@ def create_window(server, profile, start_url=None):
                 # Forge Browser's own local pages aren't addresses
                 # the person typed — keep the bar clean on those.
                 self.address.setText("" if url.startswith("http://127.0.0.1") else url)
+            # A navigation ends any hover — the link is gone.
+            self._preview_url = ""
+            self._preview_timer.stop()
+            self._hide_link_preview()
+
+        def _on_link_hovered(self, view, url):
+            # Rest on a link and, after a short dwell, a two-line
+            # preview of where it goes appears by the cursor. Nothing
+            # is fetched on hover alone, and never prefetched.
+            if view is not self._view():
+                return
+            url = url or ""
+            if not url:
+                self._preview_url = ""
+                self._preview_timer.stop()
+                self._hide_link_preview()
+                return
+            if url == self._preview_url and self._preview_popup is not None \
+                    and self._preview_popup.isVisible():
+                return
+            self._preview_url = url
+            self._hide_link_preview()
+            self._preview_timer.start(DWELL_MS)
+
+        def _fetch_link_preview(self):
+            url = self._preview_url
+            if not url:
+                return
+
+            def work():
+                from .preview import preview_url
+                text = preview_url(url)
+                self.preview_ready.emit(url, text)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _display_preview(self, url, text):
+            if url != self._preview_url or not text:
+                return
+            if self._preview_popup is None:
+                popup = QtWidgets.QWidget(
+                    None, QtCore.Qt.WindowType.ToolTip |
+                    QtCore.Qt.WindowType.FramelessWindowHint)
+                popup.setObjectName("link_preview")
+                label = QtWidgets.QLabel(popup)
+                label.setWordWrap(True)
+                label.setMaximumWidth(380)
+                layout = QtWidgets.QVBoxLayout(popup)
+                layout.setContentsMargins(10, 8, 10, 8)
+                layout.addWidget(label)
+                popup.setStyleSheet(
+                    "background:#1d1d1d; color:#e8e6e1; "
+                    "border:1px solid #4a4a4a; border-radius:6px;")
+                self._preview_label = label
+                self._preview_popup = popup
+            self._preview_label.setText(text)
+            self._preview_popup.adjustSize()
+            self._preview_popup.move(
+                QtGui.QCursor.pos() + QtCore.QPoint(14, 18))
+            self._preview_popup.show()
+
+        def _hide_link_preview(self):
+            if self._preview_popup is not None:
+                self._preview_popup.hide()
 
         def _go(self):
             kind, target = resolve_address(self.address.text())

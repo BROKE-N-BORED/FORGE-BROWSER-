@@ -401,6 +401,13 @@ def _cmd_brief(args):
     return 0
 
 
+def _cmd_preview(args):
+    from .preview import preview_url
+    text = preview_url(args.url)
+    print(text or "nothing to preview for that link")
+    return 0
+
+
 def _cmd_app(args):
     from .app import run_app
     return run_app(args.url)
@@ -445,6 +452,10 @@ def main(argv=None):
 
     p = sub.add_parser("brief", help="the morning brief — what yesterday's browsing was about")
     p.set_defaults(func=_cmd_brief)
+
+    p = sub.add_parser("preview", help="two lines about where a link goes (fetched on demand)")
+    p.add_argument("url")
+    p.set_defaults(func=_cmd_preview)
 
     p = sub.add_parser("voice", help="record the microphone and transcribe it (local whisper)")
     p.add_argument("seconds", nargs="?", type=int, default=5,
