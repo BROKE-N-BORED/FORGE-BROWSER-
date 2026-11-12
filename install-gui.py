@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny Tkinter dialogs for install-app.sh — used only when zenity
+"""Tiny Tkinter dialogs for the installer — used only when zenity
 is not installed (Linux Mint has zenity by default, so this is the
 fallback, not the main path).
 

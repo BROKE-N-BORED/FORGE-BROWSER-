@@ -1093,21 +1093,23 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(root.get("width"), "512")
         self.assertEqual(root.get("height"), "512")
 
-    def test_installer_launcher_is_valid(self):
-        path = os.path.join(self._root(), "Install Forge Browser.desktop")
+    def test_installer_is_double_clickable(self):
+        # The installer IS the double-click target: a script with a
+        # shebang and the exec bit. (A .desktop wrapper was tried
+        # and dropped — %k expands to empty when a .desktop file is
+        # launched from an arbitrary folder, so it cannot find the
+        # script next to it. The script finds itself via $0.)
+        import stat
+        path = os.path.join(self._root(), "Install Forge Browser")
         with open(path, encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-        self.assertEqual(lines[0], "[Desktop Entry]")
-        fields = dict(line.split("=", 1) for line in lines[1:]
-                      if "=" in line)
-        self.assertEqual(fields["Type"], "Application")
-        self.assertEqual(fields["Name"], "Install Forge Browser")
-        self.assertIn("install-app.sh", fields["Exec"])
-        self.assertEqual(fields["Terminal"], "false")
+            first = handle.readline()
+        self.assertTrue(first.startswith("#!/bin/sh"))
+        mode = os.stat(path).st_mode
+        self.assertTrue(mode & stat.S_IXUSR)
 
     def test_install_scripts_parse(self):
         import subprocess
-        for name in ("install-app.sh", "install.sh", "run.sh",
+        for name in ("Install Forge Browser", "install.sh", "run.sh",
                      "browser-setup.sh", "test-forge-browser.sh"):
             result = subprocess.run(
                 ["sh", "-n", os.path.join(self._root(), name)],
