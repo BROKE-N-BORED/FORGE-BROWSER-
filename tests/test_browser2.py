@@ -363,6 +363,31 @@ class FileTests(unittest.TestCase):
         self.assertEqual(result.text, "")  # no seat: nothing invented
         self.assertTrue(any("no local vision seat" in n for n in result.notes))
 
+    def test_same_name_downloaded_twice_keeps_both(self):
+        # Task #22: the second download gets a uniquified name
+        # instead of silently overwriting the first file.
+        with tempfile.TemporaryDirectory() as media:
+            old = os.environ.get("FORGE_BROWSER_MEDIA_DIR")
+            os.environ["FORGE_BROWSER_MEDIA_DIR"] = media
+            try:
+                first = fetch_any(self.base + "/pic.png", allow_local=True)
+                second = fetch_any(self.base + "/pic.png", allow_local=True)
+                third = fetch_any(self.base + "/pic.png", allow_local=True)
+                names = sorted(os.listdir(media))
+                # The isfile checks run here — the temp dir is gone
+                # once the block exits.
+                for result in (first, second, third):
+                    self.assertTrue(os.path.isfile(result.saved_path))
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEDIA_DIR", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEDIA_DIR"] = old
+        self.assertEqual(names, ["pic-1.png", "pic-2.png", "pic.png"])
+        self.assertEqual(os.path.basename(first.saved_path), "pic.png")
+        self.assertEqual(os.path.basename(second.saved_path), "pic-1.png")
+        self.assertEqual(os.path.basename(third.saved_path), "pic-2.png")
+
     def test_json_and_csv(self):
         result = fetch_any(self.base + "/data.json", allow_local=True)
         self.assertEqual(result.kind, "text")

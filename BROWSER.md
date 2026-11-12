@@ -322,7 +322,9 @@ paged via `--offset` so a small model can read them in slices.
 - video / anything else → saved, with type and size reported
 
 Files are saved under `~/.forge/browser-media/` (override:
-`FORGE_BROWSER_MEDIA_DIR`).
+`FORGE_BROWSER_MEDIA_DIR`). A name that is already taken gets
+uniquified — report-1.pdf, report-2.pdf — instead of overwriting
+the file already there.
 
 ## Rendered pages, snapshots, screenshots (Item 2)
 

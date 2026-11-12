@@ -247,8 +247,13 @@ Joshua's real PC.
   skip an engine whose installed version + hash already match. browser-
   setup.sh uses the same Lightpanda pin + verify. Suite 181/181.
   Real-PC verdict open.)*
-- [ ] **#22 — [E9] Download name collisions.** Colliding filenames silently
+- [~] **#22 — [E9] Download name collisions.** Colliding filenames silently
   overwrite — uniquify names.
+  *(Built 2026-11-11: _keep_file now uniquifies a colliding name —
+  report-1.pdf, report-2.pdf — via an atomic link call, so two downloads
+  of the same name can never clobber each other. Test fetches the same
+  image three times into a fresh media dir: pic.png, pic-1.png, pic-2.png
+  all exist, no stray temp files. Suite 182/182. Real-PC verdict open.)*
 
 ## Do NOT build (researched, wrong for this machine/product)
 

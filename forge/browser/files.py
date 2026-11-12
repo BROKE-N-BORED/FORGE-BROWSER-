@@ -85,13 +85,34 @@ def media_dir():
 
 
 def _keep_file(tmp_path, final_url, kind):
-    """Move an already-downloaded temp file to its media-dir name."""
+    """Move an already-downloaded temp file to its media-dir name.
+
+    A colliding name is uniquified (report-1.pdf, report-2.pdf, ...)
+    instead of silently overwriting the file already there. The
+    link call is the atomic check, so two downloads of the same
+    name can never clobber each other.
+    """
     name = os.path.basename(urlparse(final_url).path) or f"download.{kind}"
     if "." not in name:
         name += "." + kind
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
-    path = os.path.join(media_dir(), safe)
-    os.replace(tmp_path, path)
+    stem, ext = os.path.splitext(safe)
+    directory = media_dir()
+    candidate = safe
+    number = 0
+    while True:
+        path = os.path.join(directory, candidate)
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            number += 1
+            candidate = f"{stem}-{number}{ext}"
+            continue
+        break
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
     return path
 
 
