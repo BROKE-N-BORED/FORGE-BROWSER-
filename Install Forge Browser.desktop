@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=Install Forge Browser
-Comment=Installs Forge Browser as a real program — icon in your app menu, no terminal needed.
-Exec=sh -c 'cd "$(dirname %k)" && sh install-app.sh'
-Icon=system-software-install
-Terminal=false
-Categories=System;
