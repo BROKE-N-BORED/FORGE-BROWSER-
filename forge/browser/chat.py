@@ -17,6 +17,7 @@ time with a line like:
     ACTION {"type": "recall"}
     ACTION {"type": "recall_pages", "query": "that thing about gears"}
     ACTION {"type": "brief"}
+    ACTION {"type": "compare", "tabs": [1, 2, 3], "fields": ["price", "specs"]}
 
 The session runs the action with the real engine, hands the
 result back to the model, and the model answers from what it
@@ -67,6 +68,7 @@ ACTION {"type": "forget", "text": "dark mode"}
 ACTION {"type": "recall"}
 ACTION {"type": "recall_pages", "query": "that thing about gears"}
 ACTION {"type": "brief"}
+ACTION {"type": "compare", "tabs": [1, 2, 3], "fields": ["price", "specs"]}
 Then wait for the RESULT. When you have enough, answer plainly and briefly,
 using only what the results actually said. If the user just chats, answer
 directly with no ACTION line. Never invent page contents, prices, or facts.
@@ -77,6 +79,9 @@ with their exact words. Recall lists what you remember; forget removes it.
 When the person asks about something they read before ("that thing I read
 last week"), use recall_pages with their words as the query.
 When the person asks for the morning brief, use the brief action.
+When the person asks to compare tabs, use the compare action with
+the tab numbers and the fields to compare (price, specs, whatever
+they named).
 Your first action each turn is shown to the person as a plan for
 approval before it runs, and anything that changes what is
 remembered asks again — so propose one clear step at a time,
@@ -166,6 +171,11 @@ def describe_action(kind, action):
         return f"Search pages you visited for \"{action.get('query', '')}\""
     if kind == "brief":
         return "Build the morning brief from yesterday's pages"
+    if kind == "compare":
+        tabs = action.get("tabs") or []
+        fields = action.get("fields") or []
+        return (f"Compare tabs {', '.join(str(n) for n in tabs) or 'the open tabs'}"
+                f" on {', '.join(fields) or 'price and key specs'}")
     return f"Run the {kind} action"
 
 
@@ -289,14 +299,15 @@ class ChatSession:
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
 
     def ask(self, user_text, page_text=None, on_action=None, on_chunk=None,
-            tabs=None, page_url=None, on_plan=None):
+            tabs=None, page_url=None, on_plan=None, on_table=None):
         """One chat turn. Returns (answer, urls_to_open_in_tabs).
         tabs: [{title, url, text, current}] in visible order, for @tabN.
         on_plan(plan_text) -> bool gates the work: the first action
         of the turn runs only when it approves, and submit actions
         (remember/forget) ask again each time. None = no gate
         (tests and programmatic use); the window and the CLI pass
-        one. cancel() stops the turn at the next step boundary."""
+        one. on_table(html) receives a comparison table to render
+        in the window. cancel() stops the turn at the next step boundary."""
         self._stop_requested = False
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         # Memory: what the person asked to be remembered, when it is
@@ -449,6 +460,27 @@ class ChatSession:
                 elif kind == "brief":
                     from .brief import brief_text, build_brief
                     result = brief_text(build_brief(self))
+                elif kind == "compare":
+                    from .compare import (DEFAULT_FIELDS, compare_table_html,
+                                          compare_table_text, compare_tabs)
+                    numbers = action.get("tabs") or [
+                        int(n) for n in re.findall(r"@tab(\d+)", user_text or "")]
+                    fields = [str(f) for f in (action.get("fields") or [])
+                              if str(f).strip()] or DEFAULT_FIELDS
+                    all_tabs = list(tabs or [])
+                    chosen = [all_tabs[n - 1] for n in numbers
+                              if isinstance(n, int) and 1 <= n <= len(all_tabs)]
+                    if not chosen and all_tabs:
+                        # "compare these three" with no numbers: the
+                        # first three open tabs.
+                        chosen = all_tabs[:3]
+                    if not chosen:
+                        result = "There are no tabs open to compare."
+                    else:
+                        rows = compare_tabs(self, chosen, fields)
+                        if on_table:
+                            on_table(compare_table_html(rows, fields))
+                        result = compare_table_text(rows, fields)
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:

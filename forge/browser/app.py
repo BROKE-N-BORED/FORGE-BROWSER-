@@ -95,7 +95,7 @@ def create_window(server, profile, start_url=None):
         def _view(self):
             return self.tabs.currentWidget()
 
-        def new_tab(self, url=None, agent=False):
+        def new_tab(self, url=None, agent=False, html=None):
             view = QWebEngineView()
             view.setPage(QWebEnginePage(profile, view))
             view.urlChanged.connect(lambda *a: self._sync_address())
@@ -109,7 +109,10 @@ def create_window(server, profile, start_url=None):
                 self._agent_tab_ids.add(id(view))
                 self.tabs.setTabText(index, "🤖 New Tab")
             self.tabs.setCurrentIndex(index)
-            view.load(QtCore.QUrl(url or server.home_url))
+            if html is not None:
+                view.setHtml(html)
+            else:
+                view.load(QtCore.QUrl(url or server.home_url))
             return view
 
         def _agent_mark(self, view):
@@ -279,6 +282,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         failed = QtCore.Signal(str)
         voice_text = QtCore.Signal(str)
         plan = QtCore.Signal(str, object)  # plan text, {"event", "approved"}
+        compare_table = QtCore.Signal(str)  # comparison table HTML
 
     signals = Signals()
     model = pick_chat_model()
@@ -376,6 +380,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
     signals.open_url.connect(lambda url: window.new_tab(url, agent=True))
+    signals.compare_table.connect(lambda html: window.new_tab(html=html))
     signals.token.connect(on_token)
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
@@ -472,7 +477,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             answer, opens = session.ask(
                 text, page_text=page_text, tabs=tabs, page_url=page_url,
                 on_action=lambda kind, a: signals.notice.emit(f"working: {kind}…"),
-                on_chunk=on_chunk, on_plan=ask_plan)
+                on_chunk=on_chunk, on_plan=ask_plan,
+                on_table=lambda html: signals.compare_table.emit(html))
             for url in opens:
                 signals.open_url.emit(url)
             rest = display.flush()

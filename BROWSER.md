@@ -91,6 +91,15 @@ Summarize button: one click summarizes the current tab, streamed
 live into the log. No Ollama answering = the dock says so and
 browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
+## Cross-tab compare
+
+Say "compare these three" (or "compare @tab1 @tab2 on price") and
+the brain pulls the same fields out of each tab — one small call
+per tab, never one giant prompt — and opens a Comparison tab with
+the table in the window. A field a page doesn't list reads "not
+listed"; a reply the brain couldn't use reads "couldn't extract".
+The brain also gets the table as text, so it can talk about it.
+
 ## Link previews
 
 Rest on a link for a moment and a small box by the cursor shows

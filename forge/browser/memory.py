@@ -209,7 +209,9 @@ def remember_page(url, title, text):
 
     url = (url or "").strip()
     text = (text or "").strip()
-    if not url or is_sensitive_url(url) or url.startswith("http://127.0.0.1"):
+    if not url.startswith(("http://", "https://")):
+        return False  # about:blank, data:, and other non-web pages
+    if is_sensitive_url(url) or url.startswith("http://127.0.0.1"):
         return False
     if len(text) < 200:
         return False

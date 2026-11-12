@@ -68,9 +68,18 @@ Joshua's real PC.
   hidden when the hover or the page moves on; `preview <url>` CLI.
   Suite 142/142; Qt offscreen smoke (real hover → "Forge Browser"
   preview of the home page). Real-PC verdict open.)*
-- [ ] **#7 — Cross-tab compare [M].** "Compare these three" → extract the same
+- [~] **#7 — Cross-tab compare [M].** "Compare these three" → extract the same
   fields (price, specs) from each tab in separate tiny calls, render the table
   in the window. Never one giant prompt.
+  *(Built 2026-11-11: new forge/browser/compare.py — extract_fields
+  (one ask_once per tab, JSON with "not listed"/"couldn't extract"
+  fallbacks), compare_tabs, Markdown + HTML table; `compare` chat
+  ACTION (tab numbers, fields, first-three default); window opens
+  the table in its own tab (new_tab html=). Also fixed in place:
+  history + page memory now skip non-web URLs (about:blank/data:)
+  so comparison tabs leave no junk behind. Suite 150/150; stub E2E;
+  Qt offscreen smoke (real compare → Comparison tab, $42 vs $55).
+  Real-PC verdict open.)*
 - [~] **#8 — Tidy titles + tab grouping [M].** Fast seat renames messy titles;
   tabs grouped by topic using embeddings; history grouped into resumable
   "journeys".

@@ -115,7 +115,9 @@ def record_visit(url, title):
     """Append a visit (deduped by URL, newest first). Never raises —
     history is a convenience, not a promise."""
     url = (url or "").strip()
-    if not url or url.startswith("http://127.0.0.1"):
+    if not url.startswith(("http://", "https://")):
+        return  # about:blank, data:, and other non-web pages are not history
+    if url.startswith("http://127.0.0.1"):
         return
     try:
         entries = load_history()

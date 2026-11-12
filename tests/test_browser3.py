@@ -1020,6 +1020,96 @@ class SessionTests(unittest.TestCase):
             session.ask("hi")
 
 
+class CompareTests(unittest.TestCase):
+    """#7: cross-tab compare — one tiny call per tab, table in the window."""
+
+    def _session(self, replies):
+        session = chat.ChatSession(model="fake:1b")
+        queue = list(replies)
+
+        def fake_chat(messages, on_chunk=None):
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        return session
+
+    def test_extract_fields_parses_json(self):
+        from forge.browser.compare import extract_fields
+        session = self._session(['{"price": "$42", "specs": "steel"}'])
+        out = extract_fields(session, "Gear A", "The Gear A costs $42, steel.",
+                             ["price", "specs"])
+        self.assertEqual(out, {"price": "$42", "specs": "steel"})
+
+    def test_extract_fields_missing_keys(self):
+        from forge.browser.compare import extract_fields
+        session = self._session(['{"price": "$42"}'])
+        out = extract_fields(session, "Gear A", "text", ["price", "specs"])
+        self.assertEqual(out, {"price": "$42", "specs": "not listed"})
+
+    def test_extract_fields_bad_json(self):
+        from forge.browser.compare import extract_fields
+        session = self._session(['no json here'])
+        out = extract_fields(session, "Gear A", "text", ["price"])
+        self.assertEqual(out, {"price": "couldn't extract"})
+
+    def test_extract_fields_fenced_json(self):
+        from forge.browser.compare import extract_fields
+        session = self._session(['```json\n{"price": "$42"}\n```'])
+        out = extract_fields(session, "Gear A", "text", ["price"])
+        self.assertEqual(out, {"price": "$42"})
+
+    def test_compare_tabs_one_call_per_tab(self):
+        from forge.browser.compare import compare_tabs
+        session = self._session(['{"price": "$42"}', '{"price": "$55"}'])
+        tabs = [{"title": "Gear A", "url": "http://a.example/",
+                 "text": "Gear A costs $42."},
+                {"title": "Gear B", "url": "http://b.example/",
+                 "text": "Gear B costs $55."}]
+        rows = compare_tabs(session, tabs, ["price"])
+        self.assertEqual([(r["title"], r["fields"]["price"]) for r in rows],
+                         [("Gear A", "$42"), ("Gear B", "$55")])
+
+    def test_compare_table_text(self):
+        from forge.browser.compare import compare_table_text
+        rows = [{"title": "Gear A", "url": "", "fields": {"price": "$42"}},
+                {"title": "Gear B", "url": "", "fields": {"price": "not listed"}}]
+        text = compare_table_text(rows, ["price"])
+        self.assertIn("| Gear A | Gear B |", text)
+        self.assertIn("| price | $42 | not listed |", text)
+
+    def test_compare_table_html_escapes(self):
+        from forge.browser.compare import compare_table_html
+        rows = [{"title": "<Gear & Co>", "url": "",
+                 "fields": {"price": "$42"}}]
+        page = compare_table_html(rows, ["price"])
+        self.assertIn("<table>", page)
+        self.assertIn("&lt;Gear &amp; Co&gt;", page)
+        self.assertNotIn("<Gear", page)
+
+    def test_compare_action_via_chat(self):
+        queue = ['ACTION {"type": "compare", "tabs": [1, 2], "fields": ["price"]}',
+                 '{"price": "$42"}', '{"price": "$55"}', "here's the comparison"]
+        session = chat.ChatSession(model="fake:1b")
+        seen_tables = []
+
+        def fake_chat(messages, on_chunk=None):
+            return queue.pop(0)
+
+        session._chat = fake_chat
+        tabs = [{"title": "Gear A", "url": "http://a.example/",
+                 "text": "Gear A costs $42.", "current": True},
+                {"title": "Gear B", "url": "http://b.example/",
+                 "text": "Gear B costs $55.", "current": False}]
+        answer, _opens = session.ask("compare @tab1 @tab2 on price", tabs=tabs,
+                                     on_plan=lambda plan: True,
+                                     on_table=seen_tables.append)
+        self.assertEqual(answer, "here's the comparison")
+        self.assertEqual(len(seen_tables), 1)
+        self.assertIn("$42", seen_tables[0])
+        self.assertIn("$55", seen_tables[0])
+        self.assertIn("<table>", seen_tables[0])
+
+
 class PreviewTests(unittest.TestCase):
     """#6: link previews — two lines, on demand, cached."""
 
