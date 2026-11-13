@@ -52,6 +52,9 @@ FAKE_AX_NODES = [
 FAKE_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
 
+# Counter behind the fake's browser-context ids (see _cdp_reply).
+_BROWSER_CONTEXT_IDS = [0]
+
 
 # ----------------------------------------------------------------------
 # Fake CDP WebSocket server (raw sockets, RFC 6455 server side)
@@ -102,9 +105,15 @@ def _ws_recv(conn, buffer):
 def _cdp_reply(method, expression=""):
     if method == "Target.createTarget":
         return {"targetId": "T1"}
+    if method == "Target.createBrowserContext":
+        # Every fresh session gets its own context id, so tests can
+        # prove two sessions never share one.
+        _BROWSER_CONTEXT_IDS[0] += 1
+        return {"browserContextId": f"CTX{_BROWSER_CONTEXT_IDS[0]}"}
     if method == "Target.attachToTarget":
         return {"sessionId": "S1"}
-    if method in ("Page.enable", "Accessibility.enable", "Target.closeTarget"):
+    if method in ("Page.enable", "Accessibility.enable", "Target.closeTarget",
+                  "Target.disposeBrowserContext"):
         return {}
     if method == "Page.navigate":
         return {"frameId": "F1"}
@@ -136,44 +145,78 @@ class FakeCDPServer(threading.Thread):
         super().__init__(daemon=True)
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
-        self.listener.listen(1)
+        self.listener.listen(5)
         self.port = self.listener.getsockname()[1]
+        # Every (method, params) the server answers, in order — the
+        # fresh-session tests read this to prove isolation.
+        self.calls = []
+        # When True, Target.createBrowserContext is refused, like an
+        # engine that cannot isolate a fresh page.
+        self.refuse_context = False
+        self._stopped = False
 
-    def run(self):
+    def stop(self):
+        self._stopped = True
         try:
-            conn, _ = self.listener.accept()
-            buffer = bytearray()
-            request = b""
-            while b"\r\n\r\n" not in request:
-                request += conn.recv(4096)
-            key = ""
-            for line in request.decode(errors="replace").split("\r\n"):
-                if line.lower().startswith("sec-websocket-key:"):
-                    key = line.split(":", 1)[1].strip()
-            conn.sendall((
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                f"Sec-WebSocket-Accept: {_ws_accept(key)}\r\n\r\n").encode())
-            while True:
-                opcode, payload = _ws_recv(conn, buffer)
-                if opcode == 0x8:
-                    break
-                message = json.loads(payload.decode())
-                method = message.get("method", "")
-                params = message.get("params") or {}
-                result = _cdp_reply(method, params.get("expression", ""))
-                _ws_send(conn, json.dumps({"id": message["id"], "result": result}))
-                if method == "Page.navigate":
-                    _ws_send(conn, json.dumps(
-                        {"method": "Page.loadEventFired", "params": {},
-                         "sessionId": "S1"}))
+            self.listener.close()
         except Exception:
             pass
-        finally:
+
+    def run(self):
+        # One connection per session, several sessions per server:
+        # a fresh-state test opens two sessions against the same
+        # fake engine and proves their contexts differ.
+        while not self._stopped:
             try:
-                self.listener.close()
+                conn, _ = self.listener.accept()
+            except Exception:
+                break
+            try:
+                self._serve(conn)
             except Exception:
                 pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        try:
+            self.listener.close()
+        except Exception:
+            pass
+
+    def _serve(self, conn):
+        buffer = bytearray()
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += conn.recv(4096)
+        key = ""
+        for line in request.decode(errors="replace").split("\r\n"):
+            if line.lower().startswith("sec-websocket-key:"):
+                key = line.split(":", 1)[1].strip()
+        conn.sendall((
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Accept: {_ws_accept(key)}\r\n\r\n").encode())
+        while True:
+            opcode, payload = _ws_recv(conn, buffer)
+            if opcode == 0x8:
+                break
+            message = json.loads(payload.decode())
+            method = message.get("method", "")
+            params = message.get("params") or {}
+            self.calls.append((method, params))
+            if method == "Target.createBrowserContext" and self.refuse_context:
+                _ws_send(conn, json.dumps(
+                    {"id": message["id"],
+                     "error": {"message": "browser contexts not supported"}}))
+                continue
+            result = _cdp_reply(method, params.get("expression", ""))
+            _ws_send(conn, json.dumps({"id": message["id"], "result": result}))
+            if method == "Page.navigate":
+                _ws_send(conn, json.dumps(
+                    {"method": "Page.loadEventFired", "params": {},
+                     "sessionId": "S1"}))
 
 
 class _VersionHandler(BaseHTTPRequestHandler):
@@ -208,6 +251,8 @@ class CDPSessionTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.http.shutdown()
+        cls.http.server_close()
+        cls.fake.stop()
         if cls.old_env is None:
             os.environ.pop("FORGE_CDP_URL", None)
         else:
@@ -247,6 +292,283 @@ class CDPSessionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(BrowserError):
                 session.screenshot(os.path.join(tmp, "x.png"))
+
+
+class _KitesurfVersionHandler(BaseHTTPRequestHandler):
+    """Kitesurf's /json/version shape (its README: Puppeteer reads
+    the protocol version and WebSocket endpoint from it; its
+    VERSION_INFO reports Browser "Kitesurf/0.0.1")."""
+    ws_port = 0
+    browser = "Kitesurf/0.0.1"
+
+    def do_GET(self):
+        body = json.dumps({
+            "Browser": self.browser,
+            "Protocol-Version": "1.3",
+            "webSocketDebuggerUrl":
+                f"ws://127.0.0.1:{self.ws_port}/devtools/browser",
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class KitesurfEngineTests(unittest.TestCase):
+    """Item 1 (v0.8): Kitesurf-local as a third engine. The fake
+    speaks the same CDP the real engine does (Kitesurf's README:
+    /json/version discovery, ws /devtools/browser), so the adapter
+    is tested end to end without the real binary."""
+
+    def setUp(self):
+        self.fake = FakeCDPServer()
+        self.fake.start()
+        _KitesurfVersionHandler.ws_port = self.fake.port
+        _KitesurfVersionHandler.browser = "Kitesurf/0.0.1"
+        self.http = ThreadingHTTPServer(("127.0.0.1", 0),
+                                        _KitesurfVersionHandler)
+        self.http_port = self.http.server_address[1]
+        threading.Thread(target=self.http.serve_forever,
+                         daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.http_port}"
+        self._old_env = {}
+        for var in ("FORGE_KITESURF_URL", "FORGE_CDP_URL",
+                    "FORGE_LIGHTPANDA_URL"):
+            self._old_env[var] = os.environ.pop(var, None)
+
+    def tearDown(self):
+        self.http.shutdown()
+        self.http.server_close()
+        self.fake.stop()
+        for var, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+
+    def test_default_url_is_wrangler_dev_port(self):
+        from forge.browser.cdp import KITESURF_DEFAULT_URL
+        self.assertEqual(KITESURF_DEFAULT_URL, "http://127.0.0.1:8787")
+
+    def test_kitesurf_session_renders(self):
+        os.environ["FORGE_KITESURF_URL"] = self.url
+        with BrowserSession.start(engine="kitesurf") as session:
+            self.assertEqual(session.engine_name, "kitesurf")
+            page = session.page("http://fake.test/page")
+            self.assertTrue(page.rendered)
+            self.assertIn("Rendered Heading", page.markdown)
+
+    def test_find_kitesurf_identifies_by_browser_field(self):
+        from forge.browser.cdp import find_kitesurf
+        os.environ["FORGE_KITESURF_URL"] = self.url
+        self.assertEqual(find_kitesurf(), self.url)
+        # Something else on the port is not the engine.
+        _KitesurfVersionHandler.browser = "Chrome/145.0.0.0"
+        try:
+            self.assertIsNone(find_kitesurf())
+        finally:
+            _KitesurfVersionHandler.browser = "Kitesurf/0.0.1"
+        # Nothing answering is not the engine either.
+        os.environ["FORGE_KITESURF_URL"] = "http://127.0.0.1:1"
+        self.assertIsNone(find_kitesurf())
+
+    def test_kitesurf_missing_is_plain_words(self):
+        os.environ["FORGE_KITESURF_URL"] = "http://127.0.0.1:1"
+        with self.assertRaises(BrowserError) as caught:
+            BrowserSession.start(engine="kitesurf")
+        self.assertIn("Kitesurf", str(caught.exception))
+        self.assertIn("pnpm run dev", str(caught.exception))
+
+    def test_auto_with_kitesurf_url_picks_kitesurf(self):
+        os.environ["FORGE_KITESURF_URL"] = self.url
+        with BrowserSession.start(engine="auto") as session:
+            self.assertEqual(session.engine_name, "kitesurf")
+
+    def test_engines_status_reports_kitesurf(self):
+        from forge.browser.engines import engine_status, format_status
+        os.environ["FORGE_KITESURF_URL"] = self.url
+        status = engine_status()
+        self.assertEqual(status["kitesurf_serving"], self.url)
+        self.assertIn(self.url, format_status(status))
+        os.environ["FORGE_KITESURF_URL"] = "http://127.0.0.1:1"
+        self.assertIsNone(engine_status()["kitesurf_serving"])
+
+    def test_cli_render_accepts_engine_flag(self):
+        import io
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from unittest import mock
+        from forge.browser import cli as cli_module
+        fake_page = SimpleNamespace(
+            title="T", final_url="http://x.example/", markdown="body",
+            truncated=False)
+        with mock.patch("forge.browser.render.render",
+                        return_value=fake_page) as patched:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = cli_module.main(
+                    ["render", "http://x.example/", "--engine", "kitesurf"])
+        self.assertEqual(code, 0)
+        self.assertEqual(patched.call_args.kwargs["engine"], "kitesurf")
+
+    def test_cli_rejects_unknown_engine(self):
+        import io
+        from contextlib import redirect_stderr
+        from forge.browser import cli as cli_module
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                cli_module.main(["render", "http://x.example/",
+                                 "--engine", "netscape"])
+
+
+class FreshSessionTests(unittest.TestCase):
+    """Item 2 (v0.8): a fresh session never shares browser state
+    with any earlier run. Against an engine already running, that
+    means its own browser context, thrown away on close; a fresh
+    launch never attaches to a configured shared engine when it
+    can launch instead."""
+
+    def setUp(self):
+        self.fake = FakeCDPServer()
+        self.fake.start()
+        _VersionHandler.ws_port = self.fake.port
+        self.http = ThreadingHTTPServer(("127.0.0.1", 0), _VersionHandler)
+        self.http_port = self.http.server_address[1]
+        threading.Thread(target=self.http.serve_forever,
+                         daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.http_port}"
+        self._old_env = {}
+        for var in ("FORGE_KITESURF_URL", "FORGE_CDP_URL",
+                    "FORGE_LIGHTPANDA_URL"):
+            self._old_env[var] = os.environ.pop(var, None)
+
+    def tearDown(self):
+        self.http.shutdown()
+        self.http.server_close()
+        self.fake.stop()
+        for var, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
+
+    def _calls(self, method):
+        return [params for name, params in self.fake.calls
+                if name == method]
+
+    def test_fresh_endpoint_uses_isolated_context(self):
+        with BrowserSession.start(engine=self.url, fresh=True) as session:
+            self.assertEqual(session.engine_name, "cdp")
+            page = session.page("http://fake.test/page")
+            self.assertTrue(page.rendered)
+            created = self._calls("Target.createBrowserContext")
+            self.assertEqual(len(created), 1)
+            targets = self._calls("Target.createTarget")
+            self.assertEqual(len(targets), 1)
+            context_id = targets[0].get("browserContextId")
+            self.assertTrue(context_id)
+            self.assertTrue(context_id.startswith("CTX"))
+        disposed = self._calls("Target.disposeBrowserContext")
+        self.assertEqual(len(disposed), 1)
+        self.assertEqual(disposed[0].get("browserContextId"), context_id)
+        # Disposing the context closes its target; no separate close.
+        self.assertEqual(self._calls("Target.closeTarget"), [])
+
+    def test_two_fresh_sessions_get_different_contexts(self):
+        contexts = []
+        for _ in range(2):
+            with BrowserSession.start(engine=self.url,
+                                      fresh=True) as session:
+                session.page("http://fake.test/page")
+            created = self._calls("Target.createBrowserContext")
+            contexts.append(
+                self._calls("Target.createTarget")[-1]["browserContextId"])
+        self.assertEqual(len(created), 2)
+        self.assertNotEqual(contexts[0], contexts[1])
+        self.assertEqual(len(self._calls("Target.disposeBrowserContext")), 2)
+
+    def test_non_fresh_endpoint_shares_default_context(self):
+        with BrowserSession.start(engine=self.url) as session:
+            session.page("http://fake.test/page")
+        self.assertEqual(self._calls("Target.createBrowserContext"), [])
+        self.assertEqual(self._calls("Target.disposeBrowserContext"), [])
+        self.assertEqual(len(self._calls("Target.closeTarget")), 1)
+
+    def test_fresh_refused_when_engine_cannot_isolate(self):
+        self.fake.refuse_context = True
+        with self.assertRaises(BrowserError) as caught:
+            BrowserSession.start(engine=self.url, fresh=True)
+        self.assertIn("fresh", str(caught.exception))
+        self.assertIn("isolated", str(caught.exception))
+
+    def test_fresh_prefers_launch_over_shared_url(self):
+        # A configured shared engine is ignored while a launch is
+        # possible: the launch is attempted (here /bin/true, which
+        # exits at once, so the attempt fails fast naming the
+        # launched port — never the shared URL).
+        from unittest import mock
+        from forge.browser import cdp as cdp_module
+        os.environ["FORGE_CDP_URL"] = self.url
+        with mock.patch.object(cdp_module, "find_chromium",
+                               return_value="/bin/true"):
+            with self.assertRaises(BrowserError) as caught:
+                BrowserSession.start(engine="auto", fresh=True)
+        self.assertNotIn(self.url, str(caught.exception))
+        self.assertEqual(self._calls("Target.createBrowserContext"), [])
+
+    def test_fresh_last_resort_attaches_with_isolation(self):
+        # Nothing launchable: a fresh run may attach to the
+        # configured engine, but only inside its own context.
+        from unittest import mock
+        from forge.browser import cdp as cdp_module
+        os.environ["FORGE_CDP_URL"] = self.url
+        with mock.patch.object(cdp_module, "find_chromium",
+                               return_value=None), \
+             mock.patch.object(cdp_module, "find_lightpanda",
+                               return_value=None):
+            with BrowserSession.start(engine="auto", fresh=True) as session:
+                page = session.page("http://fake.test/page")
+                self.assertTrue(page.rendered)
+        self.assertEqual(len(self._calls("Target.createBrowserContext")), 1)
+        self.assertEqual(len(self._calls("Target.disposeBrowserContext")), 1)
+
+    def test_fresh_kitesurf_uses_isolated_context(self):
+        _KitesurfVersionHandler.ws_port = self.fake.port
+        kitesurf_http = ThreadingHTTPServer(
+            ("127.0.0.1", 0), _KitesurfVersionHandler)
+        threading.Thread(target=kitesurf_http.serve_forever,
+                         daemon=True).start()
+        try:
+            os.environ["FORGE_KITESURF_URL"] = (
+                f"http://127.0.0.1:{kitesurf_http.server_address[1]}")
+            with BrowserSession.start(engine="kitesurf",
+                                      fresh=True) as session:
+                self.assertEqual(session.engine_name, "kitesurf")
+                session.page("http://fake.test/page")
+        finally:
+            kitesurf_http.shutdown()
+            kitesurf_http.server_close()
+        self.assertEqual(len(self._calls("Target.createBrowserContext")), 1)
+        self.assertEqual(len(self._calls("Target.disposeBrowserContext")), 1)
+
+    def test_verify_starts_fresh(self):
+        # End to end through verify_in_browser: the run is rendered
+        # AND isolated — the fake saw a context created and thrown
+        # away for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.html"), "w") as handle:
+                handle.write("<html><head><title>T</title></head>"
+                             "<body><h1>Project Page</h1></body></html>")
+            result = verify_in_browser("index.html", tmp, engine=self.url)
+        self.assertTrue(result["rendered"])
+        self.assertIn("Rendered Heading", result["text"])
+        self.assertEqual(len(self._calls("Target.createBrowserContext")), 1)
+        self.assertEqual(len(self._calls("Target.disposeBrowserContext")), 1)
 
 
 # ----------------------------------------------------------------------

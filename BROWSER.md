@@ -238,6 +238,91 @@ To bump a pin: update the version AND the hash in
 `engine-pins.txt` together — download the release, check its
 size against the release page, sha256sum it, and record the hash.
 
+## Kitesurf-local: a third engine
+
+Kitesurf is Cloudflare's browser engine for AI agents, open
+source under Apache 2.0 (github.com/cloudflare/kitesurf). It
+parses HTML, applies CSS, runs page JavaScript, and renders
+screenshots without Chrome or a browser container — Rust
+compiled to WebAssembly (Blitz layout, Stylo CSS, Boa JS),
+running inside a Workers isolate. Forge Browser treats it as a
+third engine behind the same seam as Chromium and Lightpanda,
+for read, screenshot, and extract jobs: the niche where
+Chromium is heavy on an 8 GB machine and Lightpanda cannot run
+JavaScript.
+
+It speaks the Chrome DevTools Protocol, so the existing session
+code drives it unchanged — `/json/version` discovery, then the
+browser WebSocket. Pick it with `--engine kitesurf` on `render`,
+`snapshot`, `screenshot`, and `verify`, or point
+`FORGE_KITESURF_URL` at a running one (it also joins the `auto`
+chain, after FORGE_CDP_URL and FORGE_LIGHTPANDA_URL). `engines`
+reports whether a Kitesurf-local is serving; the endpoint only
+counts when its /json/version names itself Kitesurf.
+
+Local-only, by design. Kitesurf-local is a dev server you start
+by hand — it is not installed by install.sh and Forge Browser
+never launches it:
+
+```sh
+git clone https://github.com/cloudflare/kitesurf.git
+cd kitesurf
+pnpm install --frozen-lockfile
+pnpm run dev        # builds the engine, starts wrangler dev
+```
+
+The engine listens on `http://127.0.0.1:8787`
+(`http://127.0.0.1:8787/health` confirms it is up;
+`KITESURF_PORT` moves it). It needs Bazelisk installed as
+`bazel`, Node.js 22 or newer, and pnpm 9.15.4 (Bazel downloads
+its pinned Rust toolchain itself; rustup is only needed for
+editing the vendored crate patches). The first build compiles
+the Rust core and its vendored crates, which takes a while.
+There is no cloud path here on purpose: running Kitesurf on
+Cloudflare needs Dynamic Workers, which are part of the Workers
+Paid plan — that breaks the $0 rule. Kitesurf has no built-in
+authentication either, so a deployed instance would be public
+without an auth layer in front of it; the local dev server only
+listens on 127.0.0.1.
+
+Honest build verdict (2026-11-13): the engine itself could NOT
+be built in the sandbox. Bazel could not fetch its module
+registry there at all — with the sandbox proxy set, Bazel's
+Java downloader crashed on the proxy's CONNECT handshake; with
+the proxy unset, direct TLS to bcr.bazel.build failed (the
+sandbox egress answers it with plain HTTP). The toolchain up to
+that point worked (pnpm 9.15.4 and Bazelisk installed cleanly,
+`pnpm install --frozen-lockfile` finished in about a minute),
+and the adapter was built and tested against a fake CDP server
+speaking Kitesurf's documented protocol — but no live Kitesurf
+engine has been driven yet. On the real PC the build should be
+attempted with normal home internet (no proxy): the first build
+is the heavy part on a 2-core machine with a hard drive, while
+the running engine is light (Cloudflare claims 3–7x less CPU
+and memory than Chromium). Kitesurf is still experimental and
+under heavy development; some CDP surface is missing (its own
+README says some DevTools features do not work yet), so a page
+that needs a capability it lacks fails in plain words, like any
+other engine gap.
+
+## Every verification starts fresh
+
+A verification never reuses browser state from an earlier run.
+Before v0.8, verify attached to an already-running engine
+whenever one was configured, and its page landed in that
+engine's shared default context — cookies and storage from
+earlier runs could leak in (cookies are host-scoped, so the
+throwaway server's fresh port did not isolate them). Now a
+verification launches a fresh engine whenever it can (a
+throwaway profile for Chromium, a fresh process for Lightpanda)
+and, when the only engine is one already running, opens its
+page in its own isolated browser context and throws the context
+away when the run ends. An engine that cannot isolate a context
+refuses in plain words instead of sharing state. The plain
+read, screenshot, and snapshot paths are unchanged — they attach
+to the engine you point them at, because that is what they are
+for; only verification forces fresh.
+
 ## Research as a background job
 
 Ask for research in chat and the turn ends at once — the job
@@ -532,7 +617,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (477 checks),
+`forge/browser/` (the package), `tests/` (493 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that

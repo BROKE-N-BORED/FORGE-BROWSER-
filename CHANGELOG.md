@@ -1,5 +1,63 @@
 # Forge Browser — Changelog
 
+## 0.8 — 2026-11-13
+
+The Kitesurf borrowables (ordered 2026-11-13): Kitesurf-local as a
+third engine behind the engines.py seam, and fresh state for every
+verification.
+
+- Kitesurf-local is a third engine alongside Chromium and
+  Lightpanda, for read, screenshot, and extract jobs — the niche
+  where Chromium is heavy on an 8 GB machine and Lightpanda cannot
+  run JavaScript. It speaks the same CDP as the other engines, so
+  the existing session code drives it unchanged: `render`,
+  `snapshot`, `screenshot`, and `verify` take
+  `--engine kitesurf`, and `engines` reports whether a
+  Kitesurf-local is serving. It connects to a dev server the
+  person starts by hand (`pnpm run dev` in a Kitesurf checkout,
+  serving on 127.0.0.1:8787); Forge Browser never starts one
+  itself, and there is no cloud path — Cloudflare deployment
+  needs a Paid plan, which breaks the $0 rule. The endpoint only
+  counts as Kitesurf when its /json/version names itself
+  Kitesurf; anything else on the port is reported as absent.
+  Local-only, by design.
+- Honest build verdict (2026-11-13, sandbox): the Kitesurf
+  engine itself could NOT be built here — Bazel could not fetch
+  its module registry in this sandbox at all. With the sandbox
+  proxy set, Bazel's Java downloader crashed on the proxy's
+  CONNECT handshake; with the proxy unset, direct TLS to
+  bcr.bazel.build failed (the sandbox egress answers it with
+  plain HTTP). The toolchain up to that point worked: pnpm
+  9.15.4 and Bazelisk installed cleanly, `pnpm install
+  --frozen-lockfile` finished in about a minute, and the repo
+  (commit 4a290381) documents the build clearly. The adapter was
+  built and tested against a fake CDP server speaking Kitesurf's
+  documented protocol instead, so it is real and green — but no
+  live Kitesurf engine has been driven yet. On the real PC the
+  build should be attempted with normal home internet (no
+  proxy): it needs Bazelisk, Node 22+, and pnpm installed, and
+  the first build compiles the Rust core and its vendored
+  crates, which is slow on a 2-core machine with a hard drive.
+  The running engine itself is light (Cloudflare claims 3–7x
+  less CPU and memory than Chromium), so the build is the heavy
+  part, not the run.
+- Every verification now starts FRESH. Before this build, verify
+  attached to an already-running engine whenever one was
+  configured (FORGE_CDP_URL / FORGE_LIGHTPANDA_URL), and its
+  page landed in that engine's shared default context — cookies
+  and storage from earlier runs could leak in (cookies are
+  host-scoped, so the throwaway server's fresh port did not
+  isolate them). Now a verification launches a fresh engine
+  whenever it can (throwaway profile for Chromium, fresh
+  process for Lightpanda) and, when the only engine is one
+  already running, opens its page in its own isolated browser
+  context and throws the context away on close. An engine that
+  cannot isolate refuses in plain words instead of sharing
+  state. Tests prove two fresh sessions on the same engine get
+  different contexts, that a non-fresh session still shares the
+  default context, and that verify itself creates and disposes
+  a context end to end.
+
 ## 0.7 — 2026-11-13
 
 Audit batch 6 (sections V–AB of `docs/AUDIT-TASK-LIST.md`), built

@@ -89,8 +89,8 @@ def _cmd_fetch_any(args):
 
 def _cmd_render(args):
     from .render import render
-    page = render(args.url, max_chars=args.max_chars, offset=args.offset,
-                  allow_local=args.allow_local)
+    page = render(args.url, engine=args.engine, max_chars=args.max_chars,
+                  offset=args.offset, allow_local=args.allow_local)
     if args.json:
         _print_json(page.to_dict())
         return 0
@@ -105,7 +105,8 @@ def _cmd_render(args):
 
 def _cmd_snapshot(args):
     from .render import snapshot
-    data = snapshot(args.url, allow_local=args.allow_local)
+    data = snapshot(args.url, engine=args.engine,
+                    allow_local=args.allow_local)
     if args.json:
         _print_json(data)
         return 0
@@ -120,7 +121,8 @@ def _cmd_snapshot(args):
 
 def _cmd_screenshot(args):
     from .render import screenshot
-    path = screenshot(args.url, args.out, allow_local=args.allow_local)
+    path = screenshot(args.url, args.out, engine=args.engine,
+                      allow_local=args.allow_local)
     print(f"Screenshot saved: {path}")
     return 0
 
@@ -181,7 +183,8 @@ def _cmd_research(args):
 
 def _cmd_verify(args):
     from .verify import verify_in_browser
-    result = verify_in_browser(args.target, args.workspace)
+    result = verify_in_browser(args.target, args.workspace,
+                               engine=args.engine)
     if args.json:
         _print_json(result)
         return 0
@@ -737,6 +740,9 @@ def main(argv=None):
 
     p = sub.add_parser("render", help="fetch the page after JavaScript, via a local engine")
     p.add_argument("url")
+    p.add_argument("--engine", choices=["auto", "chromium", "lightpanda",
+                                        "kitesurf"], default="auto",
+                   help="which local engine renders the page")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--max-chars", type=int, default=12000)
     p.add_argument("--json", action="store_true")
@@ -746,6 +752,9 @@ def main(argv=None):
 
     p = sub.add_parser("snapshot", help="accessibility snapshot + numbered elements")
     p.add_argument("url")
+    p.add_argument("--engine", choices=["auto", "chromium", "lightpanda",
+                                        "kitesurf"], default="auto",
+                   help="which local engine renders the page")
     p.add_argument("--json", action="store_true")
     p.add_argument("--allow-local", action="store_true",
                    help="also fetch 127.0.0.1 / LAN addresses")
@@ -754,6 +763,9 @@ def main(argv=None):
     p = sub.add_parser("screenshot", help="save a PNG screenshot of a rendered page")
     p.add_argument("url")
     p.add_argument("--out", required=True)
+    p.add_argument("--engine", choices=["auto", "chromium", "lightpanda",
+                                        "kitesurf"], default="auto",
+                   help="which local engine renders the page")
     p.add_argument("--allow-local", action="store_true",
                    help="also fetch 127.0.0.1 / LAN addresses")
     p.set_defaults(func=_cmd_screenshot)
@@ -777,6 +789,9 @@ def main(argv=None):
     p = sub.add_parser("verify", help="check a project page the #65 way")
     p.add_argument("target")
     p.add_argument("--workspace", required=True)
+    p.add_argument("--engine", choices=["auto", "chromium", "lightpanda",
+                                        "kitesurf"], default="auto",
+                   help="which local engine renders the page")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=_cmd_verify)
 

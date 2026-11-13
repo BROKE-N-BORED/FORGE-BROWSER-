@@ -10,7 +10,7 @@ of guessing.
 import os
 import shutil
 
-from .cdp import find_chromium, find_lightpanda
+from .cdp import find_chromium, find_kitesurf, find_lightpanda
 from .vault import default_vault_path
 
 
@@ -63,6 +63,7 @@ def engine_status():
         "lightpanda_binary": lightpanda,
         "lightpanda_version": _read_version_file("lightpanda.version"),
         "lightpanda_serving": os.environ.get("FORGE_LIGHTPANDA_URL", "") or None,
+        "kitesurf_serving": find_kitesurf(),
         "cdp_url": os.environ.get("FORGE_CDP_URL", "") or None,
         "searxng_url": os.environ.get("FORGE_SEARXNG_URL", "") or None,
         "search_default": "searxng" if os.environ.get("FORGE_SEARXNG_URL")
@@ -83,6 +84,7 @@ def format_status(status):
         f"Lightpanda binary: {show(status['lightpanda_binary'])}",
         f"Lightpanda version: {show(status['lightpanda_version'])}",
         f"Lightpanda serving: {show(status['lightpanda_serving'])}",
+        f"Kitesurf-local serving: {show(status['kitesurf_serving'])}",
         f"External CDP endpoint: {show(status['cdp_url'])}",
         f"Search: {status['search_default']}"
         + (f" ({status['searxng_url']})" if status['searxng_url'] else ""),

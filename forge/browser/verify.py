@@ -16,6 +16,14 @@ Forge Browser's own engine instead of the Browse connector:
   asks the vision seat to describe the saved file (media.py),
   keeping the #65/#71 rule: media never rides into a model that
   cannot parse it.
+
+* Every verification starts FRESH: a throwaway profile for a
+  launched Chromium, a fresh process for a spawned Lightpanda, an
+  isolated browser context when the only engine is one already
+  running. No cookie or storage from an earlier run — this one or
+  any other page on the engine — can leak into the page under
+  test. (Cookies are host-scoped, so the throwaway server's fresh
+  port alone would not isolate them.)
 """
 
 import functools
@@ -37,6 +45,8 @@ def verify_in_browser(target, workspace, engine="auto", session_factory=None):
 
     session_factory, when given, replaces BrowserSession.start —
     a seam for tests and for hosts that manage their own sessions.
+    A custom factory owns freshness itself; the default opener
+    always starts fresh (see the module docs).
     """
     workspace = os.path.abspath(workspace)
     if target.startswith(("http://", "https://")):
@@ -59,7 +69,8 @@ def verify_in_browser(target, workspace, engine="auto", session_factory=None):
         result = {"target": target, "url": url, "screenshot": None, "note": ""}
         try:
             from .cdp import BrowserSession
-            opener = session_factory or (lambda: BrowserSession.start(engine=engine))
+            opener = session_factory or (
+                lambda: BrowserSession.start(engine=engine, fresh=True))
             with opener() as session:
                 page = session.page(url)
                 result["text"] = page.markdown

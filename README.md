@@ -1,6 +1,6 @@
 # FORGE BROWSER
 
-Version 0.7 — the current release line. See [CHANGELOG.md](CHANGELOG.md).
+Version 0.8 — the current release line. See [CHANGELOG.md](CHANGELOG.md).
 
 An AI browser. You talk to it in plain language — it browses for you.
 
@@ -43,7 +43,7 @@ like the automatic pick (any small chat model you have in Ollama).
 The engine room is a Python standard-library package
 (`forge/browser/`): keyless search, fetch of any file type
 (HTML→Markdown, PDF text, CSV, JSON…), a CDP-driven rendering
-engine (Lightpanda / Chromium), image description and audio
+engine (Lightpanda / Chromium / Kitesurf-local), image description and audio
 transcription via local seats, an encrypted vault for site
 passwords, barrier handling (consent banners dismissed; CAPTCHAs
 are handed to the human, never solved), and a plan-gated research
@@ -62,7 +62,7 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-477 checks, offline, including the chat protocol with a stubbed
+493 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.
 
 ## License

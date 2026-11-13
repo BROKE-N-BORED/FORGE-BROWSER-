@@ -2,10 +2,11 @@
 
 Talks the Chrome DevTools Protocol to a browser engine running on
 this machine: a Chromium-family browser Forge launches headless, or
-any CDP endpoint already serving (Lightpanda — Item 4 — or a browser
-the user started with --remote-debugging-port). No network service,
-no key: the engine is a local process and the protocol is a local
-WebSocket (forge/browser/_ws.py, standard library only).
+any CDP endpoint already serving (Lightpanda — Item 4 — Kitesurf-
+local, or a browser the user started with --remote-debugging-port).
+No network service, no key: the engine is a local process and the
+protocol is a local WebSocket (forge/browser/_ws.py, standard
+library only).
 
 What a session can do:
 
@@ -50,6 +51,10 @@ _CHROMIUM_NAMES = [
     "chromium", "chromium-browser", "google-chrome", "google-chrome-stable",
     "brave-browser", "microsoft-edge", "microsoft-edge-stable",
 ]
+
+# Kitesurf-local's wrangler dev default port (its README: the
+# engine listens on http://127.0.0.1:8787; KITESURF_PORT moves it).
+KITESURF_DEFAULT_URL = "http://127.0.0.1:8787"
 
 _ELEMENTS_JS = """
 (() => {
@@ -207,6 +212,29 @@ def _spawn_lightpanda():
                        "try starting it by hand: lightpanda serve --port 9222")
 
 
+def find_kitesurf():
+    """URL of a running Kitesurf-local engine, or None.
+
+    Kitesurf-local is a dev server the person starts by hand
+    (`pnpm run dev` in a Kitesurf checkout); Forge Browser never
+    launches it, so this only ever reports one already serving.
+    The URL comes from FORGE_KITESURF_URL, else wrangler dev's
+    default port 8787. The endpoint only counts when its
+    /json/version names itself Kitesurf (its VERSION_INFO reports
+    Browser "Kitesurf/0.0.1") — anything else on the port is not
+    the engine.
+    """
+    url = ((os.environ.get("FORGE_KITESURF_URL") or "").strip()
+           or KITESURF_DEFAULT_URL)
+    try:
+        version = _http_json(url.rstrip("/") + "/json/version", timeout=2)
+    except Exception:
+        return None
+    if str(version.get("Browser") or "").startswith("Kitesurf/"):
+        return url
+    return None
+
+
 def _free_port():
     import socket
     with socket.socket() as sock:
@@ -300,22 +328,28 @@ class BrowserSession:
     """One engine, one page. Use as a context manager."""
 
     def __init__(self, client, process=None, profile_dir=None, engine_name="chromium",
-                 persistent=False):
+                 persistent=False, browser_context_id=None):
         self._client = client
         self._process = process
         self._profile_dir = profile_dir
         self._persistent = persistent
         self.engine_name = engine_name
         self._target_id = None
+        self._browser_context_id = browser_context_id
 
     # -- startup ------------------------------------------------------
     @classmethod
-    def start(cls, engine="auto", timeout=25, profile_dir=None, headed=False):
+    def start(cls, engine="auto", timeout=25, profile_dir=None, headed=False,
+              fresh=False):
         """Open a session.
 
-        engine: "auto" (FORGE_CDP_URL if set, else FORGE_LIGHTPANDA_URL,
-        else launch Chromium), "chromium", or an explicit ws:// / http://
-        CDP endpoint for an engine already running.
+        engine: "auto" (FORGE_CDP_URL if set, else
+        FORGE_LIGHTPANDA_URL, else FORGE_KITESURF_URL, else launch
+        Chromium), "chromium", "lightpanda", "kitesurf", or an
+        explicit ws:// / http:// CDP endpoint for an engine
+        already running. "kitesurf" connects to a Kitesurf-local
+        dev server (FORGE_KITESURF_URL, else 127.0.0.1:8787) —
+        Forge Browser never starts one itself.
 
         profile_dir: a PERSISTENT profile folder to use instead of a
         throwaway one — cookies and logins survive between sessions,
@@ -324,36 +358,73 @@ class BrowserSession:
         profiles are never deleted on close.
         headed: launch with a visible window (the handoff mode, for
         the person to clear a human check); default headless.
+        fresh: start with NO browser state from any earlier run —
+        no cookies, no storage. A launched Chromium gets its usual
+        throwaway profile and a spawned Lightpanda its usual fresh
+        process; a session that must attach to an engine already
+        running gets its own isolated browser context instead, and
+        refuses in plain words when the engine cannot isolate one.
+        A fresh run never attaches to shared state just because an
+        engine URL is configured: with "auto" it launches first and
+        only falls back to a configured URL (isolated) when no
+        engine can be launched at all. Verify uses this so one
+        verification can never see another run's state.
         """
         cdp_http = None
         engine_name = "chromium"
         process = None
+        isolate = False
         persistent_profile = profile_dir
         if engine == "auto":
-            cdp_http = (os.environ.get("FORGE_CDP_URL")
-                        or os.environ.get("FORGE_LIGHTPANDA_URL") or "").strip() or None
-            if os.environ.get("FORGE_LIGHTPANDA_URL") and not os.environ.get("FORGE_CDP_URL"):
-                engine_name = "lightpanda"
+            if not fresh:
+                for var, name in (("FORGE_CDP_URL", "chromium"),
+                                  ("FORGE_LIGHTPANDA_URL", "lightpanda"),
+                                  ("FORGE_KITESURF_URL", "kitesurf")):
+                    value = (os.environ.get(var) or "").strip()
+                    if value:
+                        cdp_http = value
+                        engine_name = name
+                        break
         elif engine.startswith(("http://", "ws://")):
             cdp_http = engine
             engine_name = "cdp"
-        elif engine in ("chromium", "lightpanda"):
+            isolate = fresh
+        elif engine in ("chromium", "lightpanda", "kitesurf"):
             engine_name = engine
             if engine == "lightpanda":
-                cdp_http = (os.environ.get("FORGE_LIGHTPANDA_URL") or "").strip() or None
+                if not fresh:
+                    cdp_http = (os.environ.get("FORGE_LIGHTPANDA_URL") or "").strip() or None
                 if not cdp_http:
                     cdp_http, process = _spawn_lightpanda()
+            elif engine == "kitesurf":
+                cdp_http = ((os.environ.get("FORGE_KITESURF_URL") or "").strip()
+                            or KITESURF_DEFAULT_URL)
+                isolate = fresh
         if cdp_http is None and engine_name in ("chromium", "auto"):
             binary = find_chromium()
             if not binary and engine == "auto" and find_lightpanda():
                 cdp_http, process = _spawn_lightpanda()
                 engine_name = "lightpanda"
             if not binary and cdp_http is None:
-                raise BrowserError(
-                    "no browser engine found on this machine: no "
-                    "Chromium-family browser (looked for: "
-                    + ", ".join(_CHROMIUM_NAMES) + ") and no Lightpanda. "
-                    "browser-setup.sh installs the Lightpanda engine.")
+                if fresh and engine == "auto":
+                    # Last resort: nothing can be launched, so attach
+                    # to a configured engine — but isolated, never
+                    # sharing its state.
+                    for var, name in (("FORGE_CDP_URL", "chromium"),
+                                      ("FORGE_LIGHTPANDA_URL", "lightpanda"),
+                                      ("FORGE_KITESURF_URL", "kitesurf")):
+                        value = (os.environ.get(var) or "").strip()
+                        if value:
+                            cdp_http = value
+                            engine_name = name
+                            isolate = True
+                            break
+                if cdp_http is None:
+                    raise BrowserError(
+                        "no browser engine found on this machine: no "
+                        "Chromium-family browser (looked for: "
+                        + ", ".join(_CHROMIUM_NAMES) + ") and no Lightpanda. "
+                        "browser-setup.sh installs the Lightpanda engine.")
             if binary:
                 port = _free_port()
                 if persistent_profile:
@@ -371,6 +442,17 @@ class BrowserSession:
                 process = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL)
                 cdp_http = f"http://127.0.0.1:{port}"
+        if engine_name == "kitesurf":
+            # Fail fast with the fix named: Kitesurf-local is a dev
+            # server the person starts by hand, so a silent 25s poll
+            # for one that was never started is the wrong wait.
+            if find_kitesurf() is None:
+                raise BrowserError(
+                    "no Kitesurf engine answering at "
+                    f"{cdp_http}. Start one with `pnpm run dev` in a "
+                    "Kitesurf checkout (it serves on 127.0.0.1:8787), "
+                    "or point FORGE_KITESURF_URL at a running "
+                    "Kitesurf-local.")
         # Resolve the browser-level WebSocket address. A browser we
         # just launched needs time to open its port — on a hard-drive
         # machine that is seconds, not milliseconds — so poll for it
@@ -397,7 +479,29 @@ class BrowserSession:
         session = cls(client, process=process, profile_dir=profile_dir,
                       engine_name=engine_name, persistent=bool(persistent_profile))
         try:
-            target = client.call("Target.createTarget", {"url": "about:blank"}, timeout=timeout)
+            context_id = None
+            if isolate:
+                # A fresh page on an engine already running: its own
+                # browser context, so no cookie or storage from any
+                # other page on that engine can leak in. An engine
+                # that cannot isolate refuses instead of sharing.
+                try:
+                    created = client.call("Target.createBrowserContext",
+                                          {}, timeout=timeout)
+                except BrowserError as exc:
+                    raise BrowserError(
+                        "the engine at "
+                        f"{cdp_http} cannot start a fresh page: it "
+                        "refused an isolated browser context, so a "
+                        "run there would share state with other pages "
+                        f"on that engine ({exc})") from exc
+                context_id = created.get("browserContextId")
+                session._browser_context_id = context_id
+            target_params = {"url": "about:blank"}
+            if context_id:
+                target_params["browserContextId"] = context_id
+            target = client.call("Target.createTarget", target_params,
+                                 timeout=timeout)
             session._target_id = target["targetId"]
             attached = client.call(
                 "Target.attachToTarget",
@@ -581,8 +685,22 @@ class BrowserSession:
             pass
 
     def close(self):
+        disposed = False
+        if self._browser_context_id:
+            # A fresh session on a shared engine: throw its whole
+            # context away, page and state together. If the dispose
+            # fails, fall back to closing the target below.
+            try:
+                self._client.session_id = None
+                self._client.call("Target.disposeBrowserContext",
+                                  {"browserContextId": self._browser_context_id},
+                                  timeout=5)
+                disposed = True
+            except Exception:
+                pass
+            self._browser_context_id = None
         try:
-            if self._target_id:
+            if self._target_id and not disposed:
                 self._client.session_id = None
                 self._client.call("Target.closeTarget", {"targetId": self._target_id}, timeout=5)
         except Exception:
