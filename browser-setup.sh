@@ -34,7 +34,9 @@ setup_lightpanda() {
     fi
     URL="https://github.com/lightpanda-io/browser/releases/download/$VERSION/$ASSET"
     echo "Downloading Lightpanda $VERSION ($ASSET)..."
-    curl -fL -o "$BASE/lightpanda.tmp" "$URL"
+    # AA4: --retry for transient failures, --continue-at - so a
+    # broken download resumes instead of restarting from zero.
+    curl --retry 3 --continue-at - -fL -o "$BASE/lightpanda.tmp" "$URL"
     if ! echo "$HASH  $BASE/lightpanda.tmp" | sha256sum -c - >/dev/null 2>&1; then
         rm -f "$BASE/lightpanda.tmp"
         echo "Hash check FAILED for Lightpanda $VERSION — nothing installed."

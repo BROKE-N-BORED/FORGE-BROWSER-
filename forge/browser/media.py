@@ -129,54 +129,101 @@ def describe_saved_image(path, prompt=_DESCRIBE_PROMPT):
         return describe_image_bytes(handle.read(), prompt=prompt)
 
 
-def transcribe_saved_audio(path):
-    """Transcribe an audio file with a local backend; "" if none."""
+def whisper_model_path():
+    """The whisper.cpp model file: FORGE_WHISPER_MODEL_PATH, else
+    ~/.forge/whisper/base.en (S1/S12) — where install.sh puts the
+    downloaded model."""
+    override = os.environ.get("FORGE_WHISPER_MODEL_PATH", "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".forge", "whisper",
+                        "base.en")
+
+
+def transcribe_saved_audio_detailed(path):
+    """(text, reason): the transcript of an audio file, and why
+    there is none when there is none. reason is None on success;
+    else "no-transcriber" (no backend installed at all),
+    "failed" (a backend was tried and errored), or "no-speech"
+    (a backend ran cleanly but heard nothing). The backends, in
+    order: FORGE_TRANSCRIBE_CMD, the `whisper` CLI, whisper.cpp
+    (`whisper-cli` / `main`), faster-whisper. Temp dirs are
+    cleaned up (S5); faster-whisper never downloads a model
+    unannounced (S6)."""
     template = os.environ.get("FORGE_TRANSCRIBE_CMD", "").strip()
     if template:
         try:
-            out_dir = tempfile.mkdtemp(prefix="forge-transcribe-")
-            command = template.replace("{file}", path).replace("{out_dir}", out_dir)
-            subprocess.run(command, shell=True, capture_output=True, timeout=1800,
-                           check=True)
-            for name in sorted(os.listdir(out_dir)):
-                if name.endswith((".txt", ".srt", ".vtt")):
-                    with open(os.path.join(out_dir, name)) as handle:
-                        return handle.read().strip()
+            with tempfile.TemporaryDirectory(prefix="forge-transcribe-") as out_dir:
+                command = template.replace("{file}", path).replace("{out_dir}", out_dir)
+                subprocess.run(command, shell=True, capture_output=True,
+                               timeout=1800, check=True)
+                for name in sorted(os.listdir(out_dir)):
+                    if name.endswith((".txt", ".srt", ".vtt")):
+                        with open(os.path.join(out_dir, name)) as handle:
+                            text = handle.read().strip()
+                        return (text, None if text else "no-speech")
+            return ("", "failed")  # ran, produced no transcript file
         except Exception:
-            return ""
+            return ("", "failed")
     whisper = shutil.which("whisper")
     if whisper:
         try:
-            out_dir = tempfile.mkdtemp(prefix="forge-transcribe-")
-            subprocess.run([whisper, path, "--output_format", "txt",
-                            "--output_dir", out_dir,
-                            "--model", os.environ.get("FORGE_WHISPER_MODEL", "base"),
-                            "--fp16", "False"],
-                           capture_output=True, timeout=1800, check=True)
-            base = os.path.splitext(os.path.basename(path))[0] + ".txt"
-            with open(os.path.join(out_dir, base)) as handle:
-                return handle.read().strip()
+            with tempfile.TemporaryDirectory(prefix="forge-transcribe-") as out_dir:
+                subprocess.run([whisper, path, "--output_format", "txt",
+                                "--output_dir", out_dir,
+                                "--model", os.environ.get("FORGE_WHISPER_MODEL", "base"),
+                                "--fp16", "False"],
+                               capture_output=True, timeout=1800, check=True)
+                base = os.path.splitext(os.path.basename(path))[0] + ".txt"
+                with open(os.path.join(out_dir, base)) as handle:
+                    text = handle.read().strip()
+                return (text, None if text else "no-speech")
         except Exception:
-            return ""
+            return ("", "failed")
+    attempted = False
     for binary in ("whisper-cli", "main"):
         exe = shutil.which(binary)
         if exe and "whisper" in (exe + binary):
+            attempted = True
             try:
-                out_base = os.path.join(tempfile.mkdtemp(prefix="forge-transcribe-"), "out")
-                subprocess.run([exe, "-f", path, "-otxt", "-of", out_base],
-                               capture_output=True, timeout=1800, check=True)
-                with open(out_base + ".txt") as handle:
-                    return handle.read().strip()
+                with tempfile.TemporaryDirectory(prefix="forge-transcribe-") as out_dir:
+                    out_base = os.path.join(out_dir, "out")
+                    # S1: pass the model explicitly when the
+                    # configured file exists; otherwise whisper.cpp
+                    # falls back to its default relative path.
+                    command = [exe, "-f", path, "-otxt", "-of", out_base]
+                    model = whisper_model_path()
+                    if os.path.exists(model):
+                        command[1:1] = ["-m", model]
+                    subprocess.run(command, capture_output=True, timeout=1800,
+                                   check=True)
+                    with open(out_base + ".txt") as handle:
+                        text = handle.read().strip()
+                    return (text, None if text else "no-speech")
             except Exception:
                 continue
     try:
         from faster_whisper import WhisperModel
+        # S6: local-only — never download a model unannounced
+        # inside a transcription call.
         model = WhisperModel(os.environ.get("FORGE_WHISPER_MODEL", "base"),
-                             device="cpu", compute_type="int8")
+                             device="cpu", compute_type="int8",
+                             local_files_only=True)
         segments, _info = model.transcribe(path)
-        return " ".join(segment.text.strip() for segment in segments).strip()
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        return (text, None if text else "no-speech")
+    except ImportError:
+        return ("", "failed" if attempted else "no-transcriber")
     except Exception:
-        return ""
+        return ("", "failed")
+
+
+def transcribe_saved_audio(path):
+    """Transcribe an audio file with a local backend; "" if none.
+    (The reason a transcription failed is in
+    transcribe_saved_audio_detailed.)"""
+    text, _reason = transcribe_saved_audio_detailed(path)
+    return text
 
 
 class _MediaParser(HTMLParser):

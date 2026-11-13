@@ -16,33 +16,75 @@ Needs PySide6 (install.sh puts it in the app venv). Importing
 this module without Qt is safe; run_app() says what to do.
 """
 
+import html
 import json
 import os
+import queue
+import re
 import threading
 import time
 import urllib.parse
 
+from .chat import format_duration, step_words
 from .errors import BrowserError
-from .preview import DWELL_MS
+from .preview import dwell_ms
+
+_TAGLINE = "Forge Browser — no accounts, no API keys, nothing tracked."
+
+# N7: tab titles — raw and tidy alike — are capped at this many
+# characters on display, so five long words can't make a wide tab.
+_TAB_TITLE_CHARS = 28
+
+# P2: a plan the person never answers is denied after 5 minutes —
+# a missed dialog cannot hang a turn forever.
+PLAN_TIMEOUT_SECONDS = 300
 
 _QT = None
 
 
-def turn_status_text(step, started, now=None):
-    """The dock's working line: 'working: search… — 12s'."""
-    elapsed = int((time.monotonic() if now is None else now) - started)
-    return f"working: {step}… — {elapsed}s"
+def needs_all_tab_text(text):
+    """Whether a send must read every tab's text (J4): the message
+    names tabs (@tabN), or asks to compare. Anything else reads
+    the current tab only — every send used to wait for all tabs
+    (or the 5 s guard) for text nobody asked for."""
+    lowered = (text or "").lower()
+    return "@tab" in lowered or "compare" in lowered
 
 
-def turn_done_text(outcome, started, now=None):
+def turn_status_text(step, started, now=None, waited=0):
+    """The dock's working line: 'working: searching… — 12s'.
+    The step is named in plain words (V1), not the raw action
+    kind ("recall_pages"). waited seconds — time spent at the
+    plan gate — do not count as work (V2), so the clock pauses
+    while the person decides. Under a second the line says
+    "<1s", not "0s" (V5)."""
+    now = time.monotonic() if now is None else now
+    elapsed = max(0.0, now - started - waited)
+    return f"working: {step_words(step)}… — {format_duration(elapsed)}"
+
+
+def turn_done_text(outcome, started, now=None, speed=None, waited=0):
     """The dock's finished line: 'Done in 12s.' / 'Stopped after 12s.'
-    / 'Failed after 12s.'"""
-    elapsed = int((time.monotonic() if now is None else now) - started)
+    / 'Failed after 12s.' — with the turn's tok/s when known (G10):
+    'Done in 12s (4.2 tok/s).' The clock counts working time only
+    (V2); when the person spent time at the plan gate it is named:
+    'Done in 12s (11s waiting).' Under a second: 'Done in <1s.' (V5)."""
+    now = time.monotonic() if now is None else now
+    elapsed = max(0.0, now - started - waited)
     if outcome == "stopped":
-        return f"Stopped after {elapsed}s."
-    if outcome == "failed":
-        return f"Failed after {elapsed}s."
-    return f"Done in {elapsed}s."
+        text = f"Stopped after {format_duration(elapsed)}"
+    elif outcome == "failed":
+        text = f"Failed after {format_duration(elapsed)}"
+    else:
+        text = f"Done in {format_duration(elapsed)}"
+    parts = []
+    if speed:
+        parts.append(f"{speed:.1f} tok/s")
+    if waited >= 1:
+        parts.append(f"{int(waited)}s waiting")
+    if parts:
+        text += " (" + ", ".join(parts) + ")"
+    return text + "."
 
 
 def default_window_size(avail_width, avail_height):
@@ -89,10 +131,41 @@ def create_window(server, profile, start_url=None):
     (QtCore, QtGui, QtWidgets, QWebEnginePage, QWebEngineProfile,
      QWebEngineView, QWebEngineDownloadRequest) = _load_qt()
     from .webui import resolve_address
+    from .titles import TidyCache, TidyWorker
+    # M11: the comparison page's export/refresh links are absolute
+    # local-server URLs, so they work from a setHtml tab.
+    from .compare import set_server_base
+    set_server_base(server.home_url)
+
+    class _ForgePage(QWebEnginePage):
+        """A tab's page: when the person navigates it by hand, the
+        tab stops being an agent tab (P6) — a 🤖 tab the person
+        has taken over is theirs now. Reloads don't unmark."""
+
+        def __init__(self, profile, parent, on_manual_nav):
+            super().__init__(profile, parent)
+            self._on_manual_nav = on_manual_nav
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+            # Qt6 names the members NavigationTypeTyped etc. (the
+            # short names do not exist on this PySide6 build).
+            # Typed is deliberately NOT here: probed 2026-11-13, a
+            # programmatic view.load() reports NavigationTypeTyped,
+            # so the hook cannot tell a typed address from the
+            # brain opening the tab — including Typed unmarked
+            # every agent tab on its initial load. The address bar
+            # unmarks explicitly in _go instead.
+            if nav_type in (QWebEnginePage.NavigationType.NavigationTypeLinkClicked,
+                            QWebEnginePage.NavigationType.NavigationTypeFormSubmitted,
+                            QWebEnginePage.NavigationType.NavigationTypeBackForward):
+                self._on_manual_nav()
+            return super().acceptNavigationRequest(url, nav_type,
+                                                   is_main_frame)
 
     class Window(QtWidgets.QMainWindow):
         tidy_done = QtCore.Signal(object, str, str)  # view, url, tidy title
         preview_ready = QtCore.Signal(str, str)  # url, preview text
+        compare_refresh_done = QtCore.Signal(object, str)  # view, new table HTML
 
         def __init__(self):
             super().__init__()
@@ -125,11 +198,25 @@ def create_window(server, profile, start_url=None):
                 self.resize(width, height)
                 if avail is not None:
                     self.move(avail.center() - self.rect().center())
-            self._tidy_cache = {}  # url -> tidy title, so a revisit never re-asks
+            # N5: the tidy cache is capped (200 URLs, FIFO) — it no
+            # longer grows with every distinct URL for the life of
+            # the window. N6: one tidy worker for the window — one
+            # tidy at a time, rapid retitles coalesced per tab.
+            self._tidy_cache = TidyCache()
+            self._tidy_worker = TidyWorker(self._tidy_one,
+                                           self._on_tidy_done)
             self._agent_tab_ids = set()  # id(view) of tabs the brain opened
             self._preview_url = ""
             self._preview_popup = None
             self._preview_label = None
+            # L8: one preview fetch at a time — a single worker
+            # thread and a one-slot queue; a queued URL is dropped
+            # when a newer hover arrives.
+            self._preview_queue = queue.Queue()
+            self._preview_worker_started = False
+            # M11: tabs with a refresh in flight — the intercept in
+            # _sync_address must not fire twice for one click.
+            self._refreshing_views = set()
             self._preview_timer = QtCore.QTimer(self)
             self._preview_timer.setSingleShot(True)
             self._preview_timer.timeout.connect(self._fetch_link_preview)
@@ -217,8 +304,7 @@ def create_window(server, profile, start_url=None):
                             self._zoom_out)
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl+0"), self,
                             self._zoom_reset)
-            self.statusBar().showMessage(
-                "Forge Browser — no accounts, no API keys, nothing tracked.")
+            self.statusBar().showMessage(_TAGLINE)
             # Last session's tabs reopen, unless a start URL was given.
             if start_url is not None:
                 self.new_tab(start_url)
@@ -251,9 +337,10 @@ def create_window(server, profile, start_url=None):
         def _view(self):
             return self.tabs.currentWidget()
 
-        def new_tab(self, url=None, agent=False, html=None):
+        def new_tab(self, url=None, agent=False, html=None, background=False):
             view = QWebEngineView()
-            view.setPage(QWebEnginePage(profile, view))
+            view.setPage(_ForgePage(
+                profile, view, lambda: self._unmark_agent(view)))
             view.urlChanged.connect(lambda *a: self._sync_address())
             view.titleChanged.connect(lambda t: self._set_tab_title(view, t))
             view.page().linkHovered.connect(
@@ -264,7 +351,11 @@ def create_window(server, profile, start_url=None):
             if agent:
                 self._agent_tab_ids.add(id(view))
                 self.tabs.setTabText(index, "🤖 New Tab")
-            self.tabs.setCurrentIndex(index)
+            # Q2: a background tab (a finished research report) does
+            # not steal focus from what the person is reading.
+            if not background:
+                self.tabs.setCurrentIndex(index)
+            self._sync_tab_numbers()
             if html is not None:
                 view.setHtml(html)
             else:
@@ -274,13 +365,64 @@ def create_window(server, profile, start_url=None):
         def _agent_mark(self, view):
             return "🤖 " if id(view) in self._agent_tab_ids else ""
 
+        def _unmark_agent(self, view):
+            # P6: the person took this tab over by hand — drop the
+            # 🤖 mark from the set and from the tab's current text.
+            if id(view) not in self._agent_tab_ids:
+                return
+            self._agent_tab_ids.discard(id(view))
+            index = self.tabs.indexOf(view)
+            if index >= 0:
+                title = self.tabs.tabText(index)
+                if title.startswith("🤖 "):
+                    self.tabs.setTabText(index, title[2:])
+
+        def _sync_tab_numbers(self):
+            # J8: every tab's tooltip names its number, so the
+            # person can see which tab @tab2 means without
+            # counting. Numbers shift when tabs close, so this
+            # re-syncs on every tab add, close, and title change.
+            for i in range(self.tabs.count()):
+                view = self.tabs.widget(i)
+                title = view.title() if view is not None else ""
+                self.tabs.setTabToolTip(i, f"Tab {i + 1}: {title or 'Page'}")
+            self._sync_group_colors()
+
+        def _sync_group_colors(self):
+            # N12: color tabs by their group, so grouping is
+            # visible in the tab bar itself — not only in the
+            # chat's tab list. Domain grouping only: no model
+            # call on every tab change. One group (or none)
+            # means no colors — everything stays default.
+            from .titles import assign_group_colors, group_items
+            items = []
+            for i in range(self.tabs.count()):
+                view = self.tabs.widget(i)
+                items.append({"title": view.title() if view is not None else "",
+                              "url": (view.url().toString()
+                                      if view is not None else "")})
+            groups = group_items(items)
+            bar = self.tabs.tabBar()
+            if len(groups) < 2:
+                for i in range(self.tabs.count()):
+                    bar.setTabTextColor(i, QtGui.QColor())
+                return
+            colors = assign_group_colors([g["name"] for g in groups])
+            index_of = {id(item): i for i, item in enumerate(items)}
+            for group in groups:
+                for item in group["items"]:
+                    bar.setTabTextColor(index_of[id(item)],
+                                        QtGui.QColor(colors[group["name"]]))
+
         def _set_tab_title(self, view, title):
             index = self.tabs.indexOf(view)
             if index < 0:
                 return
             if view is self._view():
                 self._sync_window_title()
-            self.tabs.setTabText(index, self._agent_mark(view) + (title or "Page")[:28])
+            self.tabs.setTabText(index, self._agent_mark(view)
+                                 + (title or "Page")[:_TAB_TITLE_CHARS])
+            self._sync_tab_numbers()
             # Long, messy titles get a short brain-written one in the
             # background; the raw title shows until it lands.
             # The tidy-titles toggle (or the master AI switch) turns
@@ -292,17 +434,22 @@ def create_window(server, profile, start_url=None):
                     or not seats_enabled("tidy_titles")):
                 return
             if url in self._tidy_cache:
-                self.tabs.setTabText(index, self._agent_mark(view) + self._tidy_cache[url])
+                # N7: the cached tidy is capped like the raw title.
+                self.tabs.setTabText(
+                    index, self._agent_mark(view)
+                    + self._tidy_cache[url][:_TAB_TITLE_CHARS])
                 return
             raw = (title or "").strip()
-            if len(raw) <= 28 and len(raw.split()) <= 5:
+            if len(raw) <= _TAB_TITLE_CHARS and len(raw.split()) <= 5:
                 return
-            threading.Thread(target=self._tidy_in_background,
-                             args=(view, url, raw), daemon=True).start()
+            # N6: the worker queues it — one tidy at a time, rapid
+            # retitles coalesced per tab.
+            self._tidy_worker.request(view, url, raw)
 
-        def _tidy_session(self):
-            """The fast seat for tidy titles, or the brain when no
-            fast seat is picked (same model, no extra swap)."""
+        def _fast_seat_session(self):
+            """The fast seat (for tidy titles and the summarize map
+            step), or the brain when no fast seat is picked (same
+            model, no extra swap)."""
             from .chat import ChatSession
             from .seats import pick_fast_model
             fast = pick_fast_model()
@@ -315,16 +462,24 @@ def create_window(server, profile, start_url=None):
                 self._fast_session = cached
             return cached
 
-        def _tidy_in_background(self, view, url, raw):
+        def _tidy_one(self, url, raw):
+            # N6: the worker's tidy call — one at a time, on the
+            # fast seat when one is picked.
             from .titles import tidy_title
-            tidy = tidy_title(self._tidy_session(), raw, url)
+            return tidy_title(self._fast_seat_session(), raw, url)
+
+        def _on_tidy_done(self, view, url, tidy):
+            # N6: the worker's delivery — cache, then hand the
+            # title to the GUI thread via the signal.
             self._tidy_cache[url] = tidy
             self.tidy_done.emit(view, url, tidy)
 
         def _apply_tidy_title(self, view, url, tidy):
             index = self.tabs.indexOf(view)
             if index >= 0 and view.url().toString() == url:
-                self.tabs.setTabText(index, self._agent_mark(view) + tidy)
+                # N7: the tidy title is capped like the raw one.
+                self.tabs.setTabText(
+                    index, self._agent_mark(view) + tidy[:_TAB_TITLE_CHARS])
 
         def _on_load_finished(self, view):
             self._sync_address()
@@ -357,11 +512,20 @@ def create_window(server, profile, start_url=None):
                 self._agent_tab_ids.discard(id(widget))
                 self.tabs.removeTab(index)
                 widget.deleteLater()
+                self._sync_tab_numbers()
 
         def _sync_address(self):
             view = self._view()
             if view is not None:
                 url = view.url().toString()
+                # M11: a click on the comparison tab's Refresh link
+                # re-runs the comparison against the tabs' current
+                # text instead of navigating anywhere.
+                if (url == server.home_url + "compare-refresh"
+                        and id(view) not in self._refreshing_views):
+                    view.stop()
+                    self._refresh_comparison(view)
+                    return
                 # Forge Browser's own local pages aren't addresses
                 # the person typed — keep the bar clean on those.
                 self.address.setText("" if url.startswith("http://127.0.0.1") else url)
@@ -391,25 +555,47 @@ def create_window(server, profile, start_url=None):
                 self._preview_url = ""
                 self._preview_timer.stop()
                 self._hide_link_preview()
+                # L4: the status bar shows the hovered link while
+                # it is hovered, like every other browser.
+                self.statusBar().showMessage(_TAGLINE)
                 return
+            self.statusBar().showMessage(url)
             if url == self._preview_url and self._preview_popup is not None \
                     and self._preview_popup.isVisible():
                 return
             self._preview_url = url
             self._hide_link_preview()
-            self._preview_timer.start(DWELL_MS)
+            # L9: the dwell comes from the setting, fresh each hover.
+            self._preview_timer.start(dwell_ms())
 
         def _fetch_link_preview(self):
             url = self._preview_url
             if not url:
                 return
+            # L6: the popup says it is fetching at once — a slow
+            # fetch no longer looks like no preview.
+            self._display_preview(url, "Fetching preview…")
+            if not self._preview_worker_started:
+                self._preview_worker_started = True
+                threading.Thread(target=self._preview_worker,
+                                 daemon=True).start()
+            # L8: one fetch at a time; a queued URL is dropped
+            # when a newer hover arrives.
+            try:
+                self._preview_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._preview_queue.put(url)
 
-            def work():
-                from .preview import preview_url
-                text = preview_url(url)
+        def _preview_worker(self):
+            from .preview import preview_url
+            while True:
+                url = self._preview_queue.get()
+                try:
+                    text = preview_url(url)
+                except Exception:
+                    text = "Couldn't fetch that link."
                 self.preview_ready.emit(url, text)
-
-            threading.Thread(target=work, daemon=True).start()
 
         def _display_preview(self, url, text):
             if url != self._preview_url or not text:
@@ -430,15 +616,106 @@ def create_window(server, profile, start_url=None):
                     "border:1px solid #4a4a4a; border-radius:6px;")
                 self._preview_label = label
                 self._preview_popup = popup
-            self._preview_label.setText(text)
+            # L4: the destination domain rides the first line, so
+            # the person can judge where a link goes before clicking.
+            domain = urllib.parse.urlparse(url).netloc
+            self._preview_label.setText(
+                f"{domain}\n{text}" if domain else text)
             self._preview_popup.adjustSize()
-            self._preview_popup.move(
-                QtGui.QCursor.pos() + QtCore.QPoint(14, 18))
+            # L3: clamp the popup to the available screen — near
+            # the right or bottom edge it used to run off-screen.
+            pos = QtGui.QCursor.pos() + QtCore.QPoint(14, 18)
+            try:
+                screen = (QtGui.QGuiApplication.screenAt(
+                    QtGui.QCursor.pos())
+                    or QtGui.QGuiApplication.primaryScreen())
+                avail = screen.availableGeometry() if screen is not None else None
+            except Exception:
+                avail = None
+            if avail is not None:
+                size = self._preview_popup.size()
+                pos.setX(min(max(pos.x(), avail.left()),
+                             avail.right() - size.width()))
+                pos.setY(min(max(pos.y(), avail.top()),
+                             avail.bottom() - size.height()))
+            self._preview_popup.move(pos)
             self._preview_popup.show()
 
         def _hide_link_preview(self):
             if self._preview_popup is not None:
                 self._preview_popup.hide()
+
+        def _refresh_comparison(self, view):
+            """M11: re-run the last comparison against the tabs'
+            current text and put the new table in the same tab."""
+            from .compare import (compare_table_html, compare_tabs,
+                                  last_comparison, set_last_comparison)
+            rows, fields = last_comparison()
+
+            def note_page(text):
+                return ("<!doctype html><html><head><meta charset=\"utf-8\">"
+                        "<title>Comparison</title><style>"
+                        "body{font-family:sans-serif;margin:24px;"
+                        "background:#101216;color:#e8e4da}</style></head>"
+                        f"<body><p>{html.escape(text)}</p></body></html>")
+
+            if not rows:
+                view.setHtml(note_page(
+                    "No comparison to refresh — ask the chat to compare "
+                    "some tabs first."))
+                return
+            session = getattr(self, "_chat_session", None)
+            if session is None:
+                view.setHtml(note_page(
+                    "No brain is available to refresh the comparison."))
+                return
+            targets = {row["url"]: row["title"] for row in rows
+                       if row.get("url")}
+            views = []
+            for i in range(self.tabs.count()):
+                candidate = self.tabs.widget(i)
+                if (candidate is None or candidate is view
+                        or id(candidate) in self._agent_tab_ids):
+                    continue
+                if candidate.url().toString() in targets:
+                    views.append(candidate)
+            if not views:
+                view.setHtml(note_page(
+                    "The compared tabs are closed — nothing to refresh."))
+                return
+            self._refreshing_views.add(id(view))
+            view.setHtml(note_page("Refreshing the comparison…"))
+            texts = {}
+            started = {"done": False}
+
+            def start_work():
+                if started["done"]:
+                    return
+                started["done"] = True
+                tabs = [{"title": targets[v.url().toString()],
+                         "url": v.url().toString(),
+                         "text": texts.get(id(v), "")} for v in views]
+
+                def work():
+                    new_rows, dropped = compare_tabs(session, tabs, fields)
+                    set_last_comparison(new_rows, fields)
+                    page = compare_table_html(new_rows, fields,
+                                              dropped=dropped)
+                    self.compare_refresh_done.emit(view, page)
+
+                threading.Thread(target=work, daemon=True).start()
+
+            def collect(candidate, page_text):
+                texts[id(candidate)] = page_text or ""
+                if len(texts) == len(views):
+                    start_work()
+
+            for candidate in views:
+                candidate.page().runJavaScript(
+                    "document.body ? document.body.innerText : ''",
+                    lambda page_text, v=candidate: collect(v, page_text))
+            # A tab that never answers must not hang the refresh.
+            QtCore.QTimer.singleShot(5000, start_work)
 
         def _go(self):
             kind, target = resolve_address(self.address.text())
@@ -448,6 +725,10 @@ def create_window(server, profile, start_url=None):
                 target = server.home_url
             view = self._view()
             if view is not None:
+                # P6: typed in the address bar by hand — the tab is
+                # the person's now (view.load reports Other, so the
+                # page hook can't see this one).
+                self._unmark_agent(view)
                 view.load(QtCore.QUrl(target))
 
         # --- menu bar (E8) -----------------------------------------
@@ -903,7 +1184,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     and answers from what it found. No brain (Ollama down) leaves
     the browser fully usable — the dock just says so.
     """
-    from .chat import ChatSession, LiveDisplay, pick_chat_model
+    from .chat import ChatSession, LiveDisplay
+    from .retrieve import retrieve_note
 
     class Signals(QtCore.QObject):
         notice = QtCore.Signal(str)
@@ -913,20 +1195,75 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         failed = QtCore.Signal(str)
         step = QtCore.Signal(str)  # what the turn is doing right now
         voice_text = QtCore.Signal(str)
+        voice_failed = QtCore.Signal(str)  # S2: transcription failure reason
         plan = QtCore.Signal(str, object)  # plan text, {"event", "approved"}
         compare_table = QtCore.Signal(str)  # comparison table HTML
         progress = QtCore.Signal(str)  # research progress line
         research_done = QtCore.Signal(object, object, object)  # report, sources, error
+        brief_done = QtCore.Signal(str)  # U9: a background brief build's text
+        brain_checked = QtCore.Signal(bool, str)  # answer-check: answers?, model
 
     signals = Signals()
-    model = pick_chat_model()
-    session = ChatSession(model=model)
+    session = ChatSession()  # picks the brain, with reason + state
     window._chat_session = session  # tab titles tidy against this brain
+    brain_health = {"checked": False, "answers": None}
+    retrieval_state = {"models": []}  # fill_seat_combos keeps this fresh
+
+    def brain_header_text():
+        """The dock header from the session's pick: the model, how it
+        was picked (G8), whether it answers (G7), and any
+        fall-through note (G3). Ollama-down and no-models get
+        different lines — the fix is different (G9). Plus the
+        retrieval line (I1): on when nomic-embed-text is
+        installed, off with the fix otherwise."""
+        if session.brain_state == "ollama-down":
+            text = ("Brain: none — Ollama is not running. Start Ollama, "
+                    "then ↻. Browsing still works.")
+        elif session.brain_state == "no-models":
+            text = ("Brain: none — Ollama is running but no chat model "
+                    "is installed. Pull a small model, then ↻. "
+                    "Browsing still works.")
+        elif not session.model:
+            text = ("Brain: none answering — start Ollama, then ↻. "
+                    "Browsing still works.")
+        else:
+            text = f"Brain: {session.model}"
+            if session.pick_reason and session.pick_reason != "given":
+                text += f" ({session.pick_reason})"
+            if brain_health["checked"]:
+                text += (" — answering" if brain_health["answers"]
+                         else " — not answering")
+            if session.pick_note:
+                text += f"\n{session.pick_note}"
+        models = retrieval_state.get("models") or []
+        if any("nomic-embed-text" in m for m in models):
+            text += "\nRetrieval: on"
+        elif session.brain_state == "ollama-down":
+            text += "\nRetrieval: off — Ollama is not running"
+        else:
+            text += "\nRetrieval: off — pull nomic-embed-text"
+        return text
+
+    def _check_brain_in_background():
+        # G7: prove the picked model answers, off the GUI thread.
+        model = session.model
+        if not model:
+            return
+
+        def work_check():
+            from .chat import check_model_answers
+            signals.brain_checked.emit(check_model_answers(model), model)
+
+        threading.Thread(target=work_check, daemon=True).start()
 
     def _build_brief_in_background():
         # The morning brief builds once a day in the background; the
         # start page shows it on its next load. A failed brain call
-        # is not cached, so the next launch retries.
+        # is not cached, so the next launch retries. T2: the brief
+        # is a brain job — it does not build when AI/chat is off.
+        from .seats import seats_enabled
+        if not seats_enabled("chat"):
+            return
         from .brief import build_brief
         try:
             build_brief(session)
@@ -939,9 +1276,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     dock.setObjectName("chat_dock")  # saveState needs a name
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
-    header = QtWidgets.QLabel(
-        f"Brain: {model} (local, no key, no account)" if model else
-        "Brain: none answering — start Ollama and reopen. Browsing still works.")
+    header = QtWidgets.QLabel(brain_header_text())
     header.setWordWrap(True)
     layout.addWidget(header)
     log = QtWidgets.QTextEdit()
@@ -950,17 +1285,28 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # The working line: what this turn is doing, and how long it
     # has taken. It ticks every second while a turn is busy, and
     # says how long the turn took when it ends.
-    status_label = QtWidgets.QLabel("")
+    # V6: the label starts on "Ready" — never blank — and keeps
+    # the last outcome (the done line) until the next turn.
+    status_label = QtWidgets.QLabel("Ready")
     status_label.setObjectName("turn_status")
     status_label.setWordWrap(True)
     layout.addWidget(status_label)
+    progress_row = QtWidgets.QHBoxLayout()
     progress_label = QtWidgets.QLabel("")
     progress_label.setObjectName("research_progress")
     progress_label.setWordWrap(True)
-    layout.addWidget(progress_label)
+    progress_row.addWidget(progress_label, 1)
+    # Q1: a running research job can be stopped from the dock — the
+    # job outlives the turn that started it, so the turn's Stop
+    # does not reach it.
+    stop_research_btn = QtWidgets.QPushButton("Stop research")
+    stop_research_btn.setObjectName("stop_research_button")
+    stop_research_btn.setEnabled(False)
+    progress_row.addWidget(stop_research_btn)
+    layout.addLayout(progress_row)
     row = QtWidgets.QHBoxLayout()
     entry = QtWidgets.QLineEdit()
-    entry.setPlaceholderText("Ask for a page, a search, a summary…")
+    entry.setPlaceholderText("Ask for a page, a search, a summary… (try @tab2)")
     send = QtWidgets.QPushButton("Send")
     summarize_btn = QtWidgets.QPushButton("Summarize")
     mic_btn = QtWidgets.QPushButton("🎤 Hold to talk")
@@ -974,19 +1320,133 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     row.addWidget(mic_btn)
     row.addWidget(stop_btn)
     layout.addLayout(row)
+    # K11: summary length — a short summary is 2-3 sentences.
+    short_row = QtWidgets.QHBoxLayout()
+    short_box = QtWidgets.QCheckBox("Short summary")
+    short_box.setObjectName("short_summary_box")
+    short_row.addWidget(short_box)
+    short_row.addStretch(1)
+    layout.addLayout(short_row)
+    # O11: saved workflow cards, discoverable in the window — pick
+    # one and run it against the current page. The entry text, if
+    # any, is the card's question.
+    cards_row = QtWidgets.QHBoxLayout()
+    cards_row.addWidget(QtWidgets.QLabel("Card:"))
+    cards_combo = QtWidgets.QComboBox()
+    cards_combo.setObjectName("cards_combo")
+    cards_row.addWidget(cards_combo, 1)
+    run_card_btn = QtWidgets.QPushButton("Run card")
+    run_card_btn.setObjectName("run_card_button")
+    cards_row.addWidget(run_card_btn)
+    layout.addLayout(cards_row)
+    # R11: the memory view — what the browser remembers, in the
+    # window at last (facts + stored pages, with forget/remove).
+    # Viewing the person's own data is not an AI feature, so this
+    # button is live even with AI off.
+    memory_row = QtWidgets.QHBoxLayout()
+    memory_btn = QtWidgets.QPushButton("Memory…")
+    memory_btn.setObjectName("memory_button")
+    memory_btn.setToolTip("See what the browser remembers — facts and "
+                          "stored pages — and forget things.")
+    memory_row.addWidget(memory_btn)
+    memory_row.addStretch(1)
+    layout.addLayout(memory_row)
+
+    def show_memory_view():
+        from .memory import (forget, forget_page, list_entries, list_pages)
+        dialog = QtWidgets.QDialog(window)
+        dialog.setWindowTitle("Forge Browser — memory")
+        dialog.setObjectName("memory_dialog")
+        vbox = QtWidgets.QVBoxLayout(dialog)
+        facts_list = QtWidgets.QListWidget()
+        facts_list.setObjectName("memory_facts")
+        pages_list = QtWidgets.QListWidget()
+        pages_list.setObjectName("memory_pages")
+
+        def refresh():
+            facts_list.clear()
+            for entry in list_entries():
+                item = QtWidgets.QListWidgetItem(entry["text"])
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, entry["id"])
+                facts_list.addItem(item)
+            pages_list.clear()
+            for page in list_pages():
+                item = QtWidgets.QListWidgetItem(
+                    f"{page['title']} — {page['url']}")
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, page["url"])
+                pages_list.addItem(item)
+
+        def forget_fact():
+            item = facts_list.currentItem()
+            if item is not None:
+                forget(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                refresh()
+
+        def remove_page():
+            item = pages_list.currentItem()
+            if item is not None:
+                forget_page(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                refresh()
+
+        vbox.addWidget(QtWidgets.QLabel("Remembered facts:"))
+        vbox.addWidget(facts_list)
+        forget_btn = QtWidgets.QPushButton("Forget selected fact")
+        forget_btn.setObjectName("memory_forget_button")
+        forget_btn.clicked.connect(forget_fact)
+        vbox.addWidget(forget_btn)
+        vbox.addWidget(QtWidgets.QLabel("Stored pages:"))
+        vbox.addWidget(pages_list)
+        remove_btn = QtWidgets.QPushButton("Remove selected page")
+        remove_btn.setObjectName("memory_remove_button")
+        remove_btn.clicked.connect(remove_page)
+        vbox.addWidget(remove_btn)
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        vbox.addWidget(close_btn)
+        refresh()
+        dialog.resize(560, 480)
+        dialog.exec()
+
+    memory_btn.clicked.connect(show_memory_view)
     dock.setWidget(panel)
     dock.setMinimumWidth(320)
     window.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
 
     state = {"busy": False, "live": False}
-    turn = {"step": "thinking", "started": None}
+    # V2: "waited" is the plan-gate time accumulated this turn
+    # (never counted as work); "wait_started" is when the current
+    # wait began, or None when no dialog is up.
+    turn = {"step": "thinking", "started": None, "retrieve_note": "",
+            "waited": 0.0, "wait_started": None}
+    # Voice state lives here (not with the mic handlers below) so
+    # apply_ai_state can read it — it runs before the mic section.
+    voice_state = {"recorder": None, "transcribing": False,
+                   "capped": False, "last_size": 0}
+
+    def waited_so_far(now=None):
+        """Seconds spent at the plan gate so far this turn,
+        including the wait in progress (V2)."""
+        total = turn.get("waited", 0.0)
+        if turn.get("wait_started") is not None:
+            now = time.monotonic() if now is None else now
+            total += now - turn["wait_started"]
+        return total
+
+    def status_text(step, started):
+        """The working line, with a ● writing marker while the
+        answer is streaming (H3). The clock pauses during a
+        plan-gate wait (V2)."""
+        text = turn_status_text(step, started, waited=waited_so_far())
+        if state["live"]:
+            text += " ●"
+        return text
 
     def on_step(kind):
         # The worker names the step; the label shows it at once,
         # with the seconds so far.
         turn["step"] = kind
         if state["busy"] and turn["started"] is not None:
-            status_label.setText(turn_status_text(kind, turn["started"]))
+            status_label.setText(status_text(kind, turn["started"]))
 
     signals.step.connect(on_step)
 
@@ -995,7 +1455,18 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # time on the working line.
         if state["busy"] and turn["started"] is not None:
             status_label.setText(
-                turn_status_text(turn["step"], turn["started"]))
+                status_text(turn["step"], turn["started"]))
+        # Q1: Stop research is live only while a job runs.
+        from .research import research_job_running
+        stop_research_btn.setEnabled(research_job_running() is not None)
+
+    def on_stop_research():
+        from .research import cancel_research_job
+        if cancel_research_job():
+            progress_label.setText("Stopping research…")
+            stop_research_btn.setEnabled(False)
+
+    stop_research_btn.clicked.connect(on_stop_research)
 
     turn_timer = QtCore.QTimer(window)
     turn_timer.setInterval(1000)
@@ -1006,7 +1477,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # Three seat dropdowns fed by `ollama list`, plus Firefox-style
     # toggles: one master AI kill-switch and one per feature. Picks
     # live in ~/.forge/seats.json and apply at once.
-    from .chat import list_models as _list_models
+    from .chat import check_ollama, pick_chat_model_with_reason
     from .seats import load_seats, set_feature, set_seat
 
     seat_row = QtWidgets.QHBoxLayout()
@@ -1026,12 +1497,23 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     toggle_row = QtWidgets.QHBoxLayout()
     ai_toggle = QtWidgets.QCheckBox("AI")
     ai_toggle.setObjectName("ai_toggle")
+    # T11: each toggle says what it covers — no guessing.
+    ai_toggle.setToolTip(
+        "Master switch — turns off every AI feature: chat, the "
+        "morning brief, image describing, tidy titles, and memory.")
     chat_toggle = QtWidgets.QCheckBox("Chat")
     chat_toggle.setObjectName("chat_toggle")
+    chat_toggle.setToolTip(
+        "The chat brain, and every brain job: summarize, the "
+        "morning brief, compare, and research.")
     tidy_toggle = QtWidgets.QCheckBox("Tidy titles")
     tidy_toggle.setObjectName("tidy_toggle")
+    tidy_toggle.setToolTip("Brain-written tab titles.")
     memory_toggle = QtWidgets.QCheckBox("Memory")
     memory_toggle.setObjectName("memory_toggle")
+    memory_toggle.setToolTip(
+        "Remembered facts offered as context, and pages recorded "
+        "for later recall.")
     for box in (ai_toggle, chat_toggle, tidy_toggle, memory_toggle):
         toggle_row.addWidget(box)
     layout.addLayout(toggle_row)
@@ -1049,17 +1531,17 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         elif not chat_on:
             header.setText("Chat is off — turn it on below to talk "
                            "to the browser.")
-        elif not session.model:
-            header.setText("Brain: none answering — start Ollama, "
-                           "then ↻. Browsing still works.")
         else:
-            header.setText(f"Brain: {session.model} (local, no key, no account)")
+            header.setText(brain_header_text())
         chat_ok = ai_on and chat_on and bool(session.model)
         busy = state["busy"]
         entry.setEnabled(chat_ok and not busy)
         send.setEnabled(chat_ok and not busy)
         summarize_btn.setEnabled(chat_ok and not busy)
-        mic_btn.setEnabled(chat_ok and not busy)
+        mic_btn.setEnabled(chat_ok and not busy
+                           and not voice_state["transcribing"])
+        run_card_btn.setEnabled(chat_ok and not busy
+                                and cards_combo.count() > 0)
         ai_toggle.setChecked(ai_on)
         chat_toggle.setChecked(chat_on)
         tidy_toggle.setChecked(seats["features"]["tidy_titles"])
@@ -1068,49 +1550,144 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             box.setEnabled(ai_on)
 
     def fill_seat_combos():
-        models = _list_models()
+        # Each item carries the model name as its data; the label
+        # shows the size (T8) so a 2 GB model reads differently
+        # from an 8 GB one. Embed models are not offered as Brain
+        # or Fast (T6); a saved pick that is gone shows as dead
+        # (T5) instead of hiding behind "(auto)", and a saved
+        # embed pick shows as an embed model. The Brain combo's
+        # (auto) entry names what auto would pick (T12).
+        _reachable, details = check_ollama()
+        models = [d["name"] for d in details]
+        sizes = {d["name"]: d["size"] for d in details}
+        retrieval_state["models"] = models  # the header's Retrieval line (I1)
         seats = load_seats()
+        auto_pick = None
+        if models:
+            auto_pick, _reason, _note = pick_chat_model_with_reason(
+                models=models, sizes=sizes, ignore_saved=True)
         for key, combo in combos.items():
             combo.blockSignals(True)
             combo.clear()
-            combo.addItem("(auto)")
-            combo.addItems(models)
+            label = "(auto)"
+            if key == "brain" and auto_pick:
+                label = f"(auto: {auto_pick})"
+            combo.addItem(label, None)
+            for name in models:
+                if key in ("brain", "fast") and "embed" in name.lower():
+                    continue
+                display = name
+                if sizes.get(name):
+                    display = f"{name} ({_human_size(sizes[name])})"
+                combo.addItem(display, name)
             pick = seats.get(key)
-            combo.setCurrentText(pick if pick in models else "(auto)")
+            if pick and pick not in models:
+                combo.addItem(f"{pick} (not installed)", pick)
+                combo.setCurrentIndex(combo.count() - 1)
+            elif (pick and key in ("brain", "fast")
+                  and "embed" in pick.lower()):
+                combo.addItem(f"{pick} (embed model)", pick)
+                combo.setCurrentIndex(combo.count() - 1)
+            elif pick:
+                index = combo.findData(pick)
+                combo.setCurrentIndex(index if index >= 0 else 0)
+            else:
+                combo.setCurrentIndex(0)
             combo.blockSignals(False)
 
     def on_seat_changed(key):
         def handler():
-            text = combos[key].currentText()
-            set_seat(key, None if text == "(auto)" else text)
+            picked = combos[key].currentData()
+            set_seat(key, picked)
             if key == "brain":
-                from .chat import pick_chat_model
-                session.model = pick_chat_model()
+                session.repick()
+                brain_health["checked"] = False
+                brain_health["answers"] = None
                 apply_ai_state()
+                _check_brain_in_background()
             elif key == "fast":
                 window._fast_session = None
         return handler
 
+    def fill_cards_combo():
+        # O11: the runnable cards, by name — broken cards are left
+        # out (the CLI names them); a new card file appears after ↻.
+        from .cards import list_cards
+        current = cards_combo.currentText()
+        cards_combo.blockSignals(True)
+        cards_combo.clear()
+        cards_combo.addItems([c.name for c in list_cards() if not c.error])
+        if current:
+            cards_combo.setCurrentText(current)
+        cards_combo.blockSignals(False)
+
+    def on_refresh():
+        # ↻ re-reads the models AND re-picks the brain, so a brain
+        # that appeared since launch (Ollama just started) is picked
+        # up — the header's own "then ↻" instruction works. Then the
+        # answer-check proves the picked model answers (G7).
+        fill_seat_combos()
+        fill_cards_combo()
+        session.repick()
+        brain_health["checked"] = False
+        brain_health["answers"] = None
+        apply_ai_state()
+        _check_brain_in_background()
+
+    def on_brain_checked(answers, model):
+        # Only the current model's result counts — a re-pick since
+        # the check started makes it stale.
+        if model != session.model:
+            return
+        brain_health["checked"] = True
+        brain_health["answers"] = answers
+        apply_ai_state()
+
+    signals.brain_checked.connect(on_brain_checked)
+
+    def on_ai_toggled(on):
+        # T7: the kill-switch kills the CURRENT turn too, not just
+        # the next one — flipping AI off mid-turn stops the brain.
+        set_feature("ai", on)
+        if not on:
+            session.cancel()
+        apply_ai_state()
+
     for key in combos:
         combos[key].currentTextChanged.connect(on_seat_changed(key))
-    refresh_btn.clicked.connect(lambda: (fill_seat_combos(), apply_ai_state()))
-    ai_toggle.toggled.connect(lambda on: (set_feature("ai", on), apply_ai_state()))
+    refresh_btn.clicked.connect(on_refresh)
+    ai_toggle.toggled.connect(on_ai_toggled)
     chat_toggle.toggled.connect(lambda on: (set_feature("chat", on), apply_ai_state()))
     tidy_toggle.toggled.connect(
         lambda on: (set_feature("tidy_titles", on), apply_ai_state()))
     memory_toggle.toggled.connect(
         lambda on: (set_feature("memory", on), apply_ai_state()))
     fill_seat_combos()
+    fill_cards_combo()
     apply_ai_state()
+    _check_brain_in_background()
+
+    # F4: after an update, one line in the log saying what changed.
+    from .whatsnew import check_whats_new
+    _whats_new = check_whats_new()
+    if _whats_new:
+        log.append(f"<i>{html.escape(_whats_new)}</i>")
 
     def append(who, text):
-        log.append(f"<b>{who}:</b> {text}")
+        # H6: model text is escaped — a reply containing "<b>" or
+        # "<div>" must print as text, never render as HTML.
+        log.append(f"<b>{html.escape(who)}:</b> {html.escape(text)}")
 
     def finish(outcome="done"):
         state["busy"] = False
         stop_btn.setEnabled(False)
         if turn["started"] is not None:
-            status_label.setText(turn_done_text(outcome, turn["started"]))
+            done = turn_done_text(
+                outcome, turn["started"], speed=session.last_speed,
+                waited=turn.get("waited", 0.0))
+            if turn.get("retrieve_note"):
+                done += f" {turn['retrieve_note']}"
+            status_label.setText(done)
             turn["started"] = None
         apply_ai_state()
         entry.setFocus()
@@ -1118,14 +1695,30 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def on_token(text):
         # Streamed words appear as they are generated. The first
         # token of a turn opens the "Forge Browser:" paragraph;
-        # later tokens keep flowing onto the same line.
+        # later tokens keep flowing onto the same line. Insertion
+        # goes through a separate end cursor on the document —
+        # never log.moveCursor(End), and the first paragraph opens
+        # with insertBlock + insertHtml, not log.append (which
+        # scrolls) — so a person scrolled up to read an earlier
+        # answer is not yanked down on every token (H2). The
+        # viewport follows to the end only when it was already
+        # at the bottom.
         if not text:
             return
+        bar = log.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum() - 2
         if not state["live"]:
             state["live"] = True
-            log.append("<b>Forge Browser:</b> ")
-        log.moveCursor(QtGui.QTextCursor.MoveOperation.End)
-        log.insertPlainText(text)
+            cursor = QtGui.QTextCursor(log.document())
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            if not log.document().isEmpty():
+                cursor.insertBlock()
+            cursor.insertHtml("<b>Forge Browser:</b> ")
+        cursor = QtGui.QTextCursor(log.document())
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        if at_bottom:
+            bar.setValue(bar.maximum())
 
     def on_answer(text):
         outcome = "stopped" if (text or "").strip() == "Stopped." else "done"
@@ -1139,14 +1732,41 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             finish(outcome)
 
     def on_failed(text):
+        if state["live"]:
+            # The partial answer was cut off mid-stream: mark it
+            # so it never reads as finished (H4).
+            cursor = QtGui.QTextCursor(log.document())
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cursor.insertText(" …(cut off)")
         state["live"] = False
         append("Forge Browser", f"⚠ {text}")
         finish("failed")
 
-    signals.notice.connect(lambda text: log.append(f"<i>{text}</i>"))
+    def on_notice(text):
+        # H5: notice text is escaped — the action kind comes from
+        # model-supplied JSON. A progress line landing mid-stream
+        # opens a fresh block, so the resumed answer starts on its
+        # own line instead of running onto the notice's.
+        log.append(f"<i>{html.escape(text)}</i>")
+        if state["live"]:
+            cursor = QtGui.QTextCursor(log.document())
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cursor.insertBlock()
+
+    signals.notice.connect(on_notice)
     signals.open_url.connect(lambda url: window.new_tab(url, agent=True))
-    signals.compare_table.connect(lambda html: window.new_tab(html=html))
+    # M11: the comparison tab is brain-made, so it wears the 🤖 mark.
+    signals.compare_table.connect(
+        lambda html: window.new_tab(html=html, agent=True))
     signals.progress.connect(progress_label.setText)
+
+    def on_compare_refresh(view, html):
+        # M11: the refreshed table goes back into the same tab.
+        window._refreshing_views.discard(id(view))
+        if view is not None and window.tabs.indexOf(view) >= 0:
+            view.setHtml(html)
+
+    window.compare_refresh_done.connect(on_compare_refresh)
 
     def on_research_done(report, sources, error):
         if error:
@@ -1154,11 +1774,22 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             progress_label.setText("Research failed.")
             return
         from .research import report_to_html
-        window.new_tab(html=report_to_html(report))
-        append("Forge Browser", "Research done — the report opened in a new tab.")
+        # Q2: the report opens behind the current tab — a background
+        # job's completion does not yank the person from their page.
+        window.new_tab(html=report_to_html(report), background=True)
+        append("Forge Browser",
+               "Research done — the report opened in a new tab behind this one.")
         progress_label.setText("Research done.")
 
     signals.research_done.connect(on_research_done)
+
+    def on_brief_done(text):
+        # U9: a background brief build lands in the log when it
+        # finishes — the turn that asked for it ended long ago.
+        append("Forge Browser", text)
+        progress_label.setText("Brief done.")
+
+    signals.brief_done.connect(on_brief_done)
     signals.token.connect(on_token)
     signals.answer.connect(on_answer)
     signals.failed.connect(on_failed)
@@ -1166,24 +1797,76 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def on_plan(plan_text, state):
         # Runs on the GUI thread; the worker waits on state["event"].
         # Nothing runs until the person says yes.
+        # V3: the working line says what is actually happening —
+        # waiting for the person, not thinking.
+        turn["step"] = "waiting for approval"
+        if turn["started"] is not None:
+            status_label.setText(
+                status_text("waiting for approval", turn["started"]))
         append("Forge Browser", f"Plan: {plan_text}")
-        answer = QtWidgets.QMessageBox.question(
-            window, "Forge Browser — approve this step?",
-            f"The browser wants to:\n\n{plan_text}\n\nAllow it?",
+        dialog = QtWidgets.QMessageBox(window)
+        dialog.setWindowTitle("Forge Browser — approve this step?")
+        dialog.setText(f"The browser wants to:\n\n{plan_text}\n\nAllow it?")
+        dialog.setStandardButtons(
             QtWidgets.QMessageBox.StandardButton.Yes |
             QtWidgets.QMessageBox.StandardButton.No)
+        dialog.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+        # P5: a cheap kind can be always-allowed from the dialog, so
+        # the same step stops asking every turn.
+        always_box = None
+        from .seats import ALWAYS_ALLOWABLE_KINDS
+        if state.get("kind") in ALWAYS_ALLOWABLE_KINDS:
+            always_box = QtWidgets.QCheckBox(
+                f"Always allow {state['kind']}")
+            dialog.setCheckBox(always_box)
+        timed_out = {"value": False}
+
+        def on_timeout():
+            # P2: a missed dialog cannot hang the turn forever —
+            # after 5 minutes the plan is denied, not left waiting.
+            timed_out["value"] = True
+            dialog.done(QtWidgets.QMessageBox.StandardButton.No)
+
+        timer = QtCore.QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(on_timeout)
+        timer.start(PLAN_TIMEOUT_SECONDS * 1000)
+        answer = dialog.exec()
+        timer.stop()
         state["approved"] = (
             answer == QtWidgets.QMessageBox.StandardButton.Yes)
+        if timed_out["value"]:
+            append("Forge Browser",
+                   "Plan timed out after 5 minutes — treated as no.")
+        elif (state["approved"] and always_box is not None
+                and always_box.isChecked()):
+            from .seats import set_always_allow
+            set_always_allow(state["kind"], True)
         state["event"].set()
+        # The turn resumes with the worker — the next on_step names
+        # the real step; until then the line says thinking.
+        turn["step"] = "thinking"
 
     signals.plan.connect(on_plan)
 
-    def ask_plan(plan_text):
+    def ask_plan(plan_text, kind):
         # Called from the worker thread; blocks it until the person
-        # answers the dialog on the GUI thread.
-        state = {"event": threading.Event(), "approved": False}
+        # answers the dialog on the GUI thread. The wait is capped
+        # at the same 5 minutes as the dialog timer (P2 backstop):
+        # even if the dialog never appears, the turn is denied,
+        # not hung.
+        # V2: the wait is timed and banked — it never counts as
+        # work on the status or done lines.
+        turn["wait_started"] = time.monotonic()
+        state = {"event": threading.Event(), "approved": False,
+                 "kind": kind}
         signals.plan.emit(plan_text, state)
-        state["event"].wait()
+        if not state["event"].wait(timeout=PLAN_TIMEOUT_SECONDS):
+            signals.notice.emit(
+                "Plan timed out after 5 minutes — treated as no.")
+        turn["waited"] = (turn.get("waited", 0.0)
+                          + (time.monotonic() - turn["wait_started"]))
+        turn["wait_started"] = None
         return state["approved"]
 
     stop_btn.clicked.connect(lambda: session.cancel())
@@ -1191,6 +1874,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def on_voice_text(text):
         # Transcribed speech lands in the entry for review — the
         # person reads it and hits Send; it is never sent itself.
+        voice_state["transcribing"] = False
+        apply_ai_state()
         if not text:
             append("Forge Browser",
                    "⚠ Couldn't make out anything in the recording.")
@@ -1199,93 +1884,315 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         entry.setText((current + " " + text).strip() if current else text)
         entry.setFocus()
 
-    signals.voice_text.connect(on_voice_text)
+    def on_voice_failed(reason):
+        # S2: each failure gets its own plain sentence — a missing
+        # transcriber is not a bad recording.
+        voice_state["transcribing"] = False
+        apply_ai_state()
+        if reason == "no-transcriber":
+            message = ("⚠ No transcriber is installed — install whisper "
+                       "or set FORGE_TRANSCRIBE_CMD.")
+        elif reason == "failed":
+            message = ("⚠ Transcription failed — the transcriber "
+                       "errored on that recording.")
+        else:
+            message = "⚠ Couldn't make out anything in the recording."
+        append("Forge Browser", message)
 
-    voice_state = {"recorder": None}
+    signals.voice_text.connect(on_voice_text)
+    signals.voice_failed.connect(on_voice_failed)
+
+    def tick_voice_clock():
+        # S3/S7: while recording, the button shows elapsed time and
+        # whether audio is arriving (the WAV file growing); at the
+        # 2-minute cap the recording stops itself.
+        recorder = voice_state["recorder"]
+        if recorder is None:
+            return
+        from .voice import MAX_RECORD_SECONDS
+        elapsed = recorder.elapsed()
+        if elapsed >= MAX_RECORD_SECONDS:
+            voice_state["capped"] = True
+            on_mic_released()
+            return
+        size = 0
+        try:
+            size = os.path.getsize(recorder.path) if recorder.path else 0
+        except OSError:
+            pass
+        growing = size > voice_state["last_size"]
+        voice_state["last_size"] = size
+        text = f"● Listening… {int(elapsed // 60)}:{int(elapsed % 60):02d}"
+        if elapsed > 2 and not growing:
+            text += " — no audio yet"
+        mic_btn.setText(text)
+
+    voice_timer = QtCore.QTimer(window)
+    voice_timer.setInterval(500)
+    voice_timer.timeout.connect(tick_voice_clock)
 
     def on_mic_pressed():
         from .voice import Recorder, find_recorder
         if voice_state["recorder"] is not None:
             return
+        if voice_state["transcribing"]:
+            return  # S9: one transcription at a time
         if find_recorder() is None:
             append("Forge Browser",
                    "⚠ No microphone recorder found (arecord, parecord, or "
                    "ffmpeg). Voice input needs one of those installed.")
             return
         recorder = Recorder()
-        if not recorder.start():
+        try:  # S10: a Popen failure must say so, not raise silently
+            started = recorder.start()
+        except Exception as exc:
+            append("Forge Browser",
+                   f"⚠ Couldn't start the microphone ({exc}).")
+            return
+        if not started:
             append("Forge Browser", "⚠ Couldn't start the microphone.")
             return
         voice_state["recorder"] = recorder
-        mic_btn.setText("● Listening…")
+        voice_state["capped"] = False
+        voice_state["last_size"] = 0
+        mic_btn.setText("● Listening… 0:00")
+        voice_timer.start()
 
     def on_mic_released():
         recorder = voice_state["recorder"]
         voice_state["recorder"] = None
+        voice_timer.stop()
         mic_btn.setText("🎤 Hold to talk")
         if recorder is None:
             return
-        path = recorder.stop()
+        if voice_state["capped"]:
+            append("Forge Browser",
+                   "Recording stopped at the 2-minute cap.")
+        try:  # S10: a wedged recorder must say so, not raise silently
+            path = recorder.stop()
+        except Exception as exc:
+            append("Forge Browser",
+                   f"⚠ The recording could not be stopped cleanly ({exc}).")
+            return
         if path is None:
             append("Forge Browser",
                    "⚠ Nothing recorded — check the microphone.")
             return
+        voice_state["transcribing"] = True
+        apply_ai_state()
         signals.notice.emit("transcribing…")
 
         def work_voice():
-            from .voice import transcribe_recording
-            text = transcribe_recording(path)
+            from .voice import transcribe_recording_detailed
+            try:
+                text, reason = transcribe_recording_detailed(path)
+            except Exception:
+                text, reason = "", "failed"
             try:
                 os.unlink(path)
             except OSError:
                 pass
-            signals.voice_text.emit(text)
+            if text:
+                signals.voice_text.emit(text)
+            else:
+                signals.voice_failed.emit(reason or "failed")
 
         threading.Thread(target=work_voice, daemon=True).start()
 
-    def work(text, page_text, tabs=None, page_url=None):
-        display = LiveDisplay()
+    def _make_chunk_handler(display):
+        """Batched token delivery (H7) with the 'answering' step
+        (H3). on_chunk accumulates shown text and emits at most
+        every ~50 ms, so a fast stream doesn't make the GUI thread
+        do a cursor move + insert + layout per token; the first
+        chunk still shows at once. flush(extra) pushes any pending
+        text plus already-filtered text (the held remainder) out
+        at once. Every emitted batch switches the status to
+        'answering', token first then step, so the ● marker (which
+        needs state['live']) is set by the time the status line
+        is drawn."""
+        pending = {"text": "", "last_emit": 0.0}
+
+        def flush(extra=""):
+            pending["text"] += extra or ""
+            if pending["text"]:
+                signals.token.emit(pending["text"])
+                signals.step.emit("answering")
+                pending["text"] = ""
+                pending["last_emit"] = time.monotonic()
 
         def on_chunk(delta):
             shown = display.feed(delta)
-            if shown:
-                signals.token.emit(shown)
+            if not shown:
+                return
+            pending["text"] += shown
+            if time.monotonic() - pending["last_emit"] >= 0.05:
+                flush()
+
+        return on_chunk, flush
+
+    def _note_retrieval_once():
+        # I7: surface the embed failure reason once per session,
+        # in plain words — Ollama down and model missing need
+        # different fixes. Reads what page_context recorded.
+        last = getattr(session, "_retrieve_last", None) or {}
+        reason = last.get("reason")
+        if not reason or getattr(session, "_retrieve_notice_shown", False):
+            return
+        session._retrieve_notice_shown = True
+        if reason == "model-missing":
+            signals.notice.emit(
+                "Retrieval is off: nomic-embed-text is not installed — "
+                "run install.sh to pull it")
+        elif reason == "ollama-down":
+            signals.notice.emit(
+                "Ollama is not running — start Ollama to search long pages")
+        else:
+            signals.notice.emit(
+                "Retrieval is off: the embeddings model did not answer")
+
+    def work(text, page_text, tabs=None, page_url=None):
+        display = LiveDisplay()
+        on_chunk, flush_tokens = _make_chunk_handler(display)
+
+        def on_action(kind, action):
+            # H5/V4: action progress lines, matching the CLI's
+            # shape — plain words, no turn-relative time (the old
+            # "(12s)" read as the action's duration when it was
+            # the turn's age; the duration lands when the step
+            # finishes, below).
+            signals.notice.emit(f"… {step_words(kind)}")
+
+        def on_step_done(step, seconds):
+            # V4: the step log — each finished step notes how
+            # long it took.
+            signals.notice.emit(
+                f"{step_words(step)} took {format_duration(seconds)}")
 
         try:
             answer, opens = session.ask(
                 text, page_text=page_text, tabs=tabs, page_url=page_url,
+                on_action=on_action,
                 on_step=lambda kind: signals.step.emit(kind),
+                on_step_done=on_step_done,
+                on_note=lambda text: signals.notice.emit(text),
                 on_chunk=on_chunk, on_plan=ask_plan,
                 on_table=lambda html: signals.compare_table.emit(html),
                 on_progress=lambda text: signals.progress.emit(text),
                 on_research_done=lambda report, sources, error=None:
-                    signals.research_done.emit(report, sources, error))
+                    signals.research_done.emit(report, sources, error),
+                on_brief_done=lambda text:
+                    signals.brief_done.emit(text))
+            # I10: what retrieval did this turn rides the done line.
+            turn["retrieve_note"] = retrieve_note(
+                getattr(session, "_retrieve_last", None))
+            _note_retrieval_once()
             for url in opens:
                 signals.open_url.emit(url)
-            rest = display.flush()
-            if rest:
-                signals.token.emit(rest)
+            flush_tokens(display.flush())
             signals.answer.emit(answer or "(no answer)")
         except Exception as exc:
+            # H4: the held remainder streams out first, so a
+            # cut-off answer keeps its last words; on_failed
+            # marks it cut off.
+            flush_tokens(display.flush())
             signals.failed.emit(str(exc))
 
-    def work_summary(page_text):
+    def work_summary(page_text, url=None, length="standard"):
         display = LiveDisplay()
-
-        def on_chunk(delta):
-            shown = display.feed(delta)
-            if shown:
-                signals.token.emit(shown)
+        on_chunk, flush_tokens = _make_chunk_handler(display)
 
         try:
-            from .summarize import summarize_page
-            summary = summarize_page(session, page_text, on_chunk=on_chunk)
-            rest = display.flush()
-            if rest:
-                signals.token.emit(rest)
+            from .summarize import (SummarizeEmptyError, SummarizeStopped,
+                                    summarize_page)
+            summary = summarize_page(
+                session, page_text, url=url, on_chunk=on_chunk,
+                on_progress=lambda text: signals.progress.emit(text),
+                map_session=window._fast_seat_session(), length=length)
+            flush_tokens(display.flush())
+            # K5: "" now means the page itself was empty — a blank
+            # brain raises instead, so this message is honest.
             signals.answer.emit(summary or "(no summary — the page text was empty)")
+        except SummarizeStopped:
+            # K1: a stopped summarize ends as "Stopped.", not a
+            # failure.
+            flush_tokens(display.flush())
+            signals.answer.emit("Stopped.")
+        except SummarizeEmptyError:
+            flush_tokens(display.flush())
+            signals.answer.emit("(no summary — the brain produced nothing)")
         except Exception as exc:
+            flush_tokens(display.flush())
             signals.failed.emit(str(exc))
+
+    def work_card(name, question, page_text):
+        # O11: a card run streams into the log like a summarize —
+        # the card's steps show as progress lines, its opens as tabs.
+        display = LiveDisplay()
+        on_chunk, flush_tokens = _make_chunk_handler(display)
+
+        def on_action(kind, action):
+            # H5/V4: plain words, no turn-relative time — the
+            # duration lands when the step finishes, below.
+            signals.notice.emit(f"… {step_words(kind)}")
+
+        def on_step_done(step, seconds):
+            # V4: the step log — each finished card step notes
+            # how long it took.
+            signals.notice.emit(
+                f"{step_words(step)} took {format_duration(seconds)}")
+
+        try:
+            from .cards import run_card
+            answer, opens = run_card(
+                session, name, question=question, page_text=page_text,
+                on_action=on_action, on_chunk=on_chunk,
+                on_progress=lambda text: signals.progress.emit(text),
+                on_step_done=on_step_done)
+            for url in opens:
+                signals.open_url.emit(url)
+            flush_tokens(display.flush())
+            signals.answer.emit(answer or "(no answer)")
+        except Exception as exc:
+            flush_tokens(display.flush())
+            signals.failed.emit(str(exc))
+
+    def do_card():
+        if state["busy"]:
+            return
+        name = cards_combo.currentText()
+        if not name:
+            return
+        state["busy"] = True
+        state["live"] = False
+        turn["step"] = "running card"
+        turn["retrieve_note"] = ""
+        turn["started"] = time.monotonic()
+        turn["waited"] = 0.0
+        turn["wait_started"] = None
+        status_label.setText(status_text("running card", turn["started"]))
+        send.setEnabled(False)
+        summarize_btn.setEnabled(False)
+        run_card_btn.setEnabled(False)
+        stop_btn.setEnabled(True)
+        entry.setEnabled(False)
+        # Clear any earlier stop, or this card ends at once.
+        session._stop_requested = False
+        question = entry.text().strip()
+        entry.clear()
+        append("You", f"Run the {name} card"
+               + (f": {question}" if question else ""))
+        view = window.tabs.widget(window.tabs.currentIndex())
+
+        def got_page(page_text):
+            threading.Thread(target=work_card,
+                             args=(name, question, page_text or None),
+                             daemon=True).start()
+
+        if view is not None:
+            view.page().runJavaScript(
+                "document.body ? document.body.innerText : ''", got_page)
+        else:
+            got_page(None)
 
     def do_summarize():
         if state["busy"]:
@@ -1293,15 +2200,37 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         state["busy"] = True
         state["live"] = False
         turn["step"] = "summarizing"
+        turn["retrieve_note"] = ""
         turn["started"] = time.monotonic()
+        turn["waited"] = 0.0
+        turn["wait_started"] = None
         status_label.setText(turn_status_text("summarizing", turn["started"]))
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
+        # K1: the Stop button works during a summarize — a long
+        # one is no longer unstoppable.
+        stop_btn.setEnabled(True)
         entry.setEnabled(False)
-        view = window.tabs.currentWidget()
+        # Clear any earlier stop, or this summarize ends at once.
+        session._stop_requested = False
+        # K8: the button follows @tab — summarize the named tab
+        # when the entry has @tabN.
+        target = window.tabs.currentIndex()
+        refs = re.findall(r"@tab(\d+)", entry.text() or "")
+        if refs:
+            n = int(refs[0])
+            if 1 <= n <= window.tabs.count():
+                target = n - 1
+            else:
+                append("Forge Browser",
+                       f"There is no tab {n} — summarizing the current tab.")
+        view = window.tabs.widget(target)
+        url = view.url().toString() if view is not None else None
+        length = "short" if short_box.isChecked() else "standard"
 
         def got_page(page_text):
-            threading.Thread(target=work_summary, args=(page_text or None,),
+            threading.Thread(target=work_summary,
+                             args=(page_text or None, url, length),
                              daemon=True).start()
 
         if view is not None:
@@ -1316,16 +2245,23 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         state["busy"] = True
         state["live"] = False
-        turn["step"] = "thinking"
+        # J5: the working line names the phase honestly — the dock
+        # is reading tabs before the brain starts, not thinking.
+        turn["step"] = "reading tabs"
+        turn["retrieve_note"] = ""
         turn["started"] = time.monotonic()
-        status_label.setText(turn_status_text("thinking", turn["started"]))
+        turn["waited"] = 0.0
+        turn["wait_started"] = None
+        status_label.setText(turn_status_text("reading tabs", turn["started"]))
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
         stop_btn.setEnabled(True)
         entry.setEnabled(False)
         entry.clear()
         append("You", text)
-        # Read every tab's text, so @tabN can name any of them.
+        # J4: the current tab's text is always needed; the rest
+        # only when the message names tabs or asks to compare.
+        read_all = needs_all_tab_text(text)
         count = window.tabs.count()
         current = window.tabs.currentIndex()
         texts = [None] * count
@@ -1335,6 +2271,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             if started["done"]:
                 return
             started["done"] = True
+            turn["step"] = "thinking"
+            status_label.setText(
+                turn_status_text("thinking", turn["started"]))
             tabs = []
             for i in range(count):
                 view = window.tabs.widget(i)
@@ -1359,7 +2298,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         for i in range(count):
             view = window.tabs.widget(i)
-            if view is not None:
+            if view is not None and (i == current or read_all):
                 view.page().runJavaScript(
                     "document.body ? document.body.innerText : ''",
                     lambda page_text, i=i: collect(i, page_text))
@@ -1371,12 +2310,15 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     send.clicked.connect(do_send)
     entry.returnPressed.connect(do_send)
     summarize_btn.clicked.connect(do_summarize)
+    run_card_btn.clicked.connect(do_card)
     mic_btn.pressed.connect(on_mic_pressed)
     mic_btn.released.connect(on_mic_released)
     # The settings window calls this after a save, so the chat dock
-    # picks the new seats and toggles without a restart.
-    window._refresh_ai_controls = lambda: (fill_seat_combos(),
-                                           apply_ai_state())
+    # picks the new seats and toggles without a restart. It is the
+    # refresh handler: a brain seat changed in Settings must
+    # re-pick the brain at once, not wait for a restart (G7/G9 —
+    # the same re-pick the ↻ button does).
+    window._refresh_ai_controls = on_refresh
 
 
 def open_settings_dialog(parent, on_applied=None):
@@ -1463,6 +2405,22 @@ def open_settings_dialog(parent, on_applied=None):
     searxng_row.addWidget(searxng_entry, 1)
     layout.addLayout(searxng_row)
 
+    # L9: how long to rest on a link before its preview fetches.
+    dwell_row = QtWidgets.QHBoxLayout()
+    dwell_row.addWidget(QtWidgets.QLabel("Link preview dwell (ms):"))
+    dwell_spin = QtWidgets.QSpinBox()
+    dwell_spin.setObjectName("settings_preview_dwell_ms")
+    dwell_spin.setRange(100, 5000)
+    dwell_spin.setSingleStep(100)
+    dwell_spin.setSuffix(" ms")
+    try:
+        dwell_spin.setValue(int(get_setting("preview_dwell_ms") or "600"))
+    except ValueError:
+        dwell_spin.setValue(600)
+    dwell_row.addWidget(dwell_spin)
+    dwell_row.addStretch(1)
+    layout.addLayout(dwell_row)
+
     note = QtWidgets.QLabel(
         "The Ollama and SearXNG addresses take effect when the browser "
         "restarts.")
@@ -1487,6 +2445,7 @@ def open_settings_dialog(parent, on_applied=None):
         set_setting("download_dir", download_entry.text().strip())
         set_setting("ollama_url", ollama_entry.text().strip())
         set_setting("searxng_url", searxng_entry.text().strip())
+        set_setting("preview_dwell_ms", str(dwell_spin.value()))
         if on_applied is not None:
             on_applied()
         dialog.accept()

@@ -52,7 +52,7 @@ from .research import make_plan, run_research
 from .search import SearchResult, search
 from .verify import verify_in_browser
 
-__version__ = "0.2"
+__version__ = "0.7"
 
 __all__ = [
     "BrowserError",

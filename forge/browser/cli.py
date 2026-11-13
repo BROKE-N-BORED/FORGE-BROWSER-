@@ -126,7 +126,14 @@ def _cmd_screenshot(args):
 
 
 def _cmd_describe(args):
+    # T4: image describing is an AI feature — the master switch
+    # kills it (the chat toggle does not; describe is not chat).
     from .media import describe_saved_image, pick_vision_model
+    from .seats import load_seats
+    if not load_seats()["ai_enabled"]:
+        print("AI is off — turn it back on in the browser's chat dock "
+              "(or delete ~/.forge/seats.json).")
+        return 0
     if not pick_vision_model():
         raise BrowserError(
             "no local vision seat is configured — Ollama is not answering "
@@ -139,14 +146,18 @@ def _cmd_describe(args):
 
 
 def _cmd_transcribe(args):
-    from .media import transcribe_saved_audio
-    text = transcribe_saved_audio(args.file)
-    if not text:
+    from .media import transcribe_saved_audio_detailed
+    text, reason = transcribe_saved_audio_detailed(args.file)
+    if text:
+        print(text)
+        return 0
+    if reason == "no-transcriber":
         raise BrowserError(
-            "no local transcription backend answered — install whisper or "
-            "set FORGE_TRANSCRIBE_CMD (see BROWSER.md)")
-    print(text)
-    return 0
+            "no local transcription backend is installed — install whisper "
+            "or set FORGE_TRANSCRIBE_CMD (see BROWSER.md)")
+    if reason == "no-speech":
+        raise BrowserError("the transcriber heard no speech in that file")
+    raise BrowserError("transcription failed — the backend errored")
 
 
 def _cmd_research(args):
@@ -236,7 +247,7 @@ def _cmd_vault(args):
 
 
 def _cmd_chat(args):
-    from .chat import ChatSession, LiveDisplay
+    from .chat import ChatSession, LiveDisplay, format_duration, step_words
     from .seats import load_seats
     seats = load_seats()
     if not seats["ai_enabled"] or not seats["features"]["chat"]:
@@ -258,19 +269,42 @@ def _cmd_chat(args):
             continue
         display = LiveDisplay()
         turn_started = time.monotonic()
+        shown_any = {"value": False}
+        # V2: seconds spent at the plan prompt this turn — never
+        # counted as work on the "(took …)" line.
+        waited = {"seconds": 0.0}
 
         def on_chunk(delta):
             shown = display.feed(delta)
             if shown:
+                shown_any["value"] = True
                 print(shown, end="", flush=True)
 
-        def ask_plan(plan_text):
+        def ask_plan(plan_text, kind):
             print(f"\nPlan: {plan_text}")
+            wait_started = time.monotonic()
             try:
-                reply = input("Allow it? [y/N] ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                return False
-            return reply in ("y", "yes")
+                try:
+                    reply = input("Allow it? [y/N] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    return False
+                if reply not in ("y", "yes"):
+                    return False
+                # P5: after a yes, a cheap kind can be always-allowed
+                # so the same step stops asking every turn.
+                from .seats import ALWAYS_ALLOWABLE_KINDS, set_always_allow
+                if kind in ALWAYS_ALLOWABLE_KINDS:
+                    try:
+                        always = input(
+                            f"Always allow {kind} from now on? [y/N] "
+                            ).strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        return True
+                    if always in ("y", "yes"):
+                        set_always_allow(kind, True)
+                return True
+            finally:
+                waited["seconds"] += time.monotonic() - wait_started
 
         def on_progress(text):
             print(f"  [research] {text}", flush=True)
@@ -282,15 +316,34 @@ def _cmd_chat(args):
                 print(f"\n[research done]\n{report}")
 
         def on_action(kind, action):
-            elapsed = int(time.monotonic() - turn_started)
-            print(f"  … {kind} ({elapsed}s)", flush=True)
+            # V1/V4: plain words, no turn-relative time — the old
+            # "(12s)" read as the action's duration when it was
+            # the turn's age. The duration lands when the step
+            # finishes, below.
+            print(f"  … {step_words(kind)}", flush=True)
+
+        def on_step_done(kind, seconds):
+            # V4: the step log — each finished step notes how
+            # long it took.
+            print(f"  … {step_words(kind)} took "
+                  f"{format_duration(seconds)}", flush=True)
 
         try:
             _answer, opens = session.ask(
                 text, on_action=on_action,
                 on_chunk=on_chunk, on_plan=ask_plan,
+                on_step_done=on_step_done,
+                on_note=lambda text: print(f"  ({text})", flush=True),
                 on_progress=on_progress, on_research_done=on_research_done)
         except Exception as exc:
+            # H4: a cut-off stream keeps its last words and is
+            # marked cut off, so a partial answer never reads
+            # as finished.
+            rest = display.flush()
+            if rest:
+                print(rest, end="", flush=True)
+            if shown_any["value"]:
+                print(" …(cut off)")
             print(f"forge browser: {exc}")
             continue
         # The answer already streamed above, line by line; only
@@ -298,7 +351,20 @@ def _cmd_chat(args):
         rest = display.flush()
         if rest:
             print(rest, end="", flush=True)
-        print(f"\n(took {int(time.monotonic() - turn_started)}s)")
+        took = time.monotonic() - turn_started - waited["seconds"]
+        # V2/V5: working time only (the plan-prompt wait is named,
+        # not counted), "<1s" under a second.
+        parts = [f"took {format_duration(took)}"]
+        if session.last_speed:
+            parts.append(f"{session.last_speed:.1f} tok/s")
+        if waited["seconds"] >= 1:
+            parts.append(f"{int(waited['seconds'])}s waiting")
+        print("\n(" + ", ".join(parts) + ")")
+        # I10: what retrieval did this turn, in plain words.
+        from .retrieve import retrieve_note
+        note = retrieve_note(getattr(session, "_retrieve_last", None))
+        if note:
+            print(note)
         for url in opens:
             print(f"  (open in a tab in the window: {url})")
 
@@ -311,32 +377,65 @@ def _cmd_cards(args):
               "yours in ~/.forge/browser-cards/")
         return 0
     for card in cards:
-        print(f"{card.name:24} {card.title}")
+        # O1: a broken card shows its break, not a silent absence.
+        if card.error:
+            print(f"{card.name:24} BROKEN: {card.error}")
+        else:
+            print(f"{card.name:24} {card.title}")
     return 0
 
 
 def _cmd_card(args):
-    from .cards import run_card
+    from .cards import new_card, run_card, validate_card
+    # O10: `card check <name>` validates without running;
+    # `card new <name>` scaffolds a new card file.
+    if args.name == "check":
+        ok, message = validate_card(args.question or "")
+        print(message)
+        return 0 if ok else 1
+    if args.name == "new":
+        try:
+            path = new_card(args.question or "")
+        except Exception as exc:
+            print(f"forge browser: {exc}")
+            return 1
+        print(f"New card: {path}")
+        return 0
     from .chat import ChatSession, LiveDisplay
     session = ChatSession()
     display = LiveDisplay()
+    shown_any = {"value": False}
 
     def on_chunk(delta):
         shown = display.feed(delta)
         if shown:
+            shown_any["value"] = True
             print(shown, end="", flush=True)
 
     try:
-        run_card(session, args.name, question=args.question or "",
-                 on_action=lambda kind, a: print(f"  … {kind}"),
-                 on_chunk=on_chunk)
+        _answer, opens = run_card(
+            session, args.name, question=args.question or "",
+            on_action=lambda kind, a: print(f"  … {kind}"),
+            on_chunk=on_chunk,
+            on_progress=lambda text: print(f"  [{text}]", flush=True))
     except Exception as exc:
+        # H4: a cut-off stream keeps its last words and is
+        # marked cut off, so a partial answer never reads
+        # as finished.
+        rest = display.flush()
+        if rest:
+            print(rest, end="", flush=True)
+        if shown_any["value"]:
+            print(" …(cut off)")
         print(f"forge browser: {exc}")
         return 1
     rest = display.flush()
     if rest:
         print(rest, end="", flush=True)
     print()
+    # O9: pages the card opened are named, like chat's open does.
+    for url in opens:
+        print(f"  (open in a tab in the window: {url})")
     return 0
 
 
@@ -360,18 +459,61 @@ def _cmd_memory(args):
         print(f"exported {len(list_entries())} entries to {path}")
         return 0
     if args.action == "search":
+        from .memory import EmbedCache
         from .retrieve import embed_texts
-        found = search_entries(args.value, top_k=5, embed_fn=embed_texts)
+        found = search_entries(args.value, top_k=5, embed_fn=embed_texts,
+                               embed_cache=EmbedCache())
         for entry in found:
             print(f"- {entry['text']}")
         if not found:
             print("nothing relevant remembered")
         return 0
+    if args.action == "sites":
+        from .memory import list_site_memory
+        sites = list_site_memory()
+        if not sites["blocked"] and not sites["allowed"]:
+            print("no per-site memory rules — the sensitive-page list decides")
+            return 0
+        for host in sites["blocked"]:
+            print(f"blocked: {host} (no memory there)")
+        for host in sites["allowed"]:
+            print(f"allowed: {host} (memory stays on there)")
+        return 0
+    if args.action in ("site-block", "site-allow", "site-clear"):
+        from .memory import (allow_site_memory, block_site_memory,
+                             clear_site_memory)
+        if not args.value:
+            print(f"usage: memory {args.action} <site>")
+            return 1
+        if args.action == "site-block":
+            host = block_site_memory(args.value)
+            print(f"memory off on {host} (and its subdomains)" if host
+                  else "could not read a site from that")
+        elif args.action == "site-allow":
+            host = allow_site_memory(args.value)
+            print(f"memory stays on for {host} (and its subdomains)" if host
+                  else "could not read a site from that")
+        else:
+            host = clear_site_memory(args.value)
+            print(f"no per-site rule for {host} any more" if host
+                  else "could not read a site from that")
+        return 0
+    if args.action == "page-forget":
+        from .memory import forget_page
+        if not args.value:
+            print("usage: memory page-forget <url or title>")
+            return 1
+        removed = forget_page(args.value)
+        print(f"forgot {removed} stored page{'s' if removed != 1 else ''}"
+              if removed else "no stored page matched that")
+        return 0
     if args.action == "pages":
         from .memory import list_pages, search_pages
         if args.value:
+            from .memory import EmbedCache
             from .retrieve import embed_texts
-            found = search_pages(args.value, embed_fn=embed_texts)
+            found = search_pages(args.value, embed_fn=embed_texts,
+                                 embed_cache=EmbedCache())
             for entry in found:
                 print(f"{entry['title']} — {entry['url']}\n  {entry['text'][:200]}")
             if not found:
@@ -394,7 +536,15 @@ def _cmd_memory(args):
 
 def _cmd_voice(args):
     import time
-    from .voice import Recorder, find_recorder, transcribe_recording
+    from .seats import seats_enabled
+    # T3: the CLI voice path honors the same chat gate as the
+    # dock mic — AI/chat off means no recording.
+    if not seats_enabled("chat"):
+        print("AI is off — turn it back on in the browser's chat dock "
+              "(or delete ~/.forge/seats.json).")
+        return 0
+    from .voice import (MAX_RECORD_SECONDS, Recorder, find_recorder,
+                        transcribe_recording_detailed)
     if find_recorder() is None:
         print("no microphone recorder found (arecord, parecord, or ffmpeg)")
         return 1
@@ -402,26 +552,48 @@ def _cmd_voice(args):
     if not recorder.start():
         print("couldn't start the microphone")
         return 1
-    print(f"recording for {args.seconds}s — speak now…")
-    time.sleep(args.seconds)
+    seconds = min(args.seconds, MAX_RECORD_SECONDS)
+    print(f"recording for {seconds}s — speak now…")
+    time.sleep(seconds)
     path = recorder.stop()
     if path is None:
         print("nothing recorded — check the microphone")
         return 1
-    text = transcribe_recording(path)
+    text, reason = transcribe_recording_detailed(path)
     try:
         os.unlink(path)
     except OSError:
         pass
-    print(text or "couldn't make out anything in the recording")
+    if text:
+        print(text)
+        return 0
+    if reason == "no-transcriber":
+        print("no transcriber is installed — install whisper or set "
+              "FORGE_TRANSCRIBE_CMD (see BROWSER.md)")
+    elif reason == "failed":
+        print("transcription failed — the backend errored")
+    else:
+        print("couldn't make out anything in the recording")
     return 0
 
 
 def _cmd_brief(args):
-    from .brief import brief_text, build_brief
+    # T2: the brief is a brain job — it does not build when
+    # AI/chat is off.
+    from .seats import seats_enabled
+    if not seats_enabled("chat"):
+        print("AI is off — turn it back on in the browser's chat dock "
+              "(or delete ~/.forge/seats.json).")
+        return 0
+    from .brief import brief_text, build_brief, build_today_brief
     from .chat import ChatSession
     session = ChatSession()
-    print(brief_text(build_brief(session if session.model else None)))
+    if getattr(args, "when", None) == "today":
+        # U6: today's brief so far — a full build, not cached.
+        print(brief_text(build_today_brief(
+            session if session.model else None), when="today"))
+    else:
+        print(brief_text(build_brief(session if session.model else None)))
     return 0
 
 
@@ -492,20 +664,26 @@ def main(argv=None):
     p = sub.add_parser("cards", help="list the saved workflow cards")
     p.set_defaults(func=_cmd_cards)
 
-    p = sub.add_parser("card", help="run one saved workflow card")
+    p = sub.add_parser("card", help="run one saved workflow card "
+                                    "(card check <name> validates, "
+                                    "card new <name> scaffolds)")
     p.add_argument("name", help="card name, e.g. summarize-page")
     p.add_argument("question", nargs="?", default="",
                    help="the question or topic the card works on")
     p.set_defaults(func=_cmd_card)
 
-    p = sub.add_parser("memory", help="the remembered facts (list/add/forget/search/export/pages)")
+    p = sub.add_parser("memory", help="the remembered facts (list/add/forget/search/export/pages/page-forget/sites)")
     p.add_argument("action", nargs="?", default="list",
-                   choices=["list", "add", "forget", "search", "export", "pages"])
+                   choices=["list", "add", "forget", "search", "export", "pages",
+                            "page-forget",
+                            "sites", "site-block", "site-allow", "site-clear"])
     p.add_argument("value", nargs="?", default="",
                    help="the fact, the search, or the export path")
     p.set_defaults(func=_cmd_memory)
 
     p = sub.add_parser("brief", help="the morning brief — what yesterday's browsing was about")
+    p.add_argument("when", nargs="?", default=None, choices=["today"],
+                   help="'today' briefs today so far instead of yesterday")
     p.set_defaults(func=_cmd_brief)
 
     p = sub.add_parser("preview", help="two lines about where a link goes (fetched on demand)")

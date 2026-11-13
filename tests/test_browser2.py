@@ -293,6 +293,10 @@ class _FileHandler(BaseHTTPRequestHandler):
             return
         routes = {
             "/doc.pdf": ("application/pdf", _make_pdf()),
+            # A scanned PDF: no text layer at all (no Tj/TJ ops).
+            "/scan.pdf": ("application/pdf",
+                          b"%PDF-1.4\n1 0 obj<</Length 8>>stream\n"
+                          b"xxxxxxxx\nendstream endobj\n"),
             "/pic.png": ("image/png", FAKE_PNG),
             "/data.json": ("application/json", b'{"a": 1}'),
             "/table.csv": ("text/csv", b"name,value\nalpha,1\n"),
@@ -309,11 +313,32 @@ class _FileHandler(BaseHTTPRequestHandler):
                             b"</body></html>"),
         }
         content_type, body = routes.get(self.path, ("text/plain", b"missing"))
-        self.send_response(200 if self.path in routes else 404)
+        # W3: honor Range so resume can be tested against a real
+        # server — 206 with the rest of the body, 416 when the
+        # range starts past the end.
+        range_header = self.headers.get("Range")
+        status = 200 if self.path in routes else 404
+        start = 0
+        if range_header and self.path in routes:
+            try:
+                start = int(range_header.split("=", 1)[1].split("-", 1)[0])
+            except (TypeError, ValueError, IndexError):
+                start = 0
+            if start >= len(body):
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{len(body)}")
+                self.end_headers()
+                return
+            if start:
+                status = 206
+        self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        if status == 206:
+            self.send_header("Content-Range",
+                             f"bytes {start}-{len(body) - 1}/{len(body)}")
+        self.send_header("Content-Length", str(len(body) - start))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(body[start:])
 
     def log_message(self, *args):
         pass
@@ -363,6 +388,34 @@ class FileTests(unittest.TestCase):
         self.assertEqual(result.text, "")  # no seat: nothing invented
         self.assertTrue(any("no local vision seat" in n for n in result.notes))
 
+    def test_image_not_described_when_ai_off(self):
+        # T4: with the master switch off, fetch still saves the
+        # image but never calls the vision seat — and says so.
+        from unittest import mock
+        from forge.browser import media as media_module
+        from forge.browser import seats as seats_module
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_SEATS_PATH")
+            os.environ["FORGE_BROWSER_SEATS_PATH"] = os.path.join(
+                tmp, "seats.json")
+            try:
+                seats_module.set_feature("ai", False)
+                with mock.patch.object(
+                        media_module, "describe_saved_image",
+                        side_effect=AssertionError(
+                            "described while AI is off")):
+                    result = fetch_any(self.base + "/pic.png",
+                                       allow_local=True)
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_SEATS_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_SEATS_PATH"] = old
+        self.assertEqual(result.kind, "image")
+        self.assertTrue(os.path.isfile(result.saved_path))
+        self.assertEqual(result.text, "")
+        self.assertTrue(any("AI is off" in n for n in result.notes))
+
     def test_same_name_downloaded_twice_keeps_both(self):
         # Task #22: the second download gets a uniquified name
         # instead of silently overwriting the first file.
@@ -401,6 +454,50 @@ class FileTests(unittest.TestCase):
         self.assertEqual(result.kind, "audio")
         self.assertTrue(os.path.isfile(result.saved_path))
 
+    def test_scanned_pdf_ocr_with_stub_tools(self):
+        # F2: with tesseract + pdftoppm present, a scanned PDF is
+        # read by OCR instead of reported unreadable. The tools are
+        # stubs here (no real tesseract in the sandbox) — they prove
+        # the wiring, not the OCR engine.
+        import stat as _stat
+        from forge.browser import ocr as ocr_module
+        bin_dir = tempfile.mkdtemp()
+        with open(os.path.join(bin_dir, "pdftoppm"), "w") as handle:
+            handle.write("#!/usr/bin/env python3\nimport sys\n"
+                         "prefix = sys.argv[-1]\n"
+                         "for i in (1, 2):\n"
+                         "    open(f\"{prefix}-{i}.png\", \"wb\").write(b\"x\")\n")
+        with open(os.path.join(bin_dir, "tesseract"), "w") as handle:
+            handle.write("#!/usr/bin/env python3\nimport os, sys\n"
+                         "print(\"scanned words from \" + os.path.basename(sys.argv[1]))\n")
+        for name in ("pdftoppm", "tesseract"):
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bin_dir + os.pathsep + old_path
+        try:
+            self.assertTrue(ocr_module.ocr_available())
+            result = fetch_any(self.base + "/scan.pdf", allow_local=True)
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual(result.kind, "pdf")
+        self.assertIn("[page 1]", result.text)
+        self.assertIn("scanned words from page-1.png", result.text)
+        self.assertTrue(any("read with OCR" in n for n in result.notes))
+
+    def test_scanned_pdf_without_tools_names_the_install(self):
+        # F2: no OCR tools — the note says plainly what to install.
+        empty = tempfile.mkdtemp()
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = empty
+        try:
+            result = fetch_any(self.base + "/scan.pdf", allow_local=True)
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertEqual(result.kind, "pdf")
+        self.assertEqual(result.text, "")
+        self.assertTrue(os.path.isfile(result.saved_path))
+        self.assertTrue(any("tesseract-ocr" in n for n in result.notes))
+
     def test_gated_page_barriers_from_raw_html(self):
         # The gate is markup-only: no visible phrase says captcha or
         # login, so only detection on the raw HTML can catch it.
@@ -409,6 +506,191 @@ class FileTests(unittest.TestCase):
         self.assertIn("Welcome to the article about gears.", result.text)
         kinds = [b["kind"] for b in result.barriers]
         self.assertEqual(kinds, ["captcha", "login"])
+
+
+class CollisionAuditTests(unittest.TestCase):
+    """Task AB: long, percent-encoded, Unicode, mismatched, and
+    degenerate filenames are handled — never crashed, mangled, or
+    left lying about their content."""
+
+    def _keep(self, url, kind, content_type=""):
+        # One _keep_file round-trip in a throwaway media dir;
+        # returns (saved basename, the file exists).
+        from forge.browser.files import _keep_file
+        with tempfile.TemporaryDirectory() as media:
+            old = os.environ.get("FORGE_BROWSER_MEDIA_DIR")
+            os.environ["FORGE_BROWSER_MEDIA_DIR"] = media
+            try:
+                fd, tmp = tempfile.mkstemp(dir=media)
+                os.close(fd)
+                with open(tmp, "wb") as handle:
+                    handle.write(b"x")
+                path = _keep_file(tmp, url, kind, content_type)
+                return os.path.basename(path), os.path.isfile(path)
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEDIA_DIR", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEDIA_DIR"] = old
+
+    def test_long_name_truncated_not_crashed(self):
+        # AB1: the audit's probed crash — a 300-char basename
+        # raised raw OSError Errno 36. Now it saves, truncated
+        # to the 255-byte limit with the extension kept.
+        name, exists = self._keep(
+            "http://x.example/" + "a" * 300 + ".pdf",
+            "pdf", "application/pdf")
+        self.assertTrue(exists)
+        self.assertLessEqual(len(name.encode("utf-8")), 255)
+        self.assertTrue(name.endswith(".pdf"))
+
+    def test_long_names_uniquify_after_truncation(self):
+        # AB1: two long names sharing a 251-byte prefix truncate
+        # to the same stem — the second still saves, uniquified,
+        # and both fit the limit.
+        from forge.browser.files import _keep_file
+        with tempfile.TemporaryDirectory() as media:
+            old = os.environ.get("FORGE_BROWSER_MEDIA_DIR")
+            os.environ["FORGE_BROWSER_MEDIA_DIR"] = media
+            try:
+                names = []
+                for tail in ("one", "two"):
+                    fd, tmp = tempfile.mkstemp(dir=media)
+                    os.close(fd)
+                    with open(tmp, "wb") as handle:
+                        handle.write(b"x")
+                    path = _keep_file(
+                        tmp, "http://x.example/" + "a" * 251 + tail + ".pdf",
+                        "pdf", "application/pdf")
+                    names.append(os.path.basename(path))
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_MEDIA_DIR", None)
+                else:
+                    os.environ["FORGE_BROWSER_MEDIA_DIR"] = old
+        self.assertEqual(len(set(names)), 2)
+        for name in names:
+            self.assertLessEqual(len(name.encode("utf-8")), 255)
+            self.assertTrue(name.endswith(".pdf"))
+
+    def test_percent_encoded_name_decoded(self):
+        # AB2: %20 becomes a space (then an underscore), %C3%A9
+        # becomes é — never my_20report.pdf / caf_C3_A9-menu.pdf.
+        name, exists = self._keep(
+            "http://x.example/my%20report.pdf", "pdf", "application/pdf")
+        self.assertTrue(exists)
+        self.assertEqual(name, "my_report.pdf")
+        name, exists = self._keep(
+            "http://x.example/caf%C3%A9-menu.pdf", "pdf", "application/pdf")
+        self.assertTrue(exists)
+        self.assertEqual(name, "café-menu.pdf")
+
+    def test_unicode_name_kept(self):
+        # AB3: non-ASCII letters survive the sanitizer.
+        name, exists = self._keep(
+            "http://x.example/café-menu.pdf", "pdf", "application/pdf")
+        self.assertTrue(exists)
+        self.assertEqual(name, "café-menu.pdf")
+
+    def test_extension_follows_content_kind(self):
+        # AB4: the extension must not lie — a .txt URL serving a
+        # PDF becomes report.pdf; a .txt URL serving a PNG becomes
+        # photo.png. An agreeing extension is kept, and kind
+        # "binary" carries no content info to contradict the URL.
+        name, _ = self._keep(
+            "http://x.example/report.txt", "pdf", "application/pdf")
+        self.assertEqual(name, "report.pdf")
+        name, _ = self._keep(
+            "http://x.example/photo.txt", "image", "image/png")
+        self.assertEqual(name, "photo.png")
+        name, _ = self._keep(
+            "http://x.example/pic.png", "image", "image/png")
+        self.assertEqual(name, "pic.png")
+        name, _ = self._keep("http://x.example/archive.zip", "binary", "")
+        self.assertEqual(name, "archive.zip")
+
+    def test_degenerate_names_fall_back(self):
+        # AB5: ".", "..", all-unsafe, and empty basenames become
+        # download.<kind> — never ".-1" or "..-1".
+        for url in ("http://x.example/.", "http://x.example/..",
+                    "http://x.example/!!!.pdf", "http://x.example/"):
+            name, exists = self._keep(url, "pdf", "application/pdf")
+            self.assertTrue(exists, url)
+            self.assertEqual(name, "download.pdf", url)
+
+    def test_filesystem_failure_is_plain_words(self):
+        # AB6: an os.link failure that is not a collision (here:
+        # the target directory does not exist) raises a
+        # plain-words BrowserError, not a raw OSError — and the
+        # temp file is cleaned up.
+        from forge.browser.files import _link_unique
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fd, tmp = tempfile.mkstemp(dir=tmpdir)
+            os.close(fd)
+            with open(tmp, "wb") as handle:
+                handle.write(b"x")
+            missing = os.path.join(tmpdir, "no-such-dir")
+            with self.assertRaises(BrowserError) as caught:
+                _link_unique(tmp, missing, "report.pdf")
+            self.assertIn("could not save", str(caught.exception))
+            self.assertFalse(os.path.exists(tmp))
+
+
+class OcrTests(unittest.TestCase):
+    """F2: OCR for scanned PDFs, via tesseract + pdftoppm."""
+
+    def _stub_bin(self, pdftoppm_ok=True):
+        bin_dir = tempfile.mkdtemp()
+        pdftoppm = ("#!/usr/bin/env python3\nimport sys\n"
+                    "prefix = sys.argv[-1]\n"
+                    "for i in (1, 2):\n"
+                    "    open(f\"{prefix}-{i}.png\", \"wb\").write(b\"x\")\n"
+                    if pdftoppm_ok else
+                    "#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n")
+        with open(os.path.join(bin_dir, "pdftoppm"), "w") as handle:
+            handle.write(pdftoppm)
+        with open(os.path.join(bin_dir, "tesseract"), "w") as handle:
+            handle.write("#!/usr/bin/env python3\nimport os, sys\n"
+                         "print(\"words from \" + os.path.basename(sys.argv[1]))\n")
+        for name in ("pdftoppm", "tesseract"):
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        return bin_dir
+
+    def test_tools_missing_means_no_ocr(self):
+        from forge.browser import ocr as ocr_module
+        empty = tempfile.mkdtemp()
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = empty
+        try:
+            self.assertEqual(ocr_module.find_ocr_tools(),
+                             {"tesseract": None, "pdftoppm": None})
+            self.assertFalse(ocr_module.ocr_available())
+            self.assertEqual(ocr_module.ocr_pdf("/nonexistent.pdf"), "")
+        finally:
+            os.environ["PATH"] = old_path
+
+    def test_ocr_pdf_joins_pages_with_markers(self):
+        from forge.browser import ocr as ocr_module
+        bin_dir = self._stub_bin()
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bin_dir + os.pathsep + old_path
+        try:
+            self.assertTrue(ocr_module.ocr_available())
+            text = ocr_module.ocr_pdf("/fake/scan.pdf")
+        finally:
+            os.environ["PATH"] = old_path
+        self.assertIn("[page 1]\nwords from page-1.png", text)
+        self.assertIn("[page 2]\nwords from page-2.png", text)
+
+    def test_ocr_pdf_empty_when_render_fails(self):
+        from forge.browser import ocr as ocr_module
+        bin_dir = self._stub_bin(pdftoppm_ok=False)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = bin_dir + os.pathsep + old_path
+        try:
+            self.assertEqual(ocr_module.ocr_pdf("/fake/scan.pdf"), "")
+        finally:
+            os.environ["PATH"] = old_path
 
 
 class DownloadCapTests(unittest.TestCase):
@@ -502,6 +784,257 @@ class DownloadCapTests(unittest.TestCase):
         self.assertTrue(any("too big" in n for n in result.notes))
 
 
+class _FakeResponse:
+    """A canned urlopen result: chunks, then an optional failure."""
+
+    def __init__(self, chunks, fail=None, status=200, headers=None):
+        self._chunks = list(chunks)
+        self._fail = fail
+        self.status = status
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def geturl(self):
+        return "http://example.org/fake.bin"
+
+    def read(self, size=-1):
+        if not self._chunks:
+            if self._fail is not None:
+                raise self._fail
+            return b""
+        return self._chunks.pop(0)
+
+
+class DownloadAuditTests(unittest.TestCase):
+    """Audit #17: honest download failures, resume, progress, the
+    full-disk guard, the repo's own User-Agent, and stall
+    detection."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _FileHandler)
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}"
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.tmp = tempfile.mkdtemp()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def _patch_urlopen(self, response):
+        # Z2 moved the transport behind _http._urlopen (the fenced
+        # opener); the fake stands in there now.
+        import forge.browser._http as _http_module
+        original = _http_module._urlopen
+        _http_module._urlopen = lambda request, timeout, allow_local: response
+        return original
+
+    def test_mid_download_drop_is_a_network_failure(self):
+        # W1/W2: a dropped connection says the connection dropped
+        # (never "could not save"), and the partial file is gone.
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+        path = os.path.join(self.tmp, "dropped.bin")
+        response = _FakeResponse(
+            [b"x" * 100],
+            fail=_urlerr.URLError("connection dropped"))
+        original = self._patch_urlopen(response)
+        try:
+            with self.assertRaises(BrowserError) as caught:
+                http_get_to_file("http://example.org/drop.bin", path)
+        finally:
+            import forge.browser._http as _http_module
+            _http_module._urlopen = original
+        self.assertIn("connection dropped", str(caught.exception))
+        self.assertNotIn("could not save", str(caught.exception))
+        self.assertFalse(os.path.exists(path))
+
+    def test_short_body_is_a_network_failure(self):
+        # W1: a body cut short (IncompleteRead) is a network
+        # failure too, not a save failure, not a raw traceback.
+        import http.client as _http_client
+        import urllib.request as _urlreq
+        path = os.path.join(self.tmp, "short.bin")
+        response = _FakeResponse(
+            [b"x" * 100],
+            fail=_http_client.IncompleteRead(b"x" * 100, 2048))
+        original = self._patch_urlopen(response)
+        try:
+            with self.assertRaises(BrowserError) as caught:
+                http_get_to_file("http://example.org/short.bin", path)
+        finally:
+            import forge.browser._http as _http_module
+            _http_module._urlopen = original
+        self.assertIn("connection dropped", str(caught.exception))
+        self.assertFalse(os.path.exists(path))
+
+    def test_save_failure_still_says_save(self):
+        # W1's other side: a real save failure (the path is a
+        # directory) still says the save failed.
+        with self.assertRaises(BrowserError) as caught:
+            http_get_to_file(self.base + "/big.bin", self.tmp,
+                             allow_local=True)
+        self.assertIn("could not save", str(caught.exception))
+
+    def test_resume_appends_from_saved_part(self):
+        # W3: a 206 appends the rest — the file ends up whole.
+        path = os.path.join(self.tmp, "resumed.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 1024)
+        _url, _headers, size = http_get_to_file(
+            self.base + "/big.bin", path, resume=True, allow_local=True)
+        self.assertEqual(size, 2048)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"x" * 2048)
+
+    def test_resume_restarts_when_server_ignores_range(self):
+        # W3: a server that ignores Range restarts the file from
+        # zero — the stale partial is discarded, not appended to.
+        path = os.path.join(self.tmp, "restarted.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"y" * 100)
+        _url, _headers, size = http_get_to_file(
+            self.base + "/big-chunked.bin", path, resume=True,
+            allow_local=True)
+        self.assertEqual(size, 2048)
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), b"x" * 2048)
+
+    def test_resume_refused_keeps_partial(self):
+        # W3: a 416 (the saved part does not match) says so in
+        # plain words — and the partial survives, so the person
+        # can delete it and start over.
+        path = os.path.join(self.tmp, "mismatch.bin")
+        with open(path, "wb") as handle:
+            handle.write(b"x" * 3000)
+        with self.assertRaises(BrowserError) as caught:
+            http_get_to_file(self.base + "/big.bin", path, resume=True,
+                             allow_local=True)
+        self.assertIn("refused to resume", str(caught.exception))
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(os.path.getsize(path), 3000)
+
+    def test_progress_reports_bytes_and_total(self):
+        # W4: (bytes so far, total) after each chunk, starting
+        # at (0, total).
+        path = os.path.join(self.tmp, "progress.bin")
+        seen = []
+        _url, _headers, size = http_get_to_file(
+            self.base + "/big.bin", path, allow_local=True,
+            on_progress=lambda done, total: seen.append((done, total)))
+        self.assertEqual(size, 2048)
+        self.assertEqual(seen[0], (0, 2048))
+        self.assertEqual(seen[-1], (2048, 2048))
+        for earlier, later in zip(seen, seen[1:]):
+            self.assertLessEqual(earlier[0], later[0])
+
+    def test_disk_guard_stops_cleanly(self):
+        # W5: with the floor above free space, the download
+        # stops before writing, says the disk is nearly full,
+        # and leaves no partial behind.
+        old = os.environ.get("FORGE_BROWSER_MIN_FREE_BYTES")
+        os.environ["FORGE_BROWSER_MIN_FREE_BYTES"] = str(10 ** 15)
+        path = os.path.join(self.tmp, "guarded.bin")
+        try:
+            with self.assertRaises(BrowserError) as caught:
+                http_get_to_file(self.base + "/big.bin", path,
+                                 allow_local=True)
+        finally:
+            if old is None:
+                os.environ.pop("FORGE_BROWSER_MIN_FREE_BYTES", None)
+            else:
+                os.environ["FORGE_BROWSER_MIN_FREE_BYTES"] = old
+        self.assertIn("nearly full", str(caught.exception))
+        self.assertFalse(os.path.exists(path))
+
+    def test_user_agent_names_this_repo(self):
+        # W6: the browser identifies itself, not Code Forge.
+        from forge.browser._http import USER_AGENT
+        self.assertIn("FORGE-BROWSER-", USER_AGENT)
+        self.assertIn("Forge Browser", USER_AGENT)
+        self.assertNotIn("CODE-FORGE", USER_AGENT)
+
+    def test_page_refusal_says_page(self):
+        # W7: a page fetch over the in-memory cap says "page",
+        # not "download".
+        with self.assertRaises(BrowserError) as caught:
+            http_get(self.base + "/declared-big.bin", max_bytes=1024,
+                     allow_local=True)
+        self.assertIn("page", str(caught.exception))
+        self.assertNotIn("download", str(caught.exception))
+
+    def test_download_refusal_still_says_download(self):
+        # W7's other side: a file download over an explicit cap
+        # still says "download".
+        path = os.path.join(self.tmp, "capped.bin")
+        with self.assertRaises(BrowserError) as caught:
+            http_get_to_file(self.base + "/big.bin", path, max_bytes=1024,
+                             allow_local=True)
+        self.assertIn("download", str(caught.exception))
+
+    def test_stalled_download_aborts(self):
+        # W8: a dribble (10 bytes, a pause past the window, 10
+        # more) aborts as stalled instead of running forever.
+        import urllib.request as _urlreq
+
+        class Dribbling(_FakeResponse):
+            def __init__(self):
+                super().__init__([])
+                self._calls = 0
+
+            def read(self, size=-1):
+                self._calls += 1
+                if self._calls == 1:
+                    return b"x" * 10
+                if self._calls == 2:
+                    time.sleep(0.15)
+                    return b"y" * 10
+                return b""
+
+        original = self._patch_urlopen(Dribbling())
+        try:
+            with self.assertRaises(BrowserError) as caught:
+                http_get("http://example.org/dribble.bin",
+                         stall_window=0.1, stall_min_bytes=1000)
+        finally:
+            import forge.browser._http as _http_module
+            _http_module._urlopen = original
+        self.assertIn("stalled", str(caught.exception))
+
+    def test_healthy_download_does_not_trip_stall(self):
+        # W8: the same dribble under a realistic floor completes.
+        import urllib.request as _urlreq
+
+        class Dribbling(_FakeResponse):
+            def __init__(self):
+                super().__init__([])
+                self._calls = 0
+
+            def read(self, size=-1):
+                self._calls += 1
+                if self._calls == 1:
+                    return b"x" * 10
+                if self._calls == 2:
+                    time.sleep(0.15)
+                    return b"y" * 10
+                return b""
+
+        original = self._patch_urlopen(Dribbling())
+        try:
+            _url, _headers, body = http_get(
+                "http://example.org/dribble.bin",
+                stall_window=0.1, stall_min_bytes=5)
+        finally:
+            import forge.browser._http as _http_module
+            _http_module._urlopen = original
+        self.assertEqual(body, b"x" * 10 + b"y" * 10)
+
+
 # ----------------------------------------------------------------------
 # Media seats against fakes
 # ----------------------------------------------------------------------
@@ -571,6 +1104,160 @@ class MediaSeatTests(unittest.TestCase):
                 else:
                     os.environ["FORGE_TRANSCRIBE_CMD"] = old
 
+    def _fake_whisper_cpp(self, bindir, argv_log):
+        """A whisper-cli stand-in that records its argv and writes
+        a transcript to the -of target."""
+        script = os.path.join(bindir, "whisper-cli")
+        with open(script, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         "out=\"\"\nprev=\"\"\n"
+                         "for arg in \"$@\"; do\n"
+                         "  if [ \"$prev\" = \"-of\" ]; then out=\"$arg\"; fi\n"
+                         "  prev=\"$arg\"\ndone\n"
+                         f"printf '%s\\n' \"$@\" > {argv_log}\n"
+                         "echo 'hello from whisper' > \"$out.txt\"\n")
+        os.chmod(script, 0o755)
+
+    def test_whisper_cpp_gets_model_flag_when_model_exists(self):
+        # S1: the model path is passed explicitly with -m.
+        from unittest import mock
+        from forge.browser import media
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "whisper-bin")
+            os.makedirs(bindir)
+            argv_log = os.path.join(tmp, "argv.txt")
+            self._fake_whisper_cpp(bindir, argv_log)
+            model = os.path.join(tmp, "base.en")
+            with open(model, "wb") as handle:
+                handle.write(b"fake model")
+            audio = os.path.join(tmp, "a.wav")
+            with open(audio, "wb") as handle:
+                handle.write(b"fake audio")
+            env = {"PATH": bindir + os.pathsep + os.environ["PATH"],
+                   "FORGE_WHISPER_MODEL_PATH": model,
+                   "FORGE_TRANSCRIBE_CMD": ""}
+            with mock.patch.dict(os.environ, env):
+                text, reason = media.transcribe_saved_audio_detailed(audio)
+            self.assertEqual(text, "hello from whisper")
+            self.assertIsNone(reason)
+            with open(argv_log, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertIn("-m", argv)
+            self.assertIn(model, argv)
+
+    def test_whisper_cpp_omits_model_flag_when_model_missing(self):
+        # S1: with no model file, no -m — whisper.cpp falls back
+        # to its own default relative path, as before.
+        from unittest import mock
+        from forge.browser import media
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "whisper-bin")
+            os.makedirs(bindir)
+            argv_log = os.path.join(tmp, "argv.txt")
+            self._fake_whisper_cpp(bindir, argv_log)
+            audio = os.path.join(tmp, "a.wav")
+            with open(audio, "wb") as handle:
+                handle.write(b"fake audio")
+            env = {"PATH": bindir + os.pathsep + os.environ["PATH"],
+                   "FORGE_WHISPER_MODEL_PATH": os.path.join(tmp, "nope.bin"),
+                   "FORGE_TRANSCRIBE_CMD": ""}
+            with mock.patch.dict(os.environ, env):
+                text, reason = media.transcribe_saved_audio_detailed(audio)
+            self.assertEqual(text, "hello from whisper")
+            self.assertIsNone(reason)
+            with open(argv_log, encoding="utf-8") as handle:
+                argv = handle.read().splitlines()
+            self.assertNotIn("-m", argv)
+
+    def test_transcribe_detailed_reasons(self):
+        # S2: no backend, a failing backend, and silence each get
+        # their own reason — the dock and CLI can say the right
+        # sentence for each.
+        import sys
+        from unittest import mock
+        from forge.browser import media
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = os.path.join(tmp, "a.wav")
+            with open(audio, "wb") as handle:
+                handle.write(b"fake audio")
+            # No backend anywhere on PATH and no faster-whisper.
+            env = {"PATH": tmp, "FORGE_TRANSCRIBE_CMD": ""}
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.dict(sys.modules, {"faster_whisper": None}):
+                    self.assertEqual(
+                        media.transcribe_saved_audio_detailed(audio),
+                        ("", "no-transcriber"))
+            # A backend that exits nonzero.
+            env = {"PATH": tmp,
+                   "FORGE_TRANSCRIBE_CMD": "false {path} {out_dir}"}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(
+                    media.transcribe_saved_audio_detailed(audio),
+                    ("", "failed"))
+            # A backend that runs but hears nothing.
+            script = os.path.join(tmp, "quiet.sh")
+            with open(script, "w") as handle:
+                handle.write("#!/bin/sh\n: > \"$2/transcript.txt\"\n")
+            os.chmod(script, 0o755)
+            env = {"PATH": tmp,
+                   "FORGE_TRANSCRIBE_CMD": f"{script} {{path}} {{out_dir}}"}
+            with mock.patch.dict(os.environ, env):
+                self.assertEqual(
+                    media.transcribe_saved_audio_detailed(audio),
+                    ("", "no-speech"))
+
+    def test_transcribe_cleans_its_temp_dirs(self):
+        # S5: the transcribe temp dirs are removed afterwards —
+        # /tmp must not fill with forge-transcribe-* litter.
+        import glob
+        from unittest import mock
+        from forge.browser import media
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "fake.sh")
+            with open(script, "w") as handle:
+                handle.write("#!/bin/sh\necho hi > \"$2/transcript.txt\"\n")
+            os.chmod(script, 0o755)
+            audio = os.path.join(tmp, "a.wav")
+            with open(audio, "wb") as handle:
+                handle.write(b"fake audio")
+            pattern = os.path.join(tempfile.gettempdir(),
+                                   "forge-transcribe-*")
+            before = glob.glob(pattern)
+            env = {"FORGE_TRANSCRIBE_CMD": f"{script} {{path}} {{out_dir}}"}
+            with mock.patch.dict(os.environ, env):
+                media.transcribe_saved_audio(audio)
+            self.assertEqual(glob.glob(pattern), before)
+
+    def test_faster_whisper_is_local_only(self):
+        # S6: faster-whisper is called with local_files_only=True,
+        # so a missing model errors instead of downloading ~150 MB.
+        import sys
+        import types
+        from unittest import mock
+        from forge.browser import media
+        seen = {}
+
+        class FakeModel:
+            def __init__(self, *args, **kwargs):
+                seen.update(kwargs)
+
+            def transcribe(self, path):
+                return [types.SimpleNamespace(text="hello")], None
+
+        fake_module = types.ModuleType("faster_whisper")
+        fake_module.WhisperModel = FakeModel
+        with tempfile.TemporaryDirectory() as tmp:
+            audio = os.path.join(tmp, "a.wav")
+            with open(audio, "wb") as handle:
+                handle.write(b"fake audio")
+            env = {"PATH": tmp, "FORGE_TRANSCRIBE_CMD": ""}
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.dict(sys.modules,
+                                     {"faster_whisper": fake_module}):
+                    text = media.transcribe_saved_audio(audio)
+        self.assertEqual(text, "hello")
+        self.assertIs(seen.get("local_files_only"), True)
+
 
 # ----------------------------------------------------------------------
 # Barriers
@@ -602,6 +1289,203 @@ class BarrierTests(unittest.TestCase):
         session = _StubSession()
         self.assertEqual(barriers.dismiss_consent(session), "Reject all")
         self.assertEqual(session.clicked, [0])
+
+
+class _RetrySession:
+    """A consent banner whose first button fails to click."""
+
+    def __init__(self):
+        self.clicked = []
+
+    def elements(self):
+        return [{"i": 0, "tag": "button", "text": "Reject all"},
+                {"i": 1, "tag": "button", "text": "Reject all"}]
+
+    def click(self, index):
+        if index == 0:
+            raise RuntimeError("click missed")
+        self.clicked.append(index)
+        return True
+
+
+class _HandlePageSession:
+    """A stub CDP session for handle_page: html() changes after
+    the age-gate button is clicked; fill_login records its call."""
+
+    def __init__(self, html_before, html_after, buttons):
+        self._before = html_before
+        self._after = html_after
+        self._buttons = buttons
+        self._gate_clicked = False
+        self.clicked = []
+        self.filled = None
+        self.navigated = None
+
+    def navigate(self, url):
+        self.navigated = url
+
+    def html(self):
+        return self._after if self._gate_clicked else self._before
+
+    def elements(self):
+        return [{"i": i, "tag": "button", "text": text}
+                for i, text in enumerate(self._buttons)]
+
+    def click(self, index):
+        self.clicked.append(index)
+        self._gate_clicked = True
+        return True
+
+    def fill_login(self, username, password, submit=False):
+        self.filled = (username, password, submit)
+        return {"filled_fields": 2, "submitted": bool(submit)}
+
+
+class BarrierAuditTests(unittest.TestCase):
+    """Audit #19: gates must appear in a gate context — articles
+    about gates, login boxes, and loaded scripts do not flag."""
+
+    def test_article_about_gates_flags_nothing(self):
+        # Y1/Y8: an article discussing paywalls, CAPTCHAs, age
+        # verification, and logins is not itself gated.
+        html = ("<html><body><article><p>Paywalls changed online "
+                "news. CAPTCHAs try to tell humans from bots, and "
+                "this article explains how reCAPTCHA works and why "
+                "publishers use a paywall. Age verification laws "
+                "are debated in several states. Many sites ask "
+                "visitors to log in, and the login form sits in "
+                "the header beside the search box.</p></article>"
+                "</body></html>")
+        self.assertEqual(barriers.detect_barriers(html), [])
+
+    def test_login_box_on_readable_page_flags_nothing(self):
+        # Y1/Y8: a password field in the header of a readable
+        # article is a login box, not a gate.
+        article = "The quick brown fox jumps over the lazy dog. " * 20
+        html = ("<html><body><header><form>"
+                "<input type=\"password\" name=\"pw\"></form></header>"
+                f"<article><p>{article}</p></article></body></html>")
+        self.assertEqual(barriers.detect_barriers(html), [])
+
+    def test_login_page_still_flags(self):
+        # Y1: a password field on a page too short to be anything
+        # but the login form still flags.
+        html = ("<html><body><p>Welcome back.</p><form>"
+                "<input type=\"password\" name=\"pw\"></form>"
+                "</body></html>")
+        kinds = [b["kind"] for b in barriers.detect_barriers(html)]
+        self.assertEqual(kinds, ["login"])
+
+    def test_script_only_recaptcha_flags_nothing(self):
+        # Y1/Y8: a page that only LOADS the reCAPTCHA script
+        # (invisible v3, no check shown) is not gated.
+        html = ("<html><head><script src=\"https://www.google.com/"
+                "recaptcha/api.js\"></script></head><body>"
+                "<p>Welcome to the article.</p></body></html>")
+        self.assertEqual(barriers.detect_barriers(html), [])
+        inline = ("<html><body><script>var x = \"recaptcha\";"
+                  "</script><p>Welcome.</p></body></html>")
+        self.assertEqual(barriers.detect_barriers(inline), [])
+
+    def test_recaptcha_widget_still_flags(self):
+        # Y1: the widget div in the markup is a real gate.
+        html = "<div class=\"g-recaptcha\"></div>"
+        kinds = [b["kind"] for b in barriers.detect_barriers(html)]
+        self.assertEqual(kinds, ["captcha"])
+        html = "<div class=\"h-captcha\" data-sitekey=\"x\"></div>"
+        kinds = [b["kind"] for b in barriers.detect_barriers(html)]
+        self.assertEqual(kinds, ["captcha"])
+
+    def test_js_shell_is_the_known_blind_spot(self):
+        # Y8/Y9: a JS app shell has no markers in the raw HTML, so
+        # the fetch path reports clear — and a JS-rendered barrier
+        # would be missed. The CDP path (handle_page) is the
+        # answer for those; this test documents the blind spot.
+        html = ("<html><body><div id=\"app\"></div>"
+                "<script src=\"/bundle.js\"></script></body></html>")
+        self.assertEqual(barriers.detect_barriers(html), [])
+
+    def test_paywall_phrase_still_flags_with_soft_note(self):
+        # Y7: the note says "may be" — preview-only was never
+        # verified.
+        html = "<p>Subscribe to continue reading</p>"
+        found = barriers.detect_barriers(html)
+        self.assertEqual([b["kind"] for b in found], ["paywall"])
+        self.assertIn("may be behind a paywall", found[0]["note"])
+
+    def test_non_english_markers(self):
+        # Y5: German CAPTCHA, French paywall.
+        html = "<p>Ich bin kein Roboter</p>"
+        kinds = [b["kind"] for b in barriers.detect_barriers(html)]
+        self.assertEqual(kinds, ["captcha"])
+        html = "<p>Abonnez-vous pour continuer à lire</p>"
+        kinds = [b["kind"] for b in barriers.detect_barriers(html)]
+        self.assertEqual(kinds, ["paywall"])
+
+    def test_barrier_carries_site(self):
+        # Y4: the url parameter lands on the barrier as its site.
+        html = "<div class=\"g-recaptcha\"></div>"
+        found = barriers.detect_barriers(
+            html, "https://news.example.org/story")
+        self.assertEqual(found[0]["site"], "news.example.org")
+        found = barriers.detect_barriers(html)
+        self.assertEqual(found[0]["site"], "")
+
+    def test_click_labelled_retries_after_failure(self):
+        # Y6: a failed click tries the next matching element.
+        session = _RetrySession()
+        self.assertEqual(barriers.dismiss_consent(session), "Reject all")
+        self.assertEqual(session.clicked, [1])
+
+    def test_handle_page_clears_age_gate(self):
+        # Y3: the confirm button is clicked, and the barriers are
+        # re-detected after the click.
+        before = ("<html><body><p>Confirm you are over 18 to enter."
+                  "</p><button>I am over 18</button></body></html>")
+        after = ("<html><body><p>Welcome to the article about gears."
+                 "</p></body></html>")
+        session = _HandlePageSession(before, after, ["I am over 18"])
+        result = barriers.handle_page(
+            session, "https://example.org/gated")
+        self.assertTrue(result["age_gate_cleared"])
+        self.assertEqual(result["barriers"], [])
+        self.assertFalse(result["needs_human"])
+        self.assertEqual(session.clicked, [0])
+
+    def test_handle_page_fills_login_from_vault(self):
+        # Y2: a vault entry fills the login — never submitted.
+        from forge.browser.vault import Vault
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vault.json")
+            vault = Vault.create(path, "correct horse battery")
+            vault.set("example.org", "joshua", "s3cret-pass", "")
+            html = ("<html><body><p>Sign in to continue</p><form>"
+                    "<input type=\"text\" name=\"user\">"
+                    "<input type=\"password\" name=\"pw\"></form>"
+                    "</body></html>")
+            session = _HandlePageSession(html, html, [])
+            result = barriers.handle_page(
+                session, "https://example.org/login", vault=vault)
+            self.assertTrue(result["login_filled"])
+            self.assertEqual(session.filled,
+                             ("joshua", "s3cret-pass", False))
+
+    def test_handle_page_without_vault_entry_reports_login(self):
+        # Y2: no vault entry, no fill — the login still reports.
+        from forge.browser.vault import Vault
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vault.json")
+            vault = Vault.create(path, "correct horse battery")
+            html = ("<html><body><p>Sign in to continue</p><form>"
+                    "<input type=\"password\" name=\"pw\"></form>"
+                    "</body></html>")
+            session = _HandlePageSession(html, html, [])
+            result = barriers.handle_page(
+                session, "https://example.org/login", vault=vault)
+            self.assertFalse(result["login_filled"])
+            self.assertEqual([b["kind"] for b in result["barriers"]],
+                             ["login"])
+            self.assertTrue(result["needs_human"])
 
 
 # ----------------------------------------------------------------------
@@ -701,7 +1585,8 @@ class ResearchTests(unittest.TestCase):
 
     def test_start_research_job_runs_in_background(self):
         import threading
-        from forge.browser.research import research_job_running, start_research_job
+        from forge.browser.research import (
+            research_job_running, research_queue, start_research_job)
         started = threading.Event()
         release = threading.Event()
 
@@ -719,28 +1604,34 @@ class ResearchTests(unittest.TestCase):
             release.wait(timeout=10)
             return Found()
 
-        done = {}
+        done = []
         done_event = threading.Event()
 
         def on_done(report, sources, error):
-            done["report"] = report
-            done["sources"] = sources
-            done["error"] = error
-            done_event.set()
+            done.append((report, error))
+            if len(done) == 2:
+                done_event.set()
 
         topic = start_research_job("Test topic", on_progress=lambda t: None,
                                    on_done=on_done,
                                    search_fn=fake_search, fetch_fn=fake_fetch)
         self.assertEqual(topic, "Test topic")
         self.assertTrue(started.wait(timeout=5))
-        # Still running: a second job is refused (strictly sequential).
+        # Still running: a second job queues behind it (F1) instead of
+        # being refused — strictly sequential, one at a time.
         self.assertEqual(research_job_running(), "Test topic")
-        self.assertIsNone(start_research_job("Other topic", on_done=on_done))
+        self.assertEqual(start_research_job(
+            "Other topic", on_done=on_done,
+            search_fn=fake_search, fetch_fn=fake_fetch), "Other topic")
+        self.assertEqual(research_queue(), ["Other topic"])
         release.set()
-        self.assertTrue(done_event.wait(timeout=5))
-        self.assertIn("The source says the thing plainly.", done["report"])
-        self.assertIsNone(done["error"])
+        self.assertTrue(done_event.wait(timeout=10))
+        self.assertIn("The source says the thing plainly.", done[0][0])
+        self.assertIsNone(done[0][1])
+        self.assertIn("Research: Other topic", done[1][0])
+        self.assertIsNone(done[1][1])
         self.assertIsNone(research_job_running())
+        self.assertEqual(research_queue(), [])
 
     def test_research_keeps_fetch_side_barriers(self):
         # A fetcher that already detected a captcha in the raw HTML:
@@ -844,6 +1735,117 @@ class WebUITests(unittest.TestCase):
         finally:
             webui.keyless_search = original
 
+    def test_compare_export_routes_serve(self):
+        import urllib.request
+        from forge.browser import compare as compare_module
+        from forge.browser import webui
+        rows = [{"title": "Gear A", "url": "http://a.example/",
+                 "fields": {"price": "$42"}},
+                {"title": "Gear B", "url": "http://b.example/",
+                 "fields": {"price": "$55"}}]
+        compare_module.set_last_comparison(rows, ["price"])
+        server = webui.LocalPageServer().start()
+        try:
+            with urllib.request.urlopen(
+                    server.home_url + "compare.csv",
+                    timeout=5) as response:
+                csv_body = response.read().decode()
+                disposition = response.headers.get("Content-Disposition")
+            self.assertIn("Field,Gear A,Gear B", csv_body)
+            self.assertIn("price,$42,$55", csv_body)
+            self.assertIn("comparison.csv", disposition or "")
+            md_body = urllib.request.urlopen(
+                server.home_url + "compare.md", timeout=5).read().decode()
+            self.assertIn("| Gear A (a.example) | Gear B (b.example) |",
+                          md_body)
+            refresh = urllib.request.urlopen(
+                server.home_url + "compare-refresh",
+                timeout=5).read().decode()
+            self.assertIn("$42", refresh)
+            self.assertIn("<table>", refresh)
+        finally:
+            server.stop()
+
+    def test_history_routes_serve(self):
+        # N11: /history lists visits with a search box; the clear
+        # route asks first and only wipes on ?confirm=1.
+        import os as _os
+        import tempfile as _tempfile
+        import urllib.request
+        from forge.browser import titles as titles_module
+        from forge.browser import webui
+        with _tempfile.TemporaryDirectory() as tmp:
+            old = _os.environ.get("FORGE_BROWSER_HISTORY_PATH")
+            _os.environ["FORGE_BROWSER_HISTORY_PATH"] = _os.path.join(
+                tmp, "h.json")
+            try:
+                titles_module.record_visit("https://gears.example/",
+                                           "Gear Guide")
+                server = webui.LocalPageServer().start()
+                try:
+                    page = urllib.request.urlopen(
+                        server.home_url + "history", timeout=5).read().decode()
+                    self.assertIn("Gear Guide", page)
+                    self.assertIn("Clear history", page)
+                    ask = urllib.request.urlopen(
+                        server.home_url + "history-clear",
+                        timeout=5).read().decode()
+                    self.assertIn("Clear history?", ask)
+                    self.assertEqual(len(titles_module.load_history()), 1)
+                    done = urllib.request.urlopen(
+                        server.home_url + "history-clear?confirm=1",
+                        timeout=5).read().decode()
+                    self.assertIn("History cleared", done)
+                    self.assertEqual(titles_module.load_history(), [])
+                finally:
+                    server.stop()
+            finally:
+                if old is None:
+                    _os.environ.pop("FORGE_BROWSER_HISTORY_PATH", None)
+                else:
+                    _os.environ["FORGE_BROWSER_HISTORY_PATH"] = old
+
+    def test_research_routes_serve(self):
+        # Q4: /research lists saved reports; /research/<file>
+        # renders one; the start page links to the list.
+        import os as _os
+        import tempfile as _tempfile
+        import urllib.request
+        from forge.browser import webui
+        from forge.browser.research import list_reports, save_report
+        with _tempfile.TemporaryDirectory() as tmp:
+            old = _os.environ.get("FORGE_BROWSER_RESEARCH_DIR")
+            _os.environ["FORGE_BROWSER_RESEARCH_DIR"] = tmp
+            try:
+                save_report("Gears", "# Research: Gears\n\ntext one")
+                server = webui.LocalPageServer().start()
+                try:
+                    listed = urllib.request.urlopen(
+                        server.home_url + "research",
+                        timeout=5).read().decode()
+                    self.assertIn("Gears", listed)
+                    name = list_reports()[0]["name"]
+                    one = urllib.request.urlopen(
+                        server.home_url + "research/" + name,
+                        timeout=5).read().decode()
+                    self.assertIn("Research: Gears", one)
+                    home = urllib.request.urlopen(
+                        server.home_url, timeout=5).read().decode()
+                    self.assertIn("/research", home)
+                    self.assertIn("Gears", home)
+                    # A name that is not a listed report: no file.
+                    missing = urllib.request.urlopen(
+                        server.home_url + "research/nope.md",
+                        timeout=5).read().decode()
+                    self.assertIn("No such report", missing)
+                finally:
+                    server.stop()
+            finally:
+                if old is None:
+                    _os.environ.pop("FORGE_BROWSER_RESEARCH_DIR", None)
+                else:
+                    _os.environ["FORGE_BROWSER_RESEARCH_DIR"] = old
+
     def test_start_page_shows_grouped_history(self):
         from forge.browser import titles as titles_module
         from forge.browser import webui
@@ -891,6 +1893,97 @@ class WebUITests(unittest.TestCase):
                 page = webui.start_page()
         self.assertIn("Morning brief", page)
         self.assertIn("No brief yet", page)
+
+    def test_start_page_shows_all_brief_pages(self):
+        # U5: the start page lists every brief page, not the
+        # first 6 — it matches the CLI and chat lists.
+        import json
+        from unittest import mock
+        from forge.browser import brief as brief_module
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                forge_dir = os.path.join(tmp, ".forge")
+                os.makedirs(forge_dir)
+                day = brief_module.yesterday_date()
+                pages = [{"url": f"http://p{i}.example/",
+                          "title": f"Page {i}"} for i in range(8)]
+                with open(os.path.join(forge_dir, f"brief-{day}.json"), "w") as handle:
+                    json.dump({"date": day, "summary": None,
+                               "pages": pages}, handle)
+                page = webui.start_page()
+        for i in range(8):
+            self.assertIn(f"Page {i}", page)
+        self.assertIn("/brief-refresh", page)
+
+    def test_start_page_shows_today_so_far(self):
+        # U6: today's pages so far appear alongside yesterday's
+        # brief, as a list.
+        from unittest import mock
+        from forge.browser import titles as titles_module
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = os.path.join(tmp, "h.json")
+            page_path = os.path.join(tmp, "p.json")
+            with open(page_path, "w") as handle:
+                json.dump({"pages": []}, handle)
+            env = {"HOME": tmp,
+                   "FORGE_BROWSER_HISTORY_PATH": history_path,
+                   "FORGE_BROWSER_PAGE_MEMORY_PATH": page_path}
+            with mock.patch.dict(os.environ, env):
+                titles_module.record_visit("http://today.example/x",
+                                           "Today Page")
+                page = webui.start_page()
+        self.assertIn("Today so far", page)
+        self.assertIn("Today Page", page)
+
+    def test_brief_refresh_route_rebuilds(self):
+        # U7: /brief-refresh starts a forced rebuild in the
+        # background and says to reload in a minute; with AI off
+        # it refuses instead.
+        import json as _json
+        import time as _time
+        import urllib.request
+        from unittest import mock
+        from forge.browser import brief as brief_module
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            seats_path = os.path.join(tmp, "seats.json")
+            with open(seats_path, "w") as handle:
+                _json.dump({"ai_enabled": True,
+                            "features": {"chat": True}}, handle)
+            env = {"HOME": tmp, "FORGE_BROWSER_SEATS_PATH": seats_path}
+            with mock.patch.dict(os.environ, env):
+                with mock.patch.object(brief_module,
+                                       "build_brief") as rebuilt:
+                    server = webui.LocalPageServer().start()
+                    try:
+                        body = urllib.request.urlopen(
+                            server.home_url + "brief-refresh",
+                            timeout=5).read().decode()
+                        self.assertIn("Rebuilding the brief", body)
+                        self.assertIn("reload", body)
+                        for _ in range(50):
+                            if rebuilt.call_count:
+                                break
+                            _time.sleep(0.1)
+                        self.assertEqual(rebuilt.call_count, 1)
+                        self.assertTrue(
+                            rebuilt.call_args[1].get("force"))
+                    finally:
+                        server.stop()
+            with open(seats_path, "w") as handle:
+                _json.dump({"ai_enabled": False,
+                            "features": {"chat": True}}, handle)
+            with mock.patch.dict(os.environ, env):
+                server = webui.LocalPageServer().start()
+                try:
+                    body = urllib.request.urlopen(
+                        server.home_url + "brief-refresh",
+                        timeout=5).read().decode()
+                    self.assertIn("AI is off", body)
+                finally:
+                    server.stop()
 
     def test_app_without_qt_says_how_to_fix(self):
         try:
@@ -1032,9 +2125,77 @@ class EnginePinTests(unittest.TestCase):
             self.assertEqual(version, "1.0.3")
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
 
-    def test_chromium_pin_is_a_revision(self):
+    def test_chromium_pin_carries_revision_and_hashes(self):
+        # AA1/AA2: the Chromium pin is the revision + the zip's
+        # SHA-256 (verifies the download) + the extracted chrome
+        # binary's SHA-256 (re-verifies the installed tree).
+        import re
         pins = self._pins()
-        self.assertEqual(pins["chromium-linux-x64"], ["1741687"])
+        revision, zip_hash, bin_hash = pins["chromium-linux-x64"]
+        self.assertEqual(revision, "1741687")
+        self.assertRegex(zip_hash, r"^[0-9a-f]{64}$")
+        self.assertRegex(bin_hash, r"^[0-9a-f]{64}$")
+
+    def test_install_verifies_chromium_against_pinned_hash(self):
+        # AA1: the download is verified against the SHA-256 from
+        # engine-pins.txt, not the GCS metadata MD5 (same source
+        # as the bytes). The metadata fetch is gone.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "install.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertIn("CHROME_ZIP_HASH", script)
+        self.assertIn('echo "$CHROME_ZIP_HASH  $ZIP" | sha256sum -c -', script)
+        self.assertNotIn("EXPECTED_MD5", script)
+        self.assertNotIn("md5Hash", script)
+
+    def test_installed_chromium_is_reverified(self):
+        # AA2: the installed chrome binary is re-verified by hash
+        # on --check and on install, matching lp_installed_ok —
+        # the REVISION file alone is not trusted.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "install.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertIn("chrome_installed_ok()", script)
+        self.assertIn('echo "$CHROME_BIN_HASH  $CHROME_BIN" | sha256sum -c -', script)
+        self.assertIn('if chrome_installed_ok; then', script)
+        self.assertIn('elif chrome_installed_ok; then', script)
+
+    def test_chromium_extraction_is_atomic(self):
+        # AA3: extraction goes to a temp dir and swaps into place;
+        # the old tree is kept aside until the swap succeeds.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "install.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertIn('EXTRACT_DIR="$CHROME_DIR/.extract"', script)
+        self.assertIn('python3 -m zipfile -e "$ZIP" "$EXTRACT_DIR/"', script)
+        self.assertIn('mv "$CHROME_DIR/chrome-linux" "$CHROME_DIR/chrome-linux.old"', script)
+        self.assertIn('mv "$EXTRACT_DIR/chrome-linux" "$CHROME_DIR/chrome-linux"', script)
+        self.assertNotIn('python3 -m zipfile -e "$ZIP" "$CHROME_DIR/"', script)
+
+    def test_curl_downloads_retry_and_resume(self):
+        # AA4: every curl download retries transient failures and
+        # resumes a broken download instead of restarting.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        curl_lines = []
+        for name in ("install.sh", "browser-setup.sh"):
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                for line in handle:
+                    if "curl " in line and not line.strip().startswith("#"):
+                        curl_lines.append((name, line))
+        self.assertGreaterEqual(len(curl_lines), 4)
+        for name, line in curl_lines:
+            self.assertIn("--retry", line, (name, line))
+            self.assertIn("--continue-at -", line, (name, line))
+
+    def test_chmod_tightened_to_known_executables(self):
+        # AA5: the whole-tree chmod is gone; only the known
+        # executables get +x.
+        root = os.path.join(os.path.dirname(__file__), "..")
+        with open(os.path.join(root, "install.sh"), encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertNotIn('chmod +x "$CHROME_DIR/chrome-linux/"*', script)
+        self.assertIn("for _exe in chrome chrome-wrapper chrome_crashpad_handler chrome_sandbox; do",
+                      script)
 
     def test_install_scripts_fetch_no_nightly(self):
         # No unpinned download URL may survive: the nightly tag or
@@ -1076,6 +2237,29 @@ class EnginePinTests(unittest.TestCase):
         self.assertIsNone(status["lightpanda_version"])
         self.assertIsNone(status["chromium_revision"])
 
+    def test_engine_status_lists_all_transcription_backends(self):
+        # S8: the status names every installed transcriber, not
+        # just the `whisper` CLI — the Settings engines panel
+        # shows what the machine actually has.
+        from unittest import mock
+        from forge.browser import engines as engines_module
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "whisper-bin")
+            os.makedirs(bindir)
+            for name in ("whisper", "whisper-cli"):
+                path = os.path.join(bindir, name)
+                with open(path, "w") as handle:
+                    handle.write("#!/bin/sh\nexit 0\n")
+                os.chmod(path, 0o755)
+            env = {"PATH": bindir, "FORGE_TRANSCRIBE_CMD": ""}
+            with mock.patch.dict(os.environ, env):
+                backends = engines_module.transcription_backends()
+                status = engines_module.engine_status()
+        self.assertIn("whisper CLI", backends)
+        self.assertIn("whisper.cpp (whisper-cli)", backends)
+        self.assertIn("whisper CLI", status["transcription"])
+        self.assertIn("whisper.cpp (whisper-cli)", status["transcription"])
+
 
 class InstallerTests(unittest.TestCase):
     """The double-click installer (Release retrofit, 2026-11-12):
@@ -1105,6 +2289,18 @@ class InstallerTests(unittest.TestCase):
                 if line and not line.startswith("#"):
                     names.append(line)
         return names
+
+    def test_install_sh_offers_whisper_model(self):
+        # S12: install.sh offers the whisper.cpp model fetch as
+        # an opt-in flag, from the stable HuggingFace URL, into
+        # the path the transcriber reads.
+        with open(os.path.join(self._root(), "install.sh"),
+                  encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertIn("--with-whisper", script)
+        self.assertIn("FORGE_BROWSER_INSTALL_WHISPER", script)
+        self.assertIn("ggml-base.en.bin", script)
+        self.assertIn(".forge/whisper/base.en", script)
 
     def test_installer_is_double_clickable(self):
         # The installer IS the double-click target: a script with a
@@ -1155,6 +2351,22 @@ class InstallerTests(unittest.TestCase):
                 ["sh", "-n", os.path.join(self._root(), name)],
                 capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
+
+    def test_install_pulls_embed_model(self):
+        # I1: install.sh pulls nomic-embed-text when Ollama is
+        # present (best-effort, never fails the install) and
+        # reports only under --check.
+        with open(os.path.join(self._root(), "install.sh"),
+                  encoding="utf-8") as handle:
+            script = handle.read()
+        self.assertIn("ollama pull nomic-embed-text", script)
+        self.assertIn('grep -q "nomic-embed-text"', script)
+        self.assertIn("CHECK_ONLY", script)
+        # Best-effort: the pull branch must not set FAIL.
+        pull_section = script[script.index("Retrieval model"):]
+        pull_section = pull_section[:pull_section.index(
+            "Optional seats (report only)")]
+        self.assertNotIn("FAIL=1", pull_section)
 
     def test_install_gui_compiles(self):
         import py_compile

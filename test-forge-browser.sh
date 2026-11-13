@@ -14,7 +14,7 @@ ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
 step() { echo; echo "=== $1 ==="; }
 
-step "1. Unit tests (offline, 216 checks)"
+step "1. Unit tests (offline, 477 checks)"
 if $PY -m unittest discover -s tests -p "test_browser*.py" 2>&1 | grep -q "^OK"; then
     ok "unit tests"
 else

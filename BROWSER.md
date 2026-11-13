@@ -116,11 +116,24 @@ beats the automatic choice. "(auto)" means no pick saved.
   and by fetch-any on image files.
 - AI off: every AI feature stops — chat, tidy titles, memory
   context and page recording, summarize, brief, compare,
-  research, and voice. The browser itself keeps working.
+  research, voice, and image describing. Flipping it off
+  mid-turn stops the turn in progress, not just the next one.
+  The browser itself keeps working.
 - Chat off: the dock is quiet, but tidy titles and memory keep
   running. Tidy titles off: tabs keep their raw titles.
   Memory off: remembered facts are never offered as context
   and pages are not recorded for recall.
+- The morning brief and the terminal `voice` command are gated
+  on Chat, like the dock mic. Image describing is gated on the
+  master AI switch only — Chat off does not kill it. The
+  terminal `transcribe` command is a file utility, not an AI
+  feature, and is not gated.
+
+The picker shows each model's size next to its name, and the
+Brain combo's "(auto)" entry names the model auto would pick.
+Embedding models are not offered as Brain or Fast. A saved pick
+for a model that is no longer installed shows as "(not
+installed)" instead of hiding behind "(auto)".
 
 The terminal has the same controls: `seats` lists the picks
 and toggles; `seats brain qwen3:4b`, `seats brain auto`,
@@ -155,15 +168,31 @@ command line, `allow_local=True` in code, or
 you configured (FORGE_SEARXNG_URL) is allowed the same way — the
 configuration is the switch. The verify flow for project pages
 allows its own throwaway local server on its own. The browser
-window itself is not fenced: the person driving it can open
-anything, including the start page it serves locally.
+window itself is not fenced, by design: the person driving it can
+open anything, including the start page it serves locally. The
+fence guards the fetches the browser makes on a page's or a
+prompt's say-so, where the person is not choosing the address.
 
-DNS names are not resolved by the fence (a public name can resolve
-to a non-global address behind a proxy, so resolving would refuse
-ordinary browsing). A name that points at a private address is
-therefore not caught here — catching that needs the fetch to
-connect to the address the fence checked, which is out of scope
-for this fix.
+The env switch is all-or-nothing for the whole process:
+`FORGE_BROWSER_ALLOW_LOCAL=1` opens local fetching for every
+fetch, including brain-triggered ones. The scoped alternative is
+`allow_local=True` on one call.
+
+IP literals in non-dotted forms (2130706433, 0x7f.0.0.1,
+0177.0.0.1, 127.1) are normalized before the check — the socket
+layer accepts them, so an un-normalized fence would wave them
+through. Redirects are re-fenced on every hop: a public URL that
+302s to a local address is refused, not followed. DNS names are
+resolved and refused when they point at the local machine or the
+LAN; CGNAT (100.64/10) is allowed, because a public name can
+resolve there behind a proxy and CGNAT is ISP space, not this
+machine. One window remains: the fetch re-resolves after the
+fence's check, so a hostile DNS could in principle flip the
+answer between the two lookups (in practice the resolver usually
+caches the first answer); pinning the connection to the checked
+address would close that. Every refusal is recorded (host +
+reason) in `~/.forge/fence-log.json`, so steering attempts are
+visible afterwards.
 
 ## Engine downloads are pinned + verified
 
@@ -175,18 +204,35 @@ before it is installed. The pins live in `engine-pins.txt`:
   aarch64, each with a SHA-256 of the exact release bytes.
   `browser-setup.sh` uses the same pin.
 - Chromium snapshot revision **1741687** (Chromium 160.0.8156.0),
-  pinned for the window.
+  pinned for the window, with the zip's SHA-256 and the
+  extracted chrome binary's SHA-256.
 
 Lightpanda is checked with `sha256sum` against the pinned hash;
 a mismatch refuses the install and keeps whatever was there
-before. Google publishes no SHA-256 for Chromium snapshots, so
-the Chromium zip is verified against the MD5 in the object's own
-Google Cloud Storage metadata, plus a zip CRC check before
-extracting; if the metadata cannot be fetched, nothing is
-installed. Install writes a version record next to each engine
-(`lightpanda.version`, `chromium/REVISION`), and `engines`
-reports the installed version / revision. A re-run skips any
-engine whose installed version and hash already match the pin.
+before. The Chromium zip is checked the same way — against the
+SHA-256 recorded in `engine-pins.txt`, plus a zip CRC check
+before extracting. Google publishes no SHA-256 for snapshots,
+so the recorded hashes were computed once from a download
+verified against the GCS metadata (size + MD5, both matched);
+honest limit: a hash computed from a download proves the bytes
+match what was recorded, not that Google published them — what
+the pin catches is any later tamper or corruption. The installed
+chrome binary is re-verified by hash on every run, like
+Lightpanda; a corrupted or tampered binary fails even if the
+REVISION file says the right number. Chromium extracts to a
+temp dir and swaps into place, so an interrupted install never
+leaves a half-old / half-new live tree, and only the known
+executables (chrome, chrome-wrapper, chrome_crashpad_handler,
+chrome_sandbox) get +x. Every download retries transient
+failures and resumes a broken download instead of restarting
+from zero; a download failure keeps the partial file for the
+next run, a verification failure removes it. Install writes a
+version record next to each engine (`lightpanda.version`,
+`chromium/REVISION`), and `engines` reports the installed
+version / revision. A re-run skips any engine whose installed
+version and hash already match the pin. (PySide6 is pinned in
+`pyside-requirements.txt`, not here; in-code download resume
+lives in `_http.http_get_to_file`.)
 
 To bump a pin: update the version AND the hash in
 `engine-pins.txt` together — download the release, check its
@@ -230,8 +276,21 @@ local memory store, cached at `~/.forge/brief-YYYY-MM-DD.json`
 loads. The brain writes the summary when one is answering;
 otherwise the card is the plain list of pages. A day with no
 pages says so, and a failed brain call is not cached — the next
-launch retries. On demand: ask "give me my morning brief" in
-chat, or `python3 -m forge.browser brief` in the terminal.
+launch retries. A launch with no brain still caches the plain
+list so the card shows at once, but the summary fills in later:
+a cached summary-less brief is rebuilt as soon as a brain is
+available. The summary samples 12 pages spread across the day
+(600 chars each), and sensitive pages — banking, logins,
+checkout — never reach the brief, list or summary. Old brief
+files are pruned to the last 30 days. On demand: ask "give me
+my morning brief" in chat (a cached brief answers at once; an
+uncached one builds in the background and lands in the log when
+it is done), or `python3 -m forge.browser brief` in the
+terminal. The start page lists every page in the brief, has a
+"Refresh brief ↻" link that rebuilds it on demand, and shows
+"Today so far" — today's pages, listed live — alongside
+yesterday. `python3 -m forge.browser brief today` briefs today
+so far with a summary instead.
 
 ## Plan, run, interrupt
 
@@ -248,13 +307,30 @@ finishes first, then it stops, and nothing after it runs.
 ## Voice — hold to talk
 
 The chat dock has a "🎤 Hold to talk" button. Hold it, speak,
-release: the recording is transcribed on this machine (whisper.cpp,
-model `FORGE_WHISPER_MODEL`, default `base` — `base.en` is the
-English-only 148 MB one) and the text lands in the chat box for
-you to read and send — never sent on its own. Recording needs a
-system recorder: `arecord`, `parecord`, or `ffmpeg`. No recorder
-or nothing intelligible, and the dock says so plainly. Terminal
-version: `python3 -m forge.browser voice [seconds]` (default 5).
+release: the recording is transcribed on this machine and the
+text lands in the chat box for you to read and send — never sent
+on its own. While recording, the button shows the elapsed time
+and whether audio is arriving; recording stops itself at the
+2-minute cap. Recording needs a system recorder: `arecord`,
+`parecord`, or `ffmpeg` (first working one wins — if the first
+dies at once, the next is tried). Pin one with
+`FORGE_BROWSER_RECORDER` and pick a microphone with
+`FORGE_BROWSER_MIC_DEVICE` (e.g. `hw:1,0`). Terminal version:
+`python3 -m forge.browser voice [seconds]` (default 5, capped
+at 120).
+
+Transcription backends, in order: `FORGE_TRANSCRIBE_CMD` (a
+command template with `{file}`/`{path}` and `{out_dir}`), the
+`whisper` CLI, whisper.cpp (`whisper-cli`/`main`), faster-whisper
+(local files only — it never downloads a model unannounced).
+whisper.cpp gets the model file passed explicitly:
+`FORGE_WHISPER_MODEL_PATH`, default `~/.forge/whisper/base.en`
+(the English-only 148 MB one). Fetch it with
+`sh install.sh --with-whisper` (opt-in); the whisper.cpp binary
+itself comes from https://github.com/ggerganov/whisper.cpp
+(build it, or take a release binary) and goes on PATH. A failed
+transcription says which kind it was: no transcriber installed,
+the transcriber errored, or nothing was heard.
 
 ## Memory — what it remembers
 
@@ -374,8 +450,11 @@ description plus all visible text transcribed.
 
 Transcription — first working backend wins: `FORGE_TRANSCRIBE_CMD`
 (a command template with {file} and {out_dir}), the `whisper` CLI,
-whisper.cpp, or an installed faster-whisper package. Model:
-`FORGE_WHISPER_MODEL` (default `base`, sized for CPU).
+whisper.cpp, or an installed faster-whisper package (local files
+only). Model: `FORGE_WHISPER_MODEL` (default `base`, sized for
+CPU); whisper.cpp reads the model file at
+`FORGE_WHISPER_MODEL_PATH`, default `~/.forge/whisper/base.en` —
+fetch it with `sh install.sh --with-whisper`.
 
 ## Getting past site furniture and gates
 
@@ -453,7 +532,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (216 checks),
+`forge/browser/` (the package), `tests/` (477 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that

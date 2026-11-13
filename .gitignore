@@ -1,4 +1,24 @@
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 .forge/
+
+# Immutable rule (Joshua, 2026-11-13): sensitive information and
+# APIs are never stored in code. They live in environment files,
+# the OS keyring, or local user data — and those files are never
+# committed. Anything below holds, or could hold, a secret, a
+# token, a credential, or an API key.
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+*.pfx
+browser-vault.json
+*-vault.json
+*credentials*.json
+*secrets*.json
+*token*.json
+seats.json

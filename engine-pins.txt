@@ -11,7 +11,20 @@ lightpanda-aarch64-linux 1.0.3 20a5348bf3b6f71e41088223b188552ab550c1b9c9a9cbd8f
 #
 # Chromium snapshot revision 1741687 (Chromium 160.0.8156.0 — the
 # revision the v0.5 window was verified with on the real PC).
-# Google publishes no SHA-256 for snapshots; install.sh verifies the
-# download against the MD5 in the object's own Google Cloud Storage
-# metadata instead, plus a zip CRC check before extracting.
-chromium-linux-x64 1741687
+# Google publishes no SHA-256 for snapshots, so both hashes were
+# computed 2026-11-13 from a download verified against the GCS
+# metadata (size 258397444, MD5 NTKcUI5XHzwi+IgYatTYog== — both
+# matched): the zip's SHA-256 (field 3) verifies the download,
+# and the extracted chrome binary's SHA-256 (field 4) re-verifies
+# the installed tree on every run. Honest limit: a hash computed
+# from a download proves the bytes match what was recorded, not
+# that Google published them — a tamper baked in at recording
+# time would not be caught. What the pin does catch is any later
+# tamper or corruption, which the old metadata-MD5 check (same
+# source as the bytes) could not.
+chromium-linux-x64 1741687 ad9f5afa03ca3e44424d7a74f53730b9c037281ed15bea54556a5f62a95437f7 c6041b68d5a5c998e39717f94ab1944e0e9b0c5bd745624c6957a834870134a5
+#
+# Cross-refs (AA6): PySide6 is pinned in pyside-requirements.txt
+# (B-section), not here; download resume is the curl
+# --continue-at - flag on every download below (pairs with the
+# in-code resume in _http.http_get_to_file, task W3).

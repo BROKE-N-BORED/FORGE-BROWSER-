@@ -8,6 +8,7 @@ CLI (no API key, no account). Plain standard library.
 
 import html
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,13 +44,88 @@ a:hover { text-decoration: underline; }
   border-radius: 8px; padding: 14px 18px; margin-bottom: 28px; }
 .brief-box h2 { font-size: 18px; margin: 0 0 8px; }
 .brief-box .result { margin-bottom: 12px; }
+.tip { color: #9a958a; font-size: 14px; margin: 0 0 28px; }
+.tip b { color: #e8e4da; }
 """
+
+# Q5: the one dark page style for the browser's own engine-room
+# pages — compare.py and research.py build on this, so the app's
+# pages share one look instead of drifting apart.
+PAGE_STYLE = ("body{font-family:sans-serif;margin:24px;"
+              "background:#101216;color:#e8e4da}"
+              "a{color:#ffb347}")
+
+
+def _when(at):
+    """A history timestamp as 'Nov 12 14:02' — '' when missing."""
+    if not at:
+        return ""
+    try:
+        return time.strftime("%b %d %H:%M", time.localtime(at))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def history_page(query=None, cleared=False):
+    """The full history view (N11): every visit with its timestamp,
+    a search box, and a clear-history control."""
+    from .titles import load_history
+    entries = load_history()
+    total = len(entries)
+    if query:
+        lowered = query.lower()
+        entries = [e for e in entries
+                   if lowered in (e.get("title") or "").lower()
+                   or lowered in (e.get("url") or "").lower()]
+    note = ""
+    if cleared:
+        note = ('<p style="color:#7fae7a;">History cleared.</p>')
+    if query:
+        note += (f'<p class="sub">{len(entries)} of {total} visits '
+                 f'match "{html.escape(query)}".</p>')
+    elif total:
+        note += f'<p class="sub">{total} visits, newest first.</p>'
+    rows = []
+    for entry in entries:
+        rows.append(
+            f'<div class="result"><a class="t" href="{html.escape(entry["url"])}">'
+            f"{html.escape(entry.get('title') or entry['url'])}</a>"
+            f'<div class="u">{html.escape(entry["url"])}</div>'
+            f'<div class="s">{html.escape(_when(entry.get("at")))}</div></div>')
+    body = "\n".join(rows) or "<p>No history yet — pages you visit show up here.</p>"
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>History — Forge Browser</title><style>{_STYLE}</style></head>
+<body><div class="wrap">
+<h1>History</h1>
+<p class="sub"><a href="/">← Start page</a> · <a href="/history-clear">Clear history…</a></p>
+<form action="/history" method="get">
+<input type="text" name="q" value="{html.escape(query or "")}" placeholder="Search history">
+<button type="submit">Search</button>
+</form>
+{note}
+{body}
+</div></body></html>"""
+
+
+def history_clear_page():
+    """The clear-history confirmation (N3/N11) — a destructive
+    action gets a second look, not a one-click wipe."""
+    from .titles import load_history
+    count = len(load_history())
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Clear history — Forge Browser</title><style>{_STYLE}</style></head>
+<body><div class="wrap">
+<h1>Clear history?</h1>
+<p>This deletes all {count} recorded visits. It cannot be undone.</p>
+<p><a href="/history-clear?confirm=1">Yes, clear it</a> &nbsp;·&nbsp;
+<a href="/history">Cancel</a></p>
+</div></body></html>"""
 
 
 def start_page():
     from .bookmarks import list_bookmarks
-    from .brief import load_brief, yesterday_date
-    from .titles import grouped_history
+    from .brief import load_brief, today_pages, yesterday_date
+    from .titles import grouped_history, journeys
     status = html.escape(engines.format_status(engines.engine_status()))
     # Quick links: the person's bookmarks, first thing on the page.
     quick = ""
@@ -75,13 +151,31 @@ def start_page():
         parts = ['<h2>Morning brief</h2>']
         if cached.get("summary"):
             parts.append(f'<p>{html.escape(cached["summary"])}</p>')
-        for page in cached["pages"][:6]:
+        # U5: every page, not the first 6 — the start page matches
+        # the CLI and chat lists.
+        for page in cached["pages"]:
             parts.append(
                 f'<div class="result"><a class="t" href="{html.escape(page["url"])}">'
                 f"{html.escape(page['title'])}</a>"
                 f'<div class="u">{html.escape(page["url"])}</div></div>')
         brief = "\n".join(parts)
+    # U7: rebuild the brief on demand — a bad summary re-rolls
+    # without deleting the file by hand.
+    brief += ('<p><a href="/brief-refresh">Refresh brief ↻</a></p>')
     brief = f'<div class="brief-box">{brief}</div>'
+    # U6: today so far, alongside yesterday — a list only,
+    # computed live (today keeps changing, so it is not cached).
+    today = today_pages()
+    today_html = ""
+    if today:
+        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">'
+                 'Today so far</h2>']
+        for page in today:
+            parts.append(
+                f'<div class="result"><a class="t" href="{html.escape(page["url"])}">'
+                f"{html.escape(page['title'])}</a>"
+                f'<div class="u">{html.escape(page["url"])}</div></div>')
+        today_html = "\n".join(parts)
     recent = ""
     groups = grouped_history()
     if groups:
@@ -94,21 +188,103 @@ def start_page():
                     f'<div class="result"><a class="t" href="{html.escape(entry["url"])}">'
                     f"{html.escape(entry.get('title') or entry['url'])}</a>"
                     f'<div class="u">{html.escape(entry["url"])}</div></div>')
+        # N11: the full history view is one click away.
+        parts.append('<p><a href="/history">See all history →</a></p>')
         recent = "\n".join(parts)
+    # N2: journeys — browsing sessions, resumable by clicking any
+    # of their pages back open.
+    journey_html = ""
+    found = journeys()
+    if found:
+        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Journeys</h2>']
+        for journey in found[:4]:
+            span = _when(journey["started"])
+            if journey["ended"] != journey["started"]:
+                span += f" – {_when(journey['ended'])}"
+            parts.append(
+                f'<p style="color:#9a958a;margin:12px 0 4px;">'
+                f'{html.escape(journey["name"])} · {html.escape(span)}</p>')
+            for entry in journey["items"][:6]:
+                parts.append(
+                    f'<div class="result"><a class="t" href="{html.escape(entry["url"])}">'
+                    f"{html.escape(entry.get('title') or entry['url'])}</a>"
+                    f'<div class="u">{html.escape(entry["url"])}</div></div>')
+            extra = len(journey["items"]) - 6
+            if extra > 0:
+                parts.append(f'<p class="sub">+{extra} more in this journey — '
+                             f'<a href="/history">see all history</a>.</p>')
+        journey_html = "\n".join(parts)
+    # Q4: saved research reports — the latest few, one click from
+    # the full list. Nothing shows until a report exists.
+    research_html = ""
+    from .research import list_reports
+    reports = list_reports()
+    if reports:
+        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Research</h2>']
+        for report in reports[:4]:
+            parts.append(
+                f'<div class="result"><a class="t" href="/research/'
+                f'{html.escape(report["name"], quote=True)}">'
+                f"{html.escape(report['topic'])}</a>"
+                f'<div class="u">{html.escape(_when(report["at"]))}</div></div>')
+        parts.append('<p><a href="/research">See all reports →</a></p>')
+        research_html = "\n".join(parts)
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>FORGE BROWSER<span class="dot">.</span></h1>
 <p class="sub">Your browser. No accounts, no API keys, nothing tracked.</p>
+<p class="tip">Tip: in chat, write <b>@tab2</b> to ask about tab 2 — or compare tabs by number.</p>
 <form action="/search" method="get">
 <input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
 <button type="submit">Search</button>
 </form>
 {quick}
 {brief}
+{today_html}
 {recent}
+{journey_html}
+{research_html}
 <div class="status">{status}</div>
 </div></body></html>"""
+
+
+def research_list_page():
+    """Q4: every saved research report, newest first."""
+    from .research import list_reports
+    reports = list_reports()
+    if not reports:
+        body = ("<p>No research reports saved yet — ask the browser "
+                "to research something and the report lands here.</p>")
+    else:
+        parts = []
+        for report in reports:
+            when = _when(report["at"])
+            parts.append(
+                f'<div class="result"><a class="t" href="/research/'
+                f'{html.escape(report["name"], quote=True)}">'
+                f"{html.escape(report['topic'])}</a>"
+                f'<div class="u">{html.escape(when)}</div></div>')
+        body = "\n".join(parts)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Research reports — Forge Browser</title><style>{_STYLE}</style></head>
+<body><div class="wrap">
+<h1>Research reports</h1>
+<p class="sub"><a href="/">← Start page</a></p>
+{body}
+</div></body></html>"""
+
+
+def research_report_page(name):
+    """Q4: one saved report as HTML, or None when no such report
+    exists. The name must match a listed report exactly — no path
+    traversal out of the research dir."""
+    from .research import list_reports, report_to_html
+    for report in list_reports():
+        if report["name"] == name:
+            with open(report["path"], encoding="utf-8") as handle:
+                return report_to_html(handle.read())
+    return None
 
 
 def search_page(query, results=None):
@@ -153,14 +329,85 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         try:
+            content_type = "text/html; charset=utf-8"
+            disposition = None
             if parsed.path == "/search":
                 query = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
                 page = search_page(query)
+            elif parsed.path == "/history":
+                # N11: the full history view, with search.
+                query = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+                page = history_page(query or None)
+            elif parsed.path == "/research":
+                # Q4: the saved reports, newest first.
+                page = research_list_page()
+            elif parsed.path.startswith("/research/"):
+                # Q4: one saved report, rendered as a page.
+                page = research_report_page(parsed.path[len("/research/"):])
+                if page is None:
+                    page = ("<h1>No such report</h1><p><a href=\"/research\">"
+                            "← All reports</a></p>")
+            elif parsed.path == "/history-clear":
+                # N3/N11: confirm first; ?confirm=1 does the wipe.
+                params = urllib.parse.parse_qs(parsed.query)
+                if params.get("confirm", [""])[0] == "1":
+                    from .titles import clear_history
+                    clear_history()
+                    page = history_page(cleared=True)
+                else:
+                    page = history_clear_page()
+            elif parsed.path == "/brief-refresh":
+                # U7: rebuild the brief on demand, in the
+                # background — the page says to reload in a
+                # minute. Gated on the kill-switch (T2): no brain
+                # job runs while AI/chat is off.
+                from .seats import seats_enabled
+                if not seats_enabled("chat"):
+                    page = ('<h1>Morning brief</h1><p>AI is off — the '
+                            'brief does not build while AI/chat is off.</p>'
+                            '<p><a href="/">← Start page</a></p>')
+                else:
+                    def _rebuild_brief():
+                        from .brief import build_brief
+                        from .chat import ChatSession
+                        try:
+                            build_brief(ChatSession(), force=True)
+                        except Exception:
+                            pass
+
+                    threading.Thread(target=_rebuild_brief,
+                                     daemon=True).start()
+                    page = ('<h1>Morning brief</h1><p>Rebuilding the '
+                            'brief — reload the start page in a minute.</p>'
+                            '<p><a href="/">← Start page</a></p>')
+            elif parsed.path == "/compare.csv":
+                # M11: the last comparison as a CSV download.
+                from .compare import compare_table_csv, last_comparison
+                rows, fields = last_comparison()
+                page = compare_table_csv(rows, fields)
+                content_type = "text/csv; charset=utf-8"
+                disposition = 'attachment; filename="comparison.csv"'
+            elif parsed.path == "/compare.md":
+                # M11: the last comparison as a Markdown download.
+                from .compare import compare_table_text, last_comparison
+                rows, fields = last_comparison()
+                page = compare_table_text(rows, fields)
+                content_type = "text/markdown; charset=utf-8"
+                disposition = 'attachment; filename="comparison.md"'
+            elif parsed.path == "/compare-refresh":
+                # M11: the window intercepts this navigation and
+                # re-runs the comparison; a direct visit just shows
+                # the stored table again.
+                from .compare import compare_table_html, last_comparison
+                rows, fields = last_comparison()
+                page = compare_table_html(rows, fields)
             else:
                 page = start_page()
             body = page.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Type", content_type)
+            if disposition:
+                self.send_header("Content-Disposition", disposition)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
