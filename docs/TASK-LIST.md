@@ -1,11 +1,12 @@
 # Forge Browser — Task List
 
-**Source:** `forge-browser-improvements-2026-11-11.md` (the full guide — models,
+**Source:** `docs/IMPROVEMENTS.md` (the full guide — models,
 research, and the reasoning behind each item live there).
 **Rule:** one item at a time. Joshua names the number, Arlo builds it, verifies
 it, and only then moves on. Nothing is started unasked.
 **Status marks:** `[ ]` not started · `[~]` in progress · `[x]` done, verified on
 Joshua's real PC.
+**Suite:** 216 checks, all green.
 
 ## Suggested build order (the menu)
 

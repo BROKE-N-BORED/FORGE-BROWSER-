@@ -1,0 +1,16 @@
+# Scripts that ship with the exec bit set.
+#
+# The GitHub snapshot push stores every file as 100644, so a clone
+# cannot carry exec bits — this list is the single source of truth
+# for what ships executable, read by:
+#   - tests/test_browser2.py (InstallerTests: the installer must be
+#     listed here and carry a shebang)
+#   - install.sh (restores the bits on a clone install)
+#   - the Release zip builder (stores 0o100755 for these entries)
+# One root-relative path per line; lines starting with # are comments.
+Install Forge Browser
+install.sh
+run.sh
+browser-setup.sh
+test-forge-browser.sh
+install-gui.py

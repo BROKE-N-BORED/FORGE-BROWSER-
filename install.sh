@@ -16,6 +16,19 @@ CHECK_ONLY=0
 FAIL=0
 echo "=== Forge Browser install ==="
 
+# --- Exec bits ------------------------------------------------------------
+# A fresh clone carries no exec bits (the snapshot push stores every
+# file as 100644), so restore them from EXECUTABLES.txt before the
+# self-check runs — a clone install must work, not just a zip one.
+if [ -f EXECUTABLES.txt ]; then
+    while IFS= read -r SCRIPT || [ -n "$SCRIPT" ]; do
+        case "$SCRIPT" in
+            ""|\#*) ;;
+            *) chmod +x "$SCRIPT" 2>/dev/null ;;
+        esac
+    done < EXECUTABLES.txt
+fi
+
 # --- Python -------------------------------------------------------------
 if command -v python3 >/dev/null 2>&1; then
     if python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
@@ -142,6 +155,9 @@ fi
 # Forge Browser is a program with its own window. The window is Qt
 # (PySide6 + Qt WebEngine — a Chromium engine inside the app), kept
 # in .venv like Code Forge does, so the system Python stays clean.
+# PySide6 is pinned with hashes in pyside-requirements.txt (task
+# D1), like the engines in engine-pins.txt — pip refuses to install
+# anything whose bytes do not match the pinned hash.
 if [ "$CHECK_ONLY" = "1" ]; then
     if [ -x ".venv/bin/python" ] && .venv/bin/python -c "import PySide6" 2>/dev/null; then
         echo "Program: app venv ready (PySide6 imports)"
@@ -163,7 +179,8 @@ else
         else
             echo "Program: installing PySide6 into .venv (one time, ~600 MB with the engine)..."
             if .venv/bin/python -m pip install --quiet --upgrade pip \
-               && .venv/bin/python -m pip install --quiet "PySide6>=6.6" "PySide6-WebEngine"; then
+               && .venv/bin/python -m pip install --quiet --require-hashes \
+                    -r pyside-requirements.txt; then
                 echo "Program: PySide6 installed — run.sh opens the browser window"
             else
                 echo "Program: PySide6 install FAILED (network?) — terminal commands still work"

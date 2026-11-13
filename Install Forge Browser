@@ -19,6 +19,7 @@
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 APP_DIR="$HOME/.local/share/forge-browser-app"
 APP_TMP="$APP_DIR.new"
+APP_OLD="$APP_DIR.old"
 DESKTOP_DIR="$HOME/.local/share/applications"
 ICON_DIR="$HOME/.local/share/icons"
 LOG="$APP_DIR/install.log"
@@ -109,11 +110,23 @@ It installs under your home folder, adds Forge Browser to the app menu with its 
 fi
 
 # --- copy the program in ---------------------------------------------
-rm -rf "$APP_TMP"
+# Safe swap: the new tree is built in .new first, then the old
+# install is moved aside (not deleted), the new one moved in, and
+# only then is the old one removed. If the move-in fails, the old
+# install is restored — a failed swap leaves a working install.
+rm -rf "$APP_TMP" "$APP_OLD"
 mkdir -p "$APP_TMP" || fail "Could not create the install folder."
 cp -R "$DIR"/. "$APP_TMP"/ || fail "Could not copy the program files."
-rm -rf "$APP_DIR"
-mv "$APP_TMP" "$APP_DIR" || fail "Could not move the program into place."
+if [ -e "$APP_DIR" ]; then
+    mv "$APP_DIR" "$APP_OLD" || fail "Could not move the old install aside."
+fi
+if ! mv "$APP_TMP" "$APP_DIR"; then
+    if [ -e "$APP_OLD" ] && mv "$APP_OLD" "$APP_DIR"; then
+        fail "Could not move the program into place — the old install was restored."
+    fi
+    fail "Could not move the program into place."
+fi
+rm -rf "$APP_OLD"
 rm -f "$DONE" "$DONE.tmp"
 
 # --- run the engine + window install, with progress ------------------

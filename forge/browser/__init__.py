@@ -1,8 +1,9 @@
-"""Forge Browser — Code Forge's own web layer.
+"""Forge Browser — a standalone AI browser program.
 
-Built at Joshua's order (2026-11-11): an independent browser layer
-that runs STANDALONE first — its own folder, no Code Forge required —
-and gets baked into Code Forge later, once it has proven itself.
+Built at Joshua's order (2026-11-11): a browser program with its
+own window that runs STANDALONE — its own folder, no Code Forge
+required. The same engine room is also wired into Code Forge as a
+tool, but this project stands on its own.
 It uses NO other company's API key, no account, and no paid service
 anywhere in the chain, search included. Plain Python standard
 library only, so it runs anywhere Python 3 does and carries no

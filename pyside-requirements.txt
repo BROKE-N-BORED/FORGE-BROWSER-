@@ -1,0 +1,15 @@
+# PySide6, pinned with hashes (task D1) — install.sh installs this
+# file with `pip install --require-hashes`, so pip refuses any
+# wheel whose bytes do not match the pinned SHA-256, like the
+# engines in engine-pins.txt. Each package lists both Linux
+# architectures (x86_64 first, aarch64 second); pip checks the hash
+# of the wheel it actually downloads for this machine.
+# Versions verified 2026-11-12 (the sandbox install that ran the
+# Qt window). To re-pin: pip download the two top-level packages
+# (with deps) for each arch and paste the sha256sums here.
+PySide6==6.12.0 --hash=sha256:d13ed4d0053cc20f3e4e0fdbf12790a9b7f958d7e22c0843411ecfa8c799e2a9 --hash=sha256:8920e163f60493e18822d20f1e01c7c4bcf9c1c5cfbc68284788896f692594f8
+PySide6-Addons==6.12.0 --hash=sha256:4ab38c0017f0453671a9313d3a53ca1c0e378924f54b07e596bcea94a9642391 --hash=sha256:48cd0b639c06c9f79685f340ccae4319614b66d6efcdf06c2ce3836790d8c46e
+PySide6-Essentials==6.12.0 --hash=sha256:16f4b5e41daf49235ae048458243da9efe5f3d8040f9cc5aa454ce69893d3bd9 --hash=sha256:08c5841063fc1df69b7fa1ee405f539e66576a83fc48004be3e2c5e35ccbfa69
+PySide6-Pdf==6.12.0.140 --hash=sha256:0c94370b6b9d65fbfe54f9d6d25df0677db0cdcfd0a842a63958a3603a42007c --hash=sha256:2b63ee1f8ce3d3b2b648be2ebda483dd0fbca8d44c92a6c6f924033ac7fbde8c
+PySide6-WebEngine==6.12.0.140 --hash=sha256:c041c9921d7c91c9e51a2c027f434d05c3c59baa2c8f17b71dc8194e77791f06 --hash=sha256:66a842ccb7f06fa7e357f6d4d63bc2739e3cbc1f93583f314e38c43024fe5f74
+shiboken6==6.12.0 --hash=sha256:3bde565bb0890044b5c7f63808adddede5abc241e9395a2bfed61919884d6240 --hash=sha256:ff72a72b3277b418902d562b987b33a6f6818bed9fe40a49d634d09bc67f620e

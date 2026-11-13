@@ -159,6 +159,33 @@ class Vault:
                 for site, entry in sorted(self._entries.items())]
 
 
+def find_entry_for_url(vault, url):
+    """The vault entry for a page URL, or None.
+
+    A site key matches when it is the page's host, when the host
+    ends with it as a domain suffix (mail.example.com matches
+    example.com), or when the key itself is a URL whose host is
+    the page's host. The longest matching key wins.
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url or "").hostname or "").lower()
+    if not host or vault is None:
+        return None
+    best = None
+    for entry in vault.list_entries():
+        site = entry.get("site", "")
+        key = (urlparse(site).hostname or site).lower().strip()
+        if not key:
+            continue
+        if host == key or host.endswith("." + key):
+            if best is None or len(key) > len(best[0]):
+                best = (key, site)
+    if best is None:
+        return None
+    found = vault.get(best[1])
+    return (best[1], found) if found else None
+
+
 def fill_from_vault(session, vault, site, submit=False):
     """Fill ``site``'s login on the session's current page.
 

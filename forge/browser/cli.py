@@ -483,7 +483,7 @@ def _cmd_open(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="forge.browser",
-        description="Forge Browser — Code Forge's own keyless, multimodal web layer.")
+        description="Forge Browser — a standalone keyless, multimodal AI browser.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("chat", help="talk to the browser in the terminal (local model)")

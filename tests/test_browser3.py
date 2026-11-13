@@ -1739,5 +1739,293 @@ class VoiceTests(unittest.TestCase):
         self.assertIn("no microphone recorder", out.getvalue())
 
 
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get("FORGE_BROWSER_SETTINGS_PATH")
+        os.environ["FORGE_BROWSER_SETTINGS_PATH"] = os.path.join(
+            self.tmp, "settings.json")
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("FORGE_BROWSER_SETTINGS_PATH", None)
+        else:
+            os.environ["FORGE_BROWSER_SETTINGS_PATH"] = self.old
+
+    def test_defaults_when_no_file(self):
+        from forge.browser.settings import load_settings
+        values = load_settings()
+        self.assertEqual(values["download_dir"], "")
+        self.assertEqual(values["ollama_url"], "")
+        self.assertEqual(values["searxng_url"], "")
+
+    def test_save_and_load_round_trip(self):
+        from forge.browser.settings import get_setting, save_settings
+        save_settings({"download_dir": "/tmp/dl",
+                       "ollama_url": "http://127.0.0.1:11434"})
+        self.assertEqual(get_setting("download_dir"), "/tmp/dl")
+        self.assertEqual(get_setting("ollama_url"), "http://127.0.0.1:11434")
+        self.assertEqual(get_setting("searxng_url"), "")
+
+    def test_bad_json_falls_back_to_defaults(self):
+        from forge.browser.settings import load_settings
+        with open(os.environ["FORGE_BROWSER_SETTINGS_PATH"], "w") as handle:
+            handle.write("{not json")
+        self.assertEqual(load_settings()["download_dir"], "")
+
+
+class SessionRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get("FORGE_BROWSER_SESSION_PATH")
+        os.environ["FORGE_BROWSER_SESSION_PATH"] = os.path.join(
+            self.tmp, "session.json")
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("FORGE_BROWSER_SESSION_PATH", None)
+        else:
+            os.environ["FORGE_BROWSER_SESSION_PATH"] = self.old
+
+    def test_save_and_load_round_trip(self):
+        from forge.browser.session import load_session, save_session
+        tabs = [{"url": "https://example.org/a", "title": "A"},
+                {"url": "https://example.org/b", "title": "B"}]
+        self.assertEqual(save_session(tabs, current=1), 2)
+        saved = load_session()
+        self.assertEqual(saved["current"], 1)
+        self.assertEqual([t["url"] for t in saved["tabs"]],
+                         ["https://example.org/a", "https://example.org/b"])
+
+    def test_local_pages_are_not_saved(self):
+        from forge.browser.session import load_session, save_session
+        tabs = [{"url": "http://127.0.0.1:1234/", "title": "Start"},
+                {"url": "https://example.org/", "title": "Real"}]
+        self.assertEqual(save_session(tabs), 1)
+        self.assertEqual([t["url"] for t in load_session()["tabs"]],
+                         ["https://example.org/"])
+
+    def test_no_tabs_means_no_session(self):
+        from forge.browser.session import load_session, save_session
+        save_session([{"url": "http://127.0.0.1:1234/", "title": "Start"}])
+        self.assertIsNone(load_session())
+        self.assertFalse(os.path.exists(
+            os.environ["FORGE_BROWSER_SESSION_PATH"]))
+
+    def test_current_index_is_clamped(self):
+        from forge.browser.session import load_session, save_session
+        save_session([{"url": "https://example.org/", "title": "A"}],
+                     current=9)
+        self.assertEqual(load_session()["current"], 0)
+
+
+class BookmarksTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.old = os.environ.get("FORGE_BROWSER_BOOKMARKS_PATH")
+        os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = os.path.join(
+            self.tmp, "bookmarks.json")
+
+    def tearDown(self):
+        if self.old is None:
+            os.environ.pop("FORGE_BROWSER_BOOKMARKS_PATH", None)
+        else:
+            os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = self.old
+
+    def test_add_list_remove(self):
+        from forge.browser.bookmarks import (
+            add_bookmark, is_bookmarked, list_bookmarks, remove_bookmark)
+        self.assertEqual(list_bookmarks(), [])
+        add_bookmark("https://example.org/", "Example")
+        self.assertTrue(is_bookmarked("https://example.org/"))
+        self.assertEqual(
+            [(b["url"], b["title"]) for b in list_bookmarks()],
+            [("https://example.org/", "Example")])
+        self.assertTrue(remove_bookmark("https://example.org/"))
+        self.assertFalse(is_bookmarked("https://example.org/"))
+        self.assertFalse(remove_bookmark("https://example.org/"))
+
+    def test_re_adding_updates_title_without_doubling(self):
+        from forge.browser.bookmarks import add_bookmark, list_bookmarks
+        add_bookmark("https://example.org/", "First")
+        add_bookmark("https://example.org/", "Second")
+        self.assertEqual(len(list_bookmarks()), 1)
+        self.assertEqual(list_bookmarks()[0]["title"], "Second")
+
+    def test_blank_url_adds_nothing(self):
+        from forge.browser.bookmarks import add_bookmark, list_bookmarks
+        self.assertIsNone(add_bookmark("  "))
+        self.assertEqual(list_bookmarks(), [])
+
+
+class VaultMatchTests(unittest.TestCase):
+    def test_find_entry_for_url(self):
+        from forge.browser.vault import Vault, find_entry_for_url
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "vault.json")
+            vault = Vault.create(path, "test-passphrase")
+            vault.set("example.org", "josh", "secret1")
+            vault.set("https://mail.example.com/login", "josh2", "secret2")
+            site, entry = find_entry_for_url(
+                vault, "https://example.org/inbox")
+            self.assertEqual(site, "example.org")
+            self.assertEqual(entry["username"], "josh")
+            # A subdomain matches the bare domain entry.
+            site, _entry = find_entry_for_url(
+                vault, "https://www.example.org/")
+            self.assertEqual(site, "example.org")
+            # The longer (more specific) key wins.
+            site, entry = find_entry_for_url(
+                vault, "https://mail.example.com/")
+            self.assertEqual(entry["username"], "josh2")
+            self.assertIsNone(find_entry_for_url(
+                vault, "https://other.org/"))
+            self.assertIsNone(find_entry_for_url(vault, ""))
+
+
+class KeepDownloadTests(unittest.TestCase):
+    def test_keep_download_uniquifies(self):
+        from forge.browser.files import keep_download
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "dl")
+            paths = []
+            for i in range(3):
+                src = os.path.join(tmp, f"tmp{i}")
+                with open(src, "w") as handle:
+                    handle.write("data")
+                paths.append(keep_download(src, "report.pdf",
+                                           directory=target))
+            self.assertEqual([os.path.basename(p) for p in paths],
+                             ["report.pdf", "report-1.pdf", "report-2.pdf"])
+            for path in paths:
+                self.assertTrue(os.path.isfile(path))
+
+    def test_download_dir_env_override(self):
+        from forge.browser.files import download_dir
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_DOWNLOAD_DIR")
+            os.environ["FORGE_BROWSER_DOWNLOAD_DIR"] = os.path.join(tmp, "d")
+            try:
+                self.assertEqual(download_dir(), os.path.join(tmp, "d"))
+                self.assertTrue(os.path.isdir(os.path.join(tmp, "d")))
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_DOWNLOAD_DIR", None)
+                else:
+                    os.environ["FORGE_BROWSER_DOWNLOAD_DIR"] = old
+
+
+class WindowGeometryTests(unittest.TestCase):
+    def test_default_fits_1366x768(self):
+        from forge.browser.app import default_window_size
+        self.assertEqual(default_window_size(1366, 768), (1240, 720))
+
+    def test_default_shrinks_for_small_screens(self):
+        from forge.browser.app import default_window_size
+        self.assertEqual(default_window_size(800, 600), (800, 600))
+        self.assertEqual(default_window_size(1024, 600), (1024, 600))
+
+    def test_default_caps_for_large_screens(self):
+        from forge.browser.app import default_window_size
+        self.assertEqual(default_window_size(1920, 1080), (1240, 720))
+
+
+class StartPageQuickLinksTests(unittest.TestCase):
+    def test_quick_links_show_bookmarks(self):
+        from forge.browser.bookmarks import add_bookmark
+        from forge.browser.webui import start_page
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_BOOKMARKS_PATH")
+            os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = os.path.join(
+                tmp, "bookmarks.json")
+            try:
+                add_bookmark("https://example.org/news", "Example News")
+                html = start_page()
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_BOOKMARKS_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = old
+            self.assertIn("Quick links", html)
+            self.assertIn("https://example.org/news", html)
+            self.assertIn("Example News", html)
+
+    def test_no_quick_links_without_bookmarks(self):
+        from forge.browser.webui import start_page
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.environ.get("FORGE_BROWSER_BOOKMARKS_PATH")
+            os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = os.path.join(
+                tmp, "bookmarks.json")
+            try:
+                html = start_page()
+            finally:
+                if old is None:
+                    os.environ.pop("FORGE_BROWSER_BOOKMARKS_PATH", None)
+                else:
+                    os.environ["FORGE_BROWSER_BOOKMARKS_PATH"] = old
+            self.assertNotIn("Quick links", html)
+
+
+class OllamaUrlTests(unittest.TestCase):
+    def _set_env(self, name, value):
+        old = os.environ.get(name)
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+        return old
+
+    def _restore_env(self, name, old):
+        if old is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = old
+
+    def test_env_beats_settings(self):
+        from forge.browser.media import ollama_url
+        from forge.browser.settings import set_setting
+        with tempfile.TemporaryDirectory() as tmp:
+            old_env = self._set_env("FORGE_OLLAMA_URL",
+                                    "http://env.example:11434")
+            old_path = self._set_env(
+                "FORGE_BROWSER_SETTINGS_PATH",
+                os.path.join(tmp, "settings.json"))
+            try:
+                set_setting("ollama_url", "http://settings.example:11434")
+                self.assertEqual(ollama_url(), "http://env.example:11434")
+            finally:
+                self._restore_env("FORGE_OLLAMA_URL", old_env)
+                self._restore_env("FORGE_BROWSER_SETTINGS_PATH", old_path)
+
+    def test_settings_beats_default(self):
+        from forge.browser.media import ollama_url
+        from forge.browser.settings import set_setting
+        with tempfile.TemporaryDirectory() as tmp:
+            old_env = self._set_env("FORGE_OLLAMA_URL", None)
+            old_path = self._set_env(
+                "FORGE_BROWSER_SETTINGS_PATH",
+                os.path.join(tmp, "settings.json"))
+            try:
+                set_setting("ollama_url", "http://settings.example:11434/")
+                self.assertEqual(ollama_url(),
+                                 "http://settings.example:11434")
+            finally:
+                self._restore_env("FORGE_OLLAMA_URL", old_env)
+                self._restore_env("FORGE_BROWSER_SETTINGS_PATH", old_path)
+
+    def test_default_when_nothing_set(self):
+        from forge.browser.media import ollama_url
+        with tempfile.TemporaryDirectory() as tmp:
+            old_env = self._set_env("FORGE_OLLAMA_URL", None)
+            old_path = self._set_env(
+                "FORGE_BROWSER_SETTINGS_PATH",
+                os.path.join(tmp, "settings.json"))
+            try:
+                self.assertEqual(ollama_url(), "http://127.0.0.1:11434")
+            finally:
+                self._restore_env("FORGE_OLLAMA_URL", old_env)
+                self._restore_env("FORGE_BROWSER_SETTINGS_PATH", old_path)
+
+
 if __name__ == "__main__":
     unittest.main()

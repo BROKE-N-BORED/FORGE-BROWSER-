@@ -1,5 +1,7 @@
 # FORGE BROWSER
 
+Version 0.2 — the current release line. See [CHANGELOG.md](CHANGELOG.md).
+
 An AI browser. You talk to it in plain language — it browses for you.
 
 Forge Browser is a standalone browser program with its own window:
@@ -60,5 +62,9 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-184 checks, offline, including the chat protocol with a stubbed
+216 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -84,20 +84,27 @@ def media_dir():
     return path
 
 
-def _keep_file(tmp_path, final_url, kind):
-    """Move an already-downloaded temp file to its media-dir name.
+def download_dir():
+    """Where window downloads go: FORGE_BROWSER_DOWNLOAD_DIR, else
+    the folder picked in Settings, else ~/Downloads."""
+    override = os.environ.get("FORGE_BROWSER_DOWNLOAD_DIR", "").strip()
+    if override:
+        path = override
+    else:
+        from .settings import get_setting
+        path = get_setting("download_dir") or os.path.join(
+            os.path.expanduser("~"), "Downloads")
+    os.makedirs(path, exist_ok=True)
+    return path
 
-    A colliding name is uniquified (report-1.pdf, report-2.pdf, ...)
-    instead of silently overwriting the file already there. The
+
+def _link_unique(tmp_path, directory, safe):
+    """Atomically link a downloaded temp file into directory under
+    `safe`, uniquifying (name-1, name-2, ...) on collision. The
     link call is the atomic check, so two downloads of the same
-    name can never clobber each other.
-    """
-    name = os.path.basename(urlparse(final_url).path) or f"download.{kind}"
-    if "." not in name:
-        name += "." + kind
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    name can never clobber each other. Returns the final path;
+    the temp file is removed."""
     stem, ext = os.path.splitext(safe)
-    directory = media_dir()
     candidate = safe
     number = 0
     while True:
@@ -114,6 +121,31 @@ def _keep_file(tmp_path, final_url, kind):
     except OSError:
         pass
     return path
+
+
+def _keep_file(tmp_path, final_url, kind):
+    """Move an already-downloaded temp file to its media-dir name.
+
+    A colliding name is uniquified (report-1.pdf, report-2.pdf, ...)
+    instead of silently overwriting the file already there.
+    """
+    name = os.path.basename(urlparse(final_url).path) or f"download.{kind}"
+    if "." not in name:
+        name += "." + kind
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return _link_unique(tmp_path, media_dir(), safe)
+
+
+def keep_download(tmp_path, name, directory=None):
+    """Move a finished window download to its final name in the
+    download folder, uniquifying on collision with the same atomic
+    link check as _keep_file. Returns the final path."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "download")
+    if not safe.strip("._"):
+        safe = "download"
+    target = directory or download_dir()
+    os.makedirs(target, exist_ok=True)
+    return _link_unique(tmp_path, target, safe)
 
 
 def _kind_for(content_type, final_url):

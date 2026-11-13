@@ -34,7 +34,18 @@ import urllib.request
 from html.parser import HTMLParser
 from urllib.parse import urljoin
 
-OLLAMA_URL = os.environ.get("FORGE_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+def ollama_url():
+    """Where Ollama answers: FORGE_OLLAMA_URL, else the address
+    saved in Settings, else the local default. Read at import
+    time into OLLAMA_URL below, so a Settings change takes effect
+    on the next launch."""
+    from .settings import get_setting
+    return (os.environ.get("FORGE_OLLAMA_URL", "").strip()
+            or get_setting("ollama_url")
+            or "http://127.0.0.1:11434").rstrip("/")
+
+
+OLLAMA_URL = ollama_url()
 
 _SEAT_PREFERENCE = ["eriktonon/bonsai-2-uncensored", "bonsai-2-uncensored",
                     "dolphinlabs/qwen3.5-uncensored", "qwen3.5-uncensored"]

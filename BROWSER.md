@@ -2,13 +2,14 @@
 
 This tree is the FORGE BROWSER GitHub project: the standalone
 browser program with the chat interface (an AI browser — you talk
-to it, it browses). It builds on the v0.6 standalone program.
+to it, it browses). It is the current build: the Qt window plus
+the full engine room, with all 22 improvements from the task list.
 
 Forge Browser is a browser program, built 2026-11-11. It runs
-STANDALONE first: its own folder, its own window, no Code Forge
-required. The plan is for it to be baked into Code Forge later,
-once it has proven itself on its own — the package layout
-(forge/browser/) is kept compatible with that later step, but
+STANDALONE: its own folder, its own window, no Code Forge
+required. The engine room is also wired into Code Forge as a
+tool, but this build stands on its own — the package layout
+(forge/browser/) is kept compatible with that wiring, and
 nothing in this build needs, touches, or installs into Code Forge.
 
 No API key, no account, and no paid service is used for any part
@@ -53,7 +54,7 @@ what this machine has (engines, seats, vault). Your logins and
 cookies persist in Forge Browser's own profile under
 `~/.forge/browser-profile/`.
 
-The v0.5 `open` command (a plain Chromium window on port 9222
+The `open` command (a plain Chromium window on port 9222
 that other tools can drive) is still there for the engine room;
 the program is the front of the house now.
 
@@ -174,7 +175,7 @@ before it is installed. The pins live in `engine-pins.txt`:
   aarch64, each with a SHA-256 of the exact release bytes.
   `browser-setup.sh` uses the same pin.
 - Chromium snapshot revision **1741687** (Chromium 160.0.8156.0),
-  the revision the v0.5 window was verified with on the real PC.
+  pinned for the window.
 
 Lightpanda is checked with `sha256sum` against the pinned hash;
 a mismatch refuses the install and keeps whatever was there
@@ -452,12 +453,11 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (50 checks),
+`forge/browser/` (the package), `tests/` (216 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
-`run.sh`, `browser-setup.sh` (optional engines), this file, and a
-sample screenshot from the sandbox's live Lightpanda test. When
-the bake-in day comes, `forge/browser/` drops into Code Forge's
-tree as-is — that later step changes nothing in this build.
+`run.sh`, `browser-setup.sh` (optional engines), and this file.
+The engine room is also wired into Code Forge as a tool; that
+wiring changes nothing in this build.
 
 ## Tests
 

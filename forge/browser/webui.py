@@ -36,25 +36,43 @@ a:hover { text-decoration: underline; }
 .status { background: #171b22; border: 1px solid #2c313a;
   border-radius: 8px; padding: 14px 18px; font-size: 14px;
   line-height: 1.7; color: #b9b4a8; white-space: pre-wrap; }
+.quick { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 28px; }
+.quick a { background: #171b22; border: 1px solid #2c313a;
+  border-radius: 16px; padding: 6px 14px; font-size: 14px; }
+.brief-box { background: #171b22; border: 1px solid #2c313a;
+  border-radius: 8px; padding: 14px 18px; margin-bottom: 28px; }
+.brief-box h2 { font-size: 18px; margin: 0 0 8px; }
+.brief-box .result { margin-bottom: 12px; }
 """
 
 
 def start_page():
+    from .bookmarks import list_bookmarks
     from .brief import load_brief, yesterday_date
     from .titles import grouped_history
     status = html.escape(engines.format_status(engines.engine_status()))
+    # Quick links: the person's bookmarks, first thing on the page.
+    quick = ""
+    marks = list_bookmarks()[:8]
+    if marks:
+        links = "".join(
+            f'<a href="{html.escape(b["url"])}">'
+            f"{html.escape(b.get('title') or b['url'])}</a>"
+            for b in marks)
+        quick = (f'<h2 style="font-size:18px;margin:0 0 8px;">Quick links</h2>'
+                 f'<div class="quick">{links}</div>')
     day = yesterday_date()
     cached = load_brief(day)
     if cached is None:
-        brief = ('<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>'
+        brief = ('<h2>Morning brief</h2>'
                  '<p class="sub">No brief yet for yesterday — it builds in the '
                  'background after launch, or ask for it in chat.</p>')
     elif not cached["pages"]:
-        brief = ('<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>'
+        brief = ('<h2>Morning brief</h2>'
                  f'<p class="sub">Nothing to brief for {html.escape(day)} — '
                  'no pages yesterday.</p>')
     else:
-        parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Morning brief</h2>']
+        parts = ['<h2>Morning brief</h2>']
         if cached.get("summary"):
             parts.append(f'<p>{html.escape(cached["summary"])}</p>')
         for page in cached["pages"][:6]:
@@ -63,6 +81,7 @@ def start_page():
                 f"{html.escape(page['title'])}</a>"
                 f'<div class="u">{html.escape(page["url"])}</div></div>')
         brief = "\n".join(parts)
+    brief = f'<div class="brief-box">{brief}</div>'
     recent = ""
     groups = grouped_history()
     if groups:
@@ -85,6 +104,7 @@ def start_page():
 <input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
 <button type="submit">Search</button>
 </form>
+{quick}
 {brief}
 {recent}
 <div class="status">{status}</div>

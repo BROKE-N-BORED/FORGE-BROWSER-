@@ -1093,19 +1093,59 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(root.get("width"), "512")
         self.assertEqual(root.get("height"), "512")
 
+    def _executables(self):
+        # The manifest is the single source of truth for what ships
+        # with the exec bit: the snapshot push stores every file as
+        # 100644, so the on-disk checkout bit means nothing.
+        path = os.path.join(self._root(), "EXECUTABLES.txt")
+        names = []
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    names.append(line)
+        return names
+
     def test_installer_is_double_clickable(self):
         # The installer IS the double-click target: a script with a
-        # shebang and the exec bit. (A .desktop wrapper was tried
-        # and dropped — %k expands to empty when a .desktop file is
-        # launched from an arbitrary folder, so it cannot find the
-        # script next to it. The script finds itself via $0.)
-        import stat
+        # shebang that the Release zip stores with the exec bit.
+        # (A .desktop wrapper was tried and dropped — %k expands to
+        # empty when a .desktop file is launched from an arbitrary
+        # folder, so it cannot find the script next to it. The
+        # script finds itself via $0.)
+        # The on-disk exec bit is NOT asserted here: a fresh clone
+        # has none (snapshot pushes store 100644), and the shipped
+        # bit comes from EXECUTABLES.txt via the zip builder.
         path = os.path.join(self._root(), "Install Forge Browser")
         with open(path, encoding="utf-8") as handle:
             first = handle.readline()
         self.assertTrue(first.startswith("#!/bin/sh"))
-        mode = os.stat(path).st_mode
-        self.assertTrue(mode & stat.S_IXUSR)
+        self.assertIn("Install Forge Browser", self._executables())
+
+    def test_executables_manifest_matches_scripts(self):
+        # Every manifest entry exists and has a shebang, and every
+        # script at the tree root with a shebang is in the manifest
+        # — so a new script cannot silently ship non-executable.
+        root = self._root()
+        names = self._executables()
+        self.assertTrue(names, "EXECUTABLES.txt is empty")
+        for name in names:
+            path = os.path.join(root, name)
+            self.assertTrue(os.path.isfile(path), f"{name} is missing")
+            with open(path, encoding="utf-8") as handle:
+                first = handle.readline()
+            self.assertTrue(first.startswith("#!"),
+                            f"{name} has no shebang")
+        for entry in os.listdir(root):
+            path = os.path.join(root, entry)
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8", errors="ignore") as handle:
+                first = handle.readline()
+            if first.startswith("#!"):
+                self.assertIn(entry, names,
+                              f"{entry} has a shebang but is not in "
+                              "EXECUTABLES.txt")
 
     def test_install_scripts_parse(self):
         import subprocess
@@ -1120,6 +1160,197 @@ class InstallerTests(unittest.TestCase):
         import py_compile
         py_compile.compile(os.path.join(self._root(), "install-gui.py"),
                            doraise=True)
+
+    def test_license_file_present(self):
+        # MIT, decided by Joshua 2026-11-12 (task B6).
+        path = os.path.join(self._root(), "LICENSE")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("MIT License", text)
+        self.assertIn("Copyright (c) 2026 Joshua Lofland", text)
+
+    def test_pyside_pins(self):
+        # D1: PySide6 is pinned to the verified versions with hashes,
+        # and install.sh installs with --require-hashes.
+        root = self._root()
+        with open(os.path.join(root, "pyside-requirements.txt"),
+                  encoding="utf-8") as handle:
+            reqs = handle.read()
+        self.assertIn("PySide6==6.12.0", reqs)
+        self.assertIn("PySide6-WebEngine==6.12.0.140", reqs)
+        # Every package line carries at least one sha256 hash.
+        packages = [ln.strip() for ln in reqs.splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                    and "==" in ln]
+        self.assertTrue(packages, "no pinned packages in the requirements")
+        for line in packages:
+            self.assertIn("--hash=sha256:", line,
+                          f"{line} has no hash")
+        with open(os.path.join(root, "install.sh"),
+                  encoding="utf-8") as handle:
+            install = handle.read()
+        self.assertIn("--require-hashes", install)
+        self.assertIn("pyside-requirements.txt", install)
+        self.assertNotIn('"PySide6>=6.6"', install)
+
+    def test_installer_swap_is_safe(self):
+        # D3: the old install is moved aside, never deleted before
+        # the new one is in place, and restored if the move fails.
+        path = os.path.join(self._root(), "Install Forge Browser")
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn('rm -rf "$APP_DIR"', text)
+        self.assertIn('APP_OLD="$APP_DIR.old"', text)
+        self.assertIn('mv "$APP_DIR" "$APP_OLD"', text)
+        self.assertIn('mv "$APP_OLD" "$APP_DIR"', text)
+        move_in = text.index('mv "$APP_TMP" "$APP_DIR"')
+        remove_old = text.index('rm -rf "$APP_OLD"')
+        self.assertLess(move_in, remove_old,
+                        "the old install must only be removed after "
+                        "the new one is in place")
+
+    def _installer_harness(self, tmp, fail_move_in=False):
+        """A fake home + fake source dir + stub zenity (and, for
+        the failure run, a stub mv that refuses the move-in) so
+        the real installer script runs end to end in seconds."""
+        import shutil
+        import stat as _stat
+        home = os.path.join(tmp, "home")
+        src = os.path.join(tmp, "src")
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(home)
+        os.makedirs(src)
+        os.makedirs(bindir)
+        shutil.copy(os.path.join(self._root(), "Install Forge Browser"),
+                    os.path.join(src, "Install Forge Browser"))
+        with open(os.path.join(src, "run.sh"), "w") as handle:
+            handle.write("#!/bin/sh\nexit 0\n")
+        with open(os.path.join(src, "install.sh"), "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         "cd \"$(dirname \"$0\")\" || exit 1\n"
+                         "mkdir -p .venv/bin\n"
+                         "printf '#!/bin/sh\\nexit 0\\n' "
+                         "> .venv/bin/python\n"
+                         "chmod +x .venv/bin/python\n"
+                         "echo stub install ok\n"
+                         "exit 0\n")
+        with open(os.path.join(src, "new-file.txt"), "w") as handle:
+            handle.write("from the new install\n")
+        zenity = (
+            "#!/bin/sh\n"
+            "# --question: first call (install?) yes, later calls no.\n"
+            "# --progress: wait for the install-done file, then exit.\n"
+            "if [ \"$1\" = \"--question\" ]; then\n"
+            "    f=\"$0-count\"\n"
+            "    n=$(cat \"$f\" 2>/dev/null || echo 0)\n"
+            "    n=$((n + 1)); echo \"$n\" > \"$f\"\n"
+            "    [ \"$n\" = \"1\" ] && exit 0 || exit 1\n"
+            "fi\n"
+            "if [ \"$1\" = \"--progress\" ]; then\n"
+            "    while [ ! -f \"$HOME/.local/share/forge-browser-app"
+            ".install-done\" ]; do sleep 1; done\n"
+            "    cat >/dev/null\n"
+            "    exit 0\n"
+            "fi\n"
+            "exit 0\n")
+        zpath = os.path.join(bindir, "zenity")
+        with open(zpath, "w") as handle:
+            handle.write(zenity)
+        os.chmod(zpath, 0o755)
+        if fail_move_in:
+            # The 2nd mv call is the move-in (1st is the old install
+            # aside, 3rd is the restore) — refuse it, delegate rest.
+            mv_stub = (
+                "#!/bin/sh\n"
+                "f=\"$0-count\"\n"
+                "n=$(cat \"$f\" 2>/dev/null || echo 0)\n"
+                "n=$((n + 1)); echo \"$n\" > \"$f\"\n"
+                "[ \"$n\" = \"2\" ] && exit 1\n"
+                "exec /bin/mv \"$@\"\n")
+            mpath = os.path.join(bindir, "mv")
+            with open(mpath, "w") as handle:
+                handle.write(mv_stub)
+            os.chmod(mpath, 0o755)
+        env = dict(os.environ)
+        env["HOME"] = home
+        env["PATH"] = bindir + os.pathsep + env["PATH"]
+        return home, src, env
+
+    def _run_installer(self, src, env):
+        import subprocess
+        return subprocess.run(
+            ["sh", os.path.join(src, "Install Forge Browser")],
+            capture_output=True, text=True, env=env, timeout=120)
+
+    def test_installer_swap_replaces_old_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, src, env = self._installer_harness(tmp)
+            app_dir = os.path.join(home, ".local", "share",
+                                   "forge-browser-app")
+            os.makedirs(app_dir)
+            with open(os.path.join(app_dir, "OLD-MARKER"), "w") as handle:
+                handle.write("old install\n")
+            result = self._run_installer(src, env)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertFalse(os.path.exists(
+                os.path.join(app_dir, "OLD-MARKER")),
+                "the old install was not replaced")
+            self.assertTrue(os.path.isfile(
+                os.path.join(app_dir, "new-file.txt")))
+            self.assertFalse(os.path.exists(app_dir + ".old"),
+                             "the moved-aside old install was not removed")
+            self.assertTrue(os.path.isfile(os.path.join(
+                home, ".local", "share", "applications",
+                "forge-browser.desktop")))
+
+    def test_installer_swap_restores_old_install_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home, src, env = self._installer_harness(tmp, fail_move_in=True)
+            app_dir = os.path.join(home, ".local", "share",
+                                   "forge-browser-app")
+            os.makedirs(app_dir)
+            with open(os.path.join(app_dir, "OLD-MARKER"), "w") as handle:
+                handle.write("old install\n")
+            result = self._run_installer(src, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(os.path.isfile(
+                os.path.join(app_dir, "OLD-MARKER")),
+                "a failed swap left no working install behind")
+            self.assertFalse(os.path.exists(
+                os.path.join(app_dir, "new-file.txt")))
+
+
+class DocsTests(unittest.TestCase):
+    def test_docs_carry_the_true_test_count(self):
+        # B1: one test count everywhere. The suite itself is the
+        # canonical count — this test counts it with the same
+        # discovery the suite runs under, then asserts the four
+        # docs that state it all agree with it.
+        root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        tests_dir = os.path.join(root, "tests")
+        # No top_level_dir: tests/ has no __init__.py, so the suite
+        # runs with its modules imported top-level, exactly as
+        # `python3 -m unittest discover -s tests` does it.
+        loader = unittest.TestLoader()
+        suite = loader.discover(start_dir=tests_dir)
+        count = suite.countTestCases()
+        self.assertGreater(count, 0)
+        expected = f"{count} checks"
+
+        def read(rel):
+            with open(os.path.join(root, rel), encoding="utf-8") as handle:
+                return handle.read()
+
+        self.assertIn(expected, read("README.md"))
+        self.assertIn(expected, read("BROWSER.md"))
+        self.assertIn(expected, read("test-forge-browser.sh"))
+        task_list = read("docs/TASK-LIST.md")
+        current = [line for line in task_list.splitlines()
+                   if line.startswith("**Suite:**")]
+        self.assertEqual(len(current), 1,
+                         "TASK-LIST.md needs exactly one **Suite:** line")
+        self.assertIn(str(count), current[0])
 
 
 class VerifyTests(unittest.TestCase):

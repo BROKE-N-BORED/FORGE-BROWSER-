@@ -275,7 +275,11 @@ def search(query, max_results=DEFAULT_MAX_RESULTS, timeout=20):
     if max_results <= 0:
         raise BrowserError("max_results must be at least 1")
     query = query.strip()
+    # FORGE_SEARXNG_URL wins; else the address saved in Settings.
     searxng_url = os.environ.get("FORGE_SEARXNG_URL", "").strip()
+    if not searxng_url:
+        from .settings import get_setting
+        searxng_url = get_setting("searxng_url")
     if searxng_url:
         return search_searxng(query, max_results, searxng_url, timeout=timeout)
     # Keyless fallback chain: first backend with results wins. A
