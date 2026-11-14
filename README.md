@@ -1,6 +1,6 @@
 # FORGE BROWSER
 
-Version 0.8 — the current release line. See [CHANGELOG.md](CHANGELOG.md).
+Version 0.9 — the current release line. See [CHANGELOG.md](CHANGELOG.md).
 
 An AI browser. You talk to it in plain language — it browses for you.
 
@@ -62,7 +62,7 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-493 checks, offline, including the chat protocol with a stubbed
+534 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.
 
 ## License

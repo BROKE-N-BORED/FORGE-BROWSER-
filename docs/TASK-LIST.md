@@ -6,7 +6,7 @@ research, and the reasoning behind each item live there).
 it, and only then moves on. Nothing is started unasked.
 **Status marks:** `[ ]` not started · `[~]` in progress · `[x]` done, verified on
 Joshua's real PC.
-**Suite:** 493 checks, all green.
+**Suite:** 534 checks, all green.
 
 ## Suggested build order (the menu)
 

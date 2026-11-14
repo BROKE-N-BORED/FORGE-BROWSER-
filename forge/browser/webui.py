@@ -92,9 +92,9 @@ def history_page(query=None, cleared=False):
             f"{html.escape(entry.get('title') or entry['url'])}</a>"
             f'<div class="u">{html.escape(entry["url"])}</div>'
             f'<div class="s">{html.escape(_when(entry.get("at")))}</div></div>')
-    body = "\n".join(rows) or "<p>No history yet — pages you visit show up here.</p>"
+    body = "\n".join(rows) or "<p>No history yet. Pages you visit show up here.</p>"
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>History — Forge Browser</title><style>{_STYLE}</style></head>
+<title>History · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>History</h1>
 <p class="sub"><a href="/">← Start page</a> · <a href="/history-clear">Clear history…</a></p>
@@ -113,7 +113,7 @@ def history_clear_page():
     from .titles import load_history
     count = len(load_history())
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Clear history — Forge Browser</title><style>{_STYLE}</style></head>
+<title>Clear history · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>Clear history?</h1>
 <p>This deletes all {count} recorded visits. It cannot be undone.</p>
@@ -141,12 +141,12 @@ def start_page():
     cached = load_brief(day)
     if cached is None:
         brief = ('<h2>Morning brief</h2>'
-                 '<p class="sub">No brief yet for yesterday — it builds in the '
+                 '<p class="sub">No brief yet for yesterday. It builds in the '
                  'background after launch, or ask for it in chat.</p>')
     elif not cached["pages"]:
         brief = ('<h2>Morning brief</h2>'
-                 f'<p class="sub">Nothing to brief for {html.escape(day)} — '
-                 'no pages yesterday.</p>')
+                 f'<p class="sub">Nothing to brief for {html.escape(day)}. '
+                 'No pages yesterday.</p>')
     else:
         parts = ['<h2>Morning brief</h2>']
         if cached.get("summary"):
@@ -211,8 +211,8 @@ def start_page():
                     f'<div class="u">{html.escape(entry["url"])}</div></div>')
             extra = len(journey["items"]) - 6
             if extra > 0:
-                parts.append(f'<p class="sub">+{extra} more in this journey — '
-                             f'<a href="/history">see all history</a>.</p>')
+                parts.append(f'<p class="sub">+{extra} more in this journey ('
+                             f'<a href="/history">see all history</a>).</p>')
         journey_html = "\n".join(parts)
     # Q4: saved research reports — the latest few, one click from
     # the full list. Nothing shows until a report exists.
@@ -229,12 +229,19 @@ def start_page():
                 f'<div class="u">{html.escape(_when(report["at"]))}</div></div>')
         parts.append('<p><a href="/research">See all reports →</a></p>')
         research_html = "\n".join(parts)
+    # U22: a first run shows the way in — no history and nothing
+    # today yet means the person has never used the browser.
+    howto = ""
+    if not groups and not today:
+        howto = ('<p class="tip">First time here? '
+                 '<a href="/howto">How to use Forge Browser</a></p>')
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>FORGE BROWSER<span class="dot">.</span></h1>
 <p class="sub">Your browser. No accounts, no API keys, nothing tracked.</p>
-<p class="tip">Tip: in chat, write <b>@tab2</b> to ask about tab 2 — or compare tabs by number.</p>
+<p class="tip">Tip: in chat, write <b>@tab2</b> to ask about tab 2, or compare tabs by number.</p>
+{howto}
 <form action="/search" method="get">
 <input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
 <button type="submit">Search</button>
@@ -249,12 +256,45 @@ def start_page():
 </div></body></html>"""
 
 
+def howto_page():
+    """U22: the How to Use index as a page — BROWSER.md's headings
+    as links, each section's text under its heading. The start
+    page's first-run link and the Help menu's window both lead
+    here (the window shows the same sections natively)."""
+    from .howto import load_sections
+    sections = load_sections()
+    if not sections:
+        body = ("<p>The manual (BROWSER.md) is not installed with "
+                "this copy of Forge Browser, so there is nothing to "
+                "show here. Reinstalling puts it back.</p>")
+    else:
+        index = "".join(
+            f'<div style="margin:4px 0 4px {(level - 1) * 18}px;">'
+            f'<a href="#s{i}">{html.escape(title)}</a></div>'
+            for i, (level, title, _body) in enumerate(sections))
+        blocks = []
+        for i, (level, title, text) in enumerate(sections):
+            tag = "h2" if level <= 2 else "h3"
+            blocks.append(
+                f'<{tag} id="s{i}">{html.escape(title)}</{tag}>'
+                f"<pre>{html.escape(text)}</pre>")
+        body = (f"<h2>Index</h2>{index}"
+                + "\n".join(blocks))
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>How to Use · Forge Browser</title><style>{_STYLE}</style></head>
+<body><div class="wrap">
+<h1>How to Use</h1>
+<p class="sub"><a href="/">← Start page</a></p>
+{body}
+</div></body></html>"""
+
+
 def research_list_page():
     """Q4: every saved research report, newest first."""
     from .research import list_reports
     reports = list_reports()
     if not reports:
-        body = ("<p>No research reports saved yet — ask the browser "
+        body = ("<p>No research reports saved yet. Ask the browser "
                 "to research something and the report lands here.</p>")
     else:
         parts = []
@@ -267,7 +307,7 @@ def research_list_page():
                 f'<div class="u">{html.escape(when)}</div></div>')
         body = "\n".join(parts)
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Research reports — Forge Browser</title><style>{_STYLE}</style></head>
+<title>Research reports · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>Research reports</h1>
 <p class="sub"><a href="/">← Start page</a></p>
@@ -297,9 +337,9 @@ def search_page(query, results=None):
             f"{html.escape(result.title or result.url)}</a>"
             f'<div class="u">{html.escape(result.url)}</div>'
             f'<div class="s">{html.escape(result.snippet or "")}</div></div>')
-    body = "\n".join(items) or "<p>No results — every search backend came back empty.</p>"
+    body = "\n".join(items) or "<p>No results. Every search backend came back empty.</p>"
     return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>{html.escape(query)} — Forge Browser</title><style>{_STYLE}</style></head>
+<title>{html.escape(query)} · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <form action="/search" method="get">
 <input type="text" name="q" value="{html.escape(query)}">
@@ -363,7 +403,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # job runs while AI/chat is off.
                 from .seats import seats_enabled
                 if not seats_enabled("chat"):
-                    page = ('<h1>Morning brief</h1><p>AI is off — the '
+                    page = ('<h1>Morning brief</h1><p>AI is off. The '
                             'brief does not build while AI/chat is off.</p>'
                             '<p><a href="/">← Start page</a></p>')
                 else:
@@ -378,7 +418,7 @@ class _Handler(BaseHTTPRequestHandler):
                     threading.Thread(target=_rebuild_brief,
                                      daemon=True).start()
                     page = ('<h1>Morning brief</h1><p>Rebuilding the '
-                            'brief — reload the start page in a minute.</p>'
+                            'brief. Reload the start page in a minute.</p>'
                             '<p><a href="/">← Start page</a></p>')
             elif parsed.path == "/compare.csv":
                 # M11: the last comparison as a CSV download.
@@ -401,6 +441,10 @@ class _Handler(BaseHTTPRequestHandler):
                 from .compare import compare_table_html, last_comparison
                 rows, fields = last_comparison()
                 page = compare_table_html(rows, fields)
+            elif parsed.path == "/howto":
+                # U22: the manual as an index page — the same
+                # sections the Help menu's How to Use window shows.
+                page = howto_page()
             else:
                 page = start_page()
             body = page.encode("utf-8")
@@ -444,4 +488,9 @@ class LocalPageServer:
         return self
 
     def stop(self):
+        # shutdown() stops the serve loop; server_close() closes
+        # the listening socket. Without the close, the socket
+        # stays open until the server is garbage-collected — the
+        # ResourceWarning the suite used to print (H1).
         self._server.shutdown()
+        self._server.server_close()

@@ -15,6 +15,9 @@
     vault create|list                        the encrypted login vault
     vault add SITE                           prompts for user + password
     vault remove SITE
+    history export <file>                    the visit history out as JSON
+    reports                                  list the saved research reports
+    --version                                what changed in this version
 
 Human-readable output by default; --json prints the exact dicts the
 library returns. Vault passwords are prompted with no echo and are
@@ -607,6 +610,37 @@ def _cmd_preview(args):
     return 0
 
 
+def _cmd_history(args):
+    # I4: the visit history out to a file — the smallest real
+    # export, mirroring `memory export`.
+    from .titles import load_history
+    if args.action == "export":
+        entries = load_history()
+        path = args.value or os.path.expanduser(
+            "~/.forge/history-export.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"visits": entries}, handle, indent=2)
+        print(f"exported {len(entries)} visits to {path}")
+        return 0
+    print("usage: history export <file>")
+    return 1
+
+
+def _cmd_reports(args):
+    # I4: the saved research reports, newest first.
+    from .research import list_reports
+    reports = list_reports()
+    if not reports:
+        print("no saved research reports yet — run a research plan "
+              "with --yes and the report is saved here")
+        return 0
+    for report in reports:
+        when = (time.strftime("%Y-%m-%d", time.localtime(report["at"]))
+                if report["at"] else "?")
+        print(f"{when}  {report['topic']}  ({report['name']})")
+    return 0
+
+
 def _cmd_app(args):
     from .app import run_app
     return run_app(args.url)
@@ -656,9 +690,18 @@ def _cmd_open(args):
 
 
 def main(argv=None):
+    # I3: --version prints the whatsnew line — engine-room parity
+    # with the window's "what changed" line. Imported here, not
+    # at the top: whatsnew reads the package version, and cli is
+    # imported while the package is still loading.
+    from . import __version__
+    from .whatsnew import whats_new_line
     parser = argparse.ArgumentParser(
         prog="forge.browser",
         description="Forge Browser — a standalone keyless, multimodal AI browser.")
+    parser.add_argument("--version", action="version",
+                        version=whats_new_line(__version__),
+                        help="print what changed in this version")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("chat", help="talk to the browser in the terminal (local model)")
@@ -803,6 +846,18 @@ def main(argv=None):
     p.add_argument("action", choices=["create", "list", "add", "remove"])
     p.add_argument("site", nargs="?", default="")
     p.set_defaults(func=_cmd_vault)
+
+    p = sub.add_parser("history", help="the visit history "
+                                       "(history export <file> saves it as JSON)")
+    p.add_argument("action", nargs="?", default=None,
+                   choices=["export"])
+    p.add_argument("value", nargs="?", default="",
+                   help="the export path "
+                        "(default: ~/.forge/history-export.json)")
+    p.set_defaults(func=_cmd_history)
+
+    p = sub.add_parser("reports", help="list the saved research reports")
+    p.set_defaults(func=_cmd_reports)
 
     args = parser.parse_args(argv)
     if getattr(args, "action", "") in ("add", "remove") and not args.site:

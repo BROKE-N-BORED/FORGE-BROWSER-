@@ -69,11 +69,14 @@ def check_fetch_url(url, allow_local=False):
     sandbox's resolver answers example.org with a CGNAT address)
     and those addresses are ISP space, not this machine or LAN. A
     name that does not resolve at all passes the fence — the fetch
-    itself then fails with "could not reach". TOCTOU: the fetch
-    re-resolves after this check, so a hostile DNS could in
-    principle flip the answer between the two lookups (in practice
-    the resolver usually caches the first answer); pinning the
-    connection to the checked address is the remaining step.
+    itself then fails with "could not reach". There is no TOCTOU
+    between this check and the connection (G1): the pinned
+    handlers resolve the request host once more at open time,
+    check that answer the same way, and connect to it — the
+    address that is checked is the address that is connected to,
+    so a hostile DNS cannot flip the answer in between. This
+    up-front check is fail-fast (a plain refusal before any
+    socket work); the connection-time check is authoritative.
 
     Redirects are re-fenced on every hop (Z2): the redirect
     handler runs this check on each new URL before following it,
@@ -104,7 +107,7 @@ def check_fetch_url(url, allow_local=False):
         if not address.is_global:
             _refuse_local(host, f"non-global IP literal {address}")
         return
-    _check_resolved_host(host)
+    _resolve_checked_host(host)  # raises on a local resolution
 
 
 def _parse_ip_literal(host):
@@ -151,14 +154,20 @@ def _is_local_address(address):
     return any(address in network for network in _LOCAL_RESOLVED_NETWORKS)
 
 
-def _check_resolved_host(host):
-    """Z3: resolve a DNS name and refuse it if it points at a local
-    address. A name that does not resolve passes — the fetch
-    fails on its own with "could not reach"."""
+def _resolve_checked_host(host):
+    """Z3 + G1: resolve a DNS name ONCE, refuse it if ANY answer
+    points at a local address, and return the checked addresses
+    (deduplicated, resolver order) for the connection to use.
+    The fence and the connection share this one resolution — the
+    address that is checked is the address that is connected to,
+    so a hostile DNS cannot flip the answer in between. A name
+    that does not resolve returns [] — the fetch fails on its
+    own with "could not reach"."""
     try:
         infos = socket.getaddrinfo(host, None)
     except (socket.gaierror, OSError):
-        return
+        return []
+    addresses = []
     for info in infos:
         sockaddr = info[4]
         if not sockaddr:
@@ -175,6 +184,10 @@ def _check_resolved_host(host):
                 "reach this machine or the LAN. If that is what you "
                 "meant, pass allow_local=True, or --allow-local on "
                 "the command line, or set FORGE_BROWSER_ALLOW_LOCAL=1.")
+        text = str(address)
+        if text not in addresses:
+            addresses.append(text)
+    return addresses
 
 
 def _refuse_local(host, reason):
@@ -253,19 +266,138 @@ class _FencedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+# G1: DNS pinning — resolve once, connect to the checked address.
+# The pinned handlers resolve each request's host at open time
+# (initial request and every redirect hop), check that answer
+# with the fence, and hand the checked addresses to the
+# connection, which tries them in resolver order. The socket is
+# opened to a checked address, never to a fresh re-resolution —
+# the TOCTOU the 0.7 changelog named is closed. For HTTPS the
+# TLS handshake still uses the DNS name for SNI and certificate
+# verification (the name, not the address, is what the
+# certificate is issued for); only the TCP socket goes to the
+# pinned address.
+
+def _pinned_addrs_for(req, allow_local):
+    """The checked addresses a request may connect to (G1), or
+    None for no pin: local fetching allowed, an IP literal (the
+    literal IS the address — nothing to re-resolve), a localhost
+    name, or a name that does not resolve (the fetch then fails
+    with "could not reach", as before). The fence still refuses
+    literals and localhost names up front in check_fetch_url and
+    on redirect hops; this function only decides the pin."""
+    if allow_local or _allow_local_switch():
+        return None
+    host = (urllib.parse.urlparse(req.get_full_url()).hostname
+            or "").lower().rstrip(".")
+    if not host:
+        return None
+    # A proxied request is not pinned: the socket goes to the
+    # proxy, not the origin, so pinning to the origin's address
+    # would connect to the wrong host entirely. ProxyHandler
+    # rewrites req.host to the proxy before http_open runs — a
+    # request host that is not the URL's host means proxied.
+    req_host = urllib.parse.urlparse(
+        "//" + (req.host or "")).hostname or ""
+    if req_host.lower().rstrip(".") != host:
+        return None
+    if host == "localhost" or host.endswith(".localhost") \
+            or host.endswith(".local"):
+        return None
+    if _parse_ip_literal(host) is not None:
+        return None
+    return _resolve_checked_host(host)
+
+
+class _PinnedConnectionMixin:
+    """A connection that opens its socket to the address the
+    fence already checked. http.client keeps the socket factory
+    as an instance attribute (_create_connection) precisely so
+    it can be replaced; the pinned subclasses point it at this
+    method. With no pin, the behaviour is exactly the default.
+    With a pin, each checked address is tried in resolver order
+    — the same fall-through create_connection does on its own
+    when a host has several answers and the first is dead."""
+
+    _pinned_addrs = None
+
+    def _pinned_create_connection(self, address, timeout,
+                                  source_address=None):
+        if not self._pinned_addrs:
+            return socket.create_connection(address, timeout,
+                                            source_address)
+        _host, port = address
+        last_error = None
+        for ip in self._pinned_addrs:
+            try:
+                return socket.create_connection(
+                    (ip, port), timeout, source_address)
+            except OSError as exc:
+                last_error = exc
+        raise last_error
+
+
+class _PinnedHTTPConnection(_PinnedConnectionMixin,
+                            http.client.HTTPConnection):
+    def __init__(self, *args, pinned_addrs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pinned_addrs = pinned_addrs or []
+        self._create_connection = self._pinned_create_connection
+
+
+class _PinnedHTTPSConnection(_PinnedConnectionMixin,
+                             http.client.HTTPSConnection):
+    def __init__(self, *args, pinned_addrs=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pinned_addrs = pinned_addrs or []
+        self._create_connection = self._pinned_create_connection
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    """HTTP handler that pins the connection to the address the
+    fence checked (G1). do_open passes extra keywords to the
+    connection constructor, so the pin rides in as one."""
+
+    def __init__(self, allow_local=False, debuglevel=None):
+        super().__init__(debuglevel)
+        self._allow_local = allow_local
+
+    def http_open(self, req):
+        return self.do_open(
+            _PinnedHTTPConnection, req,
+            pinned_addrs=_pinned_addrs_for(req, self._allow_local))
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler with the same pinning (G1). The context is
+    passed through exactly as the parent does; only the TCP
+    socket is pinned, never the TLS name."""
+
+    def __init__(self, allow_local=False, debuglevel=0, context=None):
+        super().__init__(debuglevel, context)
+        self._allow_local = allow_local
+
+    def https_open(self, req):
+        return self.do_open(
+            _PinnedHTTPSConnection, req, context=self._context,
+            pinned_addrs=_pinned_addrs_for(req, self._allow_local))
+
+
 def _urlopen(request, timeout, allow_local):
-    """urlopen with the fence on redirects (Z2): a fresh opener
-    per call, so the redirect handler's allow_local matches this
-    fetch. Separated from the fetch functions so tests can stand
-    in a fake transport."""
+    """urlopen with the fence on redirects (Z2) and DNS pinning
+    (G1): a fresh opener per call, so the handlers' allow_local
+    matches this fetch. Separated from the fetch functions so
+    tests can stand in a fake transport."""
     opener = urllib.request.build_opener(
-        _FencedRedirectHandler(allow_local=allow_local))
+        _FencedRedirectHandler(allow_local=allow_local),
+        _PinnedHTTPHandler(allow_local=allow_local),
+        _PinnedHTTPSHandler(allow_local=allow_local))
     return opener.open(request, timeout=timeout)
 
 # W6: the browser names its own repo (the old string said Code
 # Forge's). The version tracks the package — bump it with the
 # version bump.
-USER_AGENT = "ForgeBrowser/0.7 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
+USER_AGENT = "ForgeBrowser/0.9 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
 DEFAULT_TIMEOUT = 20  # seconds
 
 # W5: the full-disk guard — a download stops cleanly when free

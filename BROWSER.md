@@ -186,11 +186,13 @@ through. Redirects are re-fenced on every hop: a public URL that
 resolved and refused when they point at the local machine or the
 LAN; CGNAT (100.64/10) is allowed, because a public name can
 resolve there behind a proxy and CGNAT is ISP space, not this
-machine. One window remains: the fetch re-resolves after the
-fence's check, so a hostile DNS could in principle flip the
-answer between the two lookups (in practice the resolver usually
-caches the first answer); pinning the connection to the checked
-address would close that. Every refusal is recorded (host +
+machine. The connection goes to the address the fence checked:
+each request's host is resolved once, the answer is checked,
+and the socket connects to that same answer — a hostile DNS
+cannot flip the answer between the check and the connection
+(the window the 0.7 notes named is closed). For HTTPS the TLS
+handshake still uses the DNS name, only the socket is pinned.
+Every refusal is recorded (host +
 reason) in `~/.forge/fence-log.json`, so steering attempts are
 visible afterwards.
 
@@ -457,6 +459,9 @@ python3 -m forge.browser research "topic" --yes [--out report.md]
 python3 -m forge.browser verify page.html --workspace /path/to/project
 python3 -m forge.browser engines [--json]
 python3 -m forge.browser vault create | list | add SITE | remove SITE
+python3 -m forge.browser history export out.json   # the visit history out as JSON
+python3 -m forge.browser reports                   # the saved research reports
+python3 -m forge.browser --version                 # what changed in this version
 ```
 
 `--json` prints the same data the Python functions return, which is
@@ -617,7 +622,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (493 checks),
+`forge/browser/` (the package), `tests/` (534 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that
@@ -646,13 +651,18 @@ on Joshua's PC. His run closes the items, as usual.
 
 ## Limits, plainly
 
-- One engine session = one page. No parallel tabs in this build;
-  that is deliberate on an 8 GB machine.
+- One engine-room session = one page: the CDP session behind
+  render/snapshot/screenshot drives a single page at a time, no
+  parallel pages in this build; that is deliberate on an 8 GB
+  machine. The window itself has as many tabs as the person
+  opens — this limit is the engine room's, not the window's.
 - Lightpanda is a beta engine: partial web APIs, rough rendering,
   and link-click navigation did not complete in the live test
   (the click dispatched; the page did not change). Chromium is the
   engine for interactive flows; Lightpanda is the fast reader.
 - The PDF extractor reads text-layer PDFs (the common generated
-  kind). Scanned PDFs need OCR, which is not in this build.
+  kind). Scanned PDFs are read with OCR when tesseract is
+  installed (and the note says plainly what to install when it
+  is not).
 - Search engines can bot-check any network. The backend chain and
   the local SearXNG option are the answers built in.

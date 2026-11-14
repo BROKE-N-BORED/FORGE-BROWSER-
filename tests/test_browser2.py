@@ -2039,6 +2039,17 @@ class WebUITests(unittest.TestCase):
         self.assertIn("Gear Facts", page)
         self.assertIn("https://gears.example/", page)
 
+    def test_stop_closes_the_listening_socket(self):
+        # H1: stop() used to shut down the serve loop but leave
+        # the socket open until GC (ResourceWarning). It closes
+        # it now.
+        from forge.browser import webui
+        server = webui.LocalPageServer().start()
+        sock = server._server.socket
+        self.assertNotEqual(sock.fileno(), -1)
+        server.stop()
+        self.assertEqual(sock.fileno(), -1)
+
     def test_local_pages_serve(self):
         import urllib.request
         from forge.browser import webui
@@ -2284,7 +2295,7 @@ class WebUITests(unittest.TestCase):
                             server.home_url + "brief-refresh",
                             timeout=5).read().decode()
                         self.assertIn("Rebuilding the brief", body)
-                        self.assertIn("reload", body)
+                        self.assertIn("Reload", body)
                         for _ in range(50):
                             if rebuilt.call_count:
                                 break
@@ -2885,6 +2896,530 @@ class DocsTests(unittest.TestCase):
         self.assertEqual(len(current), 1,
                          "TASK-LIST.md needs exactly one **Suite:** line")
         self.assertIn(str(count), current[0])
+
+
+class UiTextRulesTests(unittest.TestCase):
+    """A2: U33 — no em-dashes in visible UI text, test-enforced.
+
+    The deep audit counted 48 em-dash string literals in app.py
+    (plus 13 in webui.py's served pages and 2 in compare.py's
+    comparison page); the A1 sweep removed them all. This test
+    parses the three UI files with ast and fails the suite if an
+    em-dash ever appears in a non-docstring string literal again —
+    the same test-enforced pattern as the B1 test-count test.
+    Docstrings and comments may still use em-dashes; they are
+    never shown in the window.
+    """
+
+    UI_FILES = ("forge/browser/app.py", "forge/browser/webui.py",
+                "forge/browser/compare.py")
+
+    def _em_dash_literals(self, path):
+        import ast
+        with open(path, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        docstrings = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                body = node.body
+                if (body and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)):
+                    docstrings.add(id(body[0].value))
+        return [(node.lineno, node.value)
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and "—" in node.value
+                and id(node) not in docstrings]
+
+    def test_no_em_dash_in_visible_ui_strings(self):
+        root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for rel in self.UI_FILES:
+            for lineno, value in self._em_dash_literals(
+                    os.path.join(root, rel)):
+                offenders.append("%s:%d: %r" % (rel, lineno, value[:60]))
+        self.assertEqual(offenders, [],
+                         "em-dash in visible UI text (U33):\n"
+                         + "\n".join(offenders))
+
+    def test_window_title_suffix_and_tagline(self):
+        # The window title suffix and the status-bar tagline are the
+        # most-seen strings in the app; both used to carry em-dashes.
+        from forge.browser.app import _TAGLINE
+        self.assertNotIn("—", _TAGLINE)
+        root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "forge/browser/app.py"),
+                  encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("· Forge Browser", source)
+
+
+class DebugLogTests(unittest.TestCase):
+    """B1: the vendored BNB S61 + T21 debug log layer, working in
+    place. A focused port of the upstream smoke test — the module
+    itself is copied verbatim, these checks prove the copy."""
+
+    # Deliberate FAKE values, not real credentials: key-shaped
+    # fixtures that prove the scrubber redacts key-shaped values.
+    FAKE_KEY = "sk-fake-key-1234567890abcdef"
+    FAKE_TOKEN = "ghp_faketoken1234567890abcd"
+
+    def _logger(self, tmp, app="testapp", **kwargs):
+        from forge.browser.debug_log import DebugLogger
+        log = DebugLogger(app, "1.0",
+                          log_dir=os.path.join(tmp, "logs"), **kwargs)
+        self.addCleanup(self._close, log)
+        return log
+
+    @staticmethod
+    def _close(log):
+        for handler in list(log.logger.handlers):
+            try:
+                handler.close()
+            finally:
+                log.logger.removeHandler(handler)
+
+    def test_scrub_text_redacts_secrets_keeps_normal_text(self):
+        from forge.browser.debug_log import scrub_text
+        self.assertNotIn(self.FAKE_KEY,
+                         scrub_text("api_key=" + self.FAKE_KEY))
+        self.assertIn("[REDACTED]",
+                      scrub_text("api_key=" + self.FAKE_KEY))
+        self.assertNotIn("hunter2", scrub_text("password: hunter2"))
+        self.assertEqual(scrub_text("model qwen3.5:2b loaded in 4.2s"),
+                         "model qwen3.5:2b loaded in 4.2s")
+
+    def test_scrub_dict_redacts_sensitive_keys(self):
+        from forge.browser.debug_log import scrub_dict
+        scrubbed = scrub_dict({
+            "model": "qwen3.5:2b",
+            "api_key": self.FAKE_KEY,
+            "token": self.FAKE_TOKEN,
+            "empty_key": "",
+            "nested": {"password": "hunter2", "mode": "blind"},
+        })
+        self.assertEqual(scrubbed["api_key"], "[REDACTED] — present")
+        self.assertEqual(scrubbed["token"], "[REDACTED] — present")
+        self.assertEqual(scrubbed["empty_key"], "[absent]")
+        self.assertEqual(scrubbed["nested"]["password"],
+                         "[REDACTED] — present")
+        self.assertEqual(scrubbed["model"], "qwen3.5:2b")
+        self.assertEqual(scrubbed["nested"]["mode"], "blind")
+
+    def test_report_has_all_sections_and_no_secrets(self):
+        from forge.browser.debug_log import check_ollama
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp, history=5)
+            log.set_setting("model", "qwen3.5:2b")
+            log.set_setting("api_key", self.FAKE_KEY)
+            log.register_service(
+                "ollama",
+                lambda: check_ollama(base_url="http://127.0.0.1:9",
+                                     timeout=1))
+            log.register_dependency("nonexistent-package-xyz")
+            log.info("startup ok")
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                log.exception("relay failed")
+            for i in range(8):
+                log.action("step %d" % i)
+            path = log.generate_report()
+            self.assertRegex(os.path.basename(path),
+                             r"debug-report-testapp-\d{8}-\d{6}\.txt$")
+            with open(path, encoding="utf-8") as handle:
+                report = handle.read()
+            for section in ("== Context ==", "== Settings ==",
+                            "== Services ==", "== Recent actions",
+                            "== Errors ==", "== Log tail"):
+                self.assertIn(section, report)
+            self.assertIn("ValueError: boom", report)
+            self.assertIn("Traceback", report)
+            self.assertNotIn(self.FAKE_KEY, report)
+            self.assertNotIn(self.FAKE_TOKEN, report)
+            self.assertIn("[REDACTED]", report)
+            self.assertIn("ollama: not reachable", report)
+            self.assertIn("nonexistent-package-xyz: not installed",
+                          report)
+            actions = report.split("== Recent actions")[1].split(
+                "== Errors ==")[0]
+            self.assertIn("step 7", actions)
+            self.assertIn("step 3", actions)
+            self.assertNotIn("step 2", actions)
+
+    def test_rotation_caps_total_log_size(self):
+        import glob
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp, app="rotapp", max_bytes=1024,
+                               backup_count=2, history=5)
+            for i in range(200):
+                log.info("filler line %03d %s" % (i, "x" * 40))
+            for handler in log.logger.handlers:
+                handler.flush()
+            sizes = [os.path.getsize(p)
+                     for p in glob.glob(log.log_path + "*")]
+            self.assertGreater(len(sizes), 1)
+            self.assertLessEqual(sum(sizes), 3 * 1024 + 512)
+
+    def test_crash_handler_writes_a_report(self):
+        import glob
+        import sys as _sys
+        with tempfile.TemporaryDirectory() as tmp:
+            log = self._logger(tmp, app="crashapp")
+            log_dir = os.path.join(tmp, "logs")
+            before = set(glob.glob(os.path.join(
+                log_dir, "debug-report-*.txt")))
+            log.install_crash_handler()
+            try:
+                _sys.excepthook(ValueError, ValueError("crash-test"),
+                                None)
+            finally:
+                log.uninstall_crash_handler()
+            after = set(glob.glob(os.path.join(
+                log_dir, "debug-report-*.txt")))
+            self.assertGreater(len(after), len(before))
+
+
+class HowtoTests(unittest.TestCase):
+    """B2: the How to Use index reads BROWSER.md's own headings."""
+
+    def test_find_manual_finds_the_repo_manual(self):
+        from forge.browser.howto import find_manual
+        path = find_manual()
+        self.assertIsNotNone(path)
+        self.assertTrue(path.endswith("BROWSER.md"))
+        self.assertTrue(os.path.isfile(path))
+
+    def test_load_sections_from_the_real_manual(self):
+        from forge.browser.howto import load_sections
+        sections = load_sections()
+        self.assertGreaterEqual(len(sections), 30)
+        titles = [title for _level, title, _body in sections]
+        self.assertEqual(titles[0],
+                         "Forge Browser (standalone: the AI browser build)")
+        self.assertIn("Install (standalone)", titles)
+        self.assertIn("Chat: the AI part", titles)
+        self.assertIn("Limits, plainly", titles)
+        bodies = dict((title, body)
+                      for _level, title, body in sections)
+        self.assertIn("double-click", bodies["Install (standalone)"])
+
+    def test_no_loaded_title_carries_an_em_dash(self):
+        # Titles are index entries — visible UI text (U33).
+        from forge.browser.howto import load_sections
+        for _level, title, _body in load_sections():
+            self.assertNotIn("—", title)
+
+    def test_load_sections_on_a_fixture(self):
+        from forge.browser.howto import load_sections
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "MANUAL.md")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("# Top\n\nintro\n\n## First — part\n\n"
+                             "body one\n\n### Deep\n\nbody two\n")
+            sections = load_sections(path)
+        self.assertEqual(
+            [(level, title) for level, title, _b in sections],
+            [(1, "Top"), (2, "First: part"), (3, "Deep")])
+        self.assertEqual(sections[1][2], "body one")
+        self.assertEqual(sections[2][2], "body two")
+
+    def test_missing_manual_is_empty_not_an_error(self):
+        from forge.browser.howto import load_sections
+        self.assertEqual(
+            load_sections("/nonexistent-dir-nope/BROWSER.md"), [])
+
+
+class HowtoWebTests(unittest.TestCase):
+    """B2: the /howto page and the start page's first-run link."""
+
+    def test_howto_route_serves_the_index(self):
+        import urllib.request
+        from forge.browser import webui
+        server = webui.LocalPageServer().start()
+        try:
+            body = urllib.request.urlopen(
+                server.home_url + "howto", timeout=5).read().decode()
+        finally:
+            server.stop()
+        self.assertIn("How to Use", body)
+        self.assertIn("Install (standalone)", body)
+        self.assertIn("#s0", body)
+
+    def test_start_page_links_howto_on_first_run(self):
+        import urllib.request
+        from unittest import mock
+        from forge.browser import webui
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"FORGE_BROWSER_HISTORY_PATH":
+                   os.path.join(tmp, "no-history.json")}
+            with mock.patch.dict(os.environ, env):
+                server = webui.LocalPageServer().start()
+                try:
+                    body = urllib.request.urlopen(
+                        server.home_url, timeout=5).read().decode()
+                finally:
+                    server.stop()
+        self.assertIn('href="/howto"', body)
+        self.assertIn("First time here?", body)
+
+
+class AppWiringTests(unittest.TestCase):
+    """B1/B3/B4: the window wiring, pinned in the stdlib suite.
+
+    The Qt behavior itself (menu clicks, second-instance exit,
+    the icon actually showing) is proven by the offscreen smoke
+    run, not here — the suite has no Qt. These checks pin the
+    wiring in place so a later edit cannot silently drop it.
+    """
+
+    def _app_source(self):
+        root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "forge/browser/app.py"),
+                  encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_help_menu_has_howto_and_debug_report(self):
+        source = self._app_source()
+        self.assertIn('"How to Use…"', source)
+        self.assertIn('"Debug Report…"', source)
+        self.assertIn("def _show_howto", source)
+        self.assertIn("def _show_debug_report", source)
+        self.assertIn("install_crash_handler()", source)
+
+    def test_single_instance_guard_and_window_icon(self):
+        source = self._app_source()
+        self.assertIn("QLockFile", source)
+        self.assertIn("QLocalServer", source)
+        self.assertIn("tryLock(0)", source)
+        self.assertIn("_take_single_instance()", source)
+        self.assertIn("setWindowIcon", source)
+        self.assertIn("def app_icon_path", source)
+
+    def test_app_icon_path_finds_the_repo_svg(self):
+        from forge.browser.app import app_icon_path
+        path = app_icon_path()
+        self.assertIsNotNone(path)
+        self.assertTrue(path.endswith("forge-browser.svg"))
+        self.assertTrue(os.path.isfile(path))
+
+
+class VersionTests(unittest.TestCase):
+    """E4: one __version__ for the repo. forge/__init__.py used to
+    say "2.5" (the Code Forge parent version) while the browser
+    said "0.8" — a reader grepping for the version found two
+    answers. The parent mirrors the browser now, pinned here."""
+
+    def test_parent_and_browser_versions_agree(self):
+        import forge
+        from forge.browser import __version__ as browser_version
+        self.assertEqual(forge.__version__, browser_version)
+
+
+class DocFixTests(unittest.TestCase):
+    """E1/E2/E3: the deep audit's doc fixes, pinned."""
+
+    def _read(self, rel):
+        root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, rel), encoding="utf-8") as handle:
+            text = handle.read()
+        # Prose wraps mid-sentence; collapse whitespace so the
+        # assertions check the words, not the line breaks.
+        return " ".join(text.split())
+
+    def test_limits_no_longer_calls_ocr_missing(self):
+        text = self._read("BROWSER.md")
+        self.assertNotIn("Scanned PDFs need OCR, which is not in "
+                         "this build", text)
+        self.assertIn("Scanned PDFs are read with OCR when "
+                      "tesseract is installed", text)
+
+    def test_limits_names_the_one_page_limit_correctly(self):
+        text = self._read("BROWSER.md")
+        self.assertNotIn("One engine session = one page. "
+                         "No parallel tabs in this build", text)
+        self.assertIn("this limit is the engine room's, not the "
+                      "window's", text)
+
+    def test_changelog_makes_no_v03_release_claim(self):
+        # The 0.3 section itself must make no release claim. (The
+        # 0.9 section names the claim while recording its
+        # correction — so the assertion is scoped to the 0.3
+        # section, not the whole file.)
+        from forge.browser.whatsnew import read_changelog_section
+        section = " ".join(read_changelog_section("0.3"))
+        self.assertNotIn("GitHub Release v0.3", section)
+        self.assertIn("shipped together as GitHub Release v0.7", section)
+
+
+class CliCheckVersionHistoryTests(unittest.TestCase):
+    """I2/I3/I4: run.sh check, --version, history export, reports."""
+
+    def _root(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _run_main(self, argv):
+        import contextlib
+        import io
+        from forge.browser.cli import main
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            try:
+                code = main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, buffer.getvalue()
+
+    def test_version_prints_whatsnew_line(self):
+        # I3: --version is the window's "what changed" line, not
+        # a bare number — engine-room parity.
+        from forge.browser import __version__
+        code, out = self._run_main(["--version"])
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            out.startswith(f"What's new in {__version__}: "),
+            out)
+
+    def test_history_export_writes_json(self):
+        # I4: the visit history out to a file, as JSON.
+        from unittest import mock
+        from forge.browser.titles import record_visit
+        with tempfile.TemporaryDirectory() as tmp:
+            history = os.path.join(tmp, "history.json")
+            out_path = os.path.join(tmp, "export.json")
+            with mock.patch.dict(os.environ,
+                                 {"FORGE_BROWSER_HISTORY_PATH": history}):
+                record_visit("https://gears.example/", "Gear Guide")
+                record_visit("https://other.example/", "Other Page")
+                code, out = self._run_main(
+                    ["history", "export", out_path])
+            self.assertEqual(code, 0)
+            self.assertIn("exported 2 visits to", out)
+            with open(out_path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.assertEqual(len(data["visits"]), 2)
+            urls = [v["url"] for v in data["visits"]]
+            self.assertIn("https://gears.example/", urls)
+            self.assertIn("https://other.example/", urls)
+
+    def test_history_export_empty_history(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "export.json")
+            with mock.patch.dict(os.environ,
+                                 {"FORGE_BROWSER_HISTORY_PATH":
+                                  os.path.join(tmp, "no-history.json")}):
+                code, out = self._run_main(
+                    ["history", "export", out_path])
+            self.assertEqual(code, 0)
+            self.assertIn("exported 0 visits to", out)
+            with open(out_path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), {"visits": []})
+
+    def test_history_bare_prints_usage(self):
+        code, out = self._run_main(["history"])
+        self.assertEqual(code, 1)
+        self.assertIn("usage: history export", out)
+
+    def test_reports_lists_saved_reports(self):
+        # I4: the saved research reports, newest first.
+        from unittest import mock
+        from forge.browser.research import save_report
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "research")
+            with mock.patch.dict(os.environ,
+                                 {"FORGE_BROWSER_RESEARCH_DIR": folder}):
+                save_report("gears", "# Research: gears\n\nbody\n")
+                code, out = self._run_main(["reports"])
+            self.assertEqual(code, 0)
+            self.assertIn("gears", out)
+
+    def test_reports_empty(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ,
+                                 {"FORGE_BROWSER_RESEARCH_DIR":
+                                  os.path.join(tmp, "research")}):
+                code, out = self._run_main(["reports"])
+            self.assertEqual(code, 0)
+            self.assertIn("no saved research reports yet", out)
+
+    def test_run_sh_check_without_ollama_reports_not_run(self):
+        # I2: no Ollama answering means the validators are
+        # reported as not run — never a crash, never a failure.
+        import subprocess
+        env = dict(os.environ)
+        env["FORGE_OLLAMA_URL"] = "http://127.0.0.1:9"
+        proc = subprocess.run(
+            ["sh", "run.sh", "check"], cwd=self._root(),
+            capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("not run: no Ollama answering", proc.stdout)
+        self.assertIn("Threshold validators", proc.stdout)
+
+    def test_run_sh_names_both_validators_and_parses(self):
+        import subprocess
+        root = self._root()
+        with open(os.path.join(root, "run.sh"),
+                  encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("validate_threshold", text)
+        self.assertIn("validate_memory_threshold", text)
+        proc = subprocess.run(["sh", "-n", "run.sh"], cwd=root,
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class CiTests(unittest.TestCase):
+    """J1: the free CI script exists, parses, and its verdict
+    record carries the current suite count. CI-STATUS.md is
+    generated by `sh ci/check.sh` and committed with the push —
+    README.md is the count's reference here (DocsTests already
+    pins README.md to the true suite count)."""
+
+    def _root(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _read(self, rel):
+        with open(os.path.join(self._root(), rel),
+                  encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_check_script_exists_and_parses(self):
+        import subprocess
+        path = os.path.join(self._root(), "ci", "check.sh")
+        self.assertTrue(os.path.isfile(path))
+        proc = subprocess.run(["sh", "-n", path],
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_build_zip_script_exists_and_parses(self):
+        import subprocess
+        path = os.path.join(self._root(), "ci", "build-zip.py")
+        self.assertTrue(os.path.isfile(path))
+        proc = subprocess.run(
+            [sys.executable, "-m", "py_compile", path],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_ci_status_carries_current_suite_count(self):
+        import re
+        readme_count = re.search(r"(\d+) checks", self._read("README.md"))
+        self.assertIsNotNone(readme_count, "README.md states no count")
+        status = self._read("CI-STATUS.md")
+        status_count = re.search(r"(\d+) checks", status)
+        self.assertIsNotNone(status_count,
+                             "CI-STATUS.md carries no suite count")
+        self.assertEqual(status_count.group(1), readme_count.group(1))
+        self.assertIn("Release zip:", status)
+        self.assertIn("modes", status)
 
 
 class VerifyTests(unittest.TestCase):

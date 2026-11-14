@@ -193,7 +193,7 @@ def compare_table_text(rows, fields, dropped=0, max_chars=None):
     if left_out:
         text += f"\n({left_out} field(s) left out to fit.)"
     if dropped:
-        text += (f"\n({dropped} tab(s) left out — the comparison "
+        text += (f"\n({dropped} tab(s) left out. The comparison "
                  f"covers {len(rows)} tabs.)")
     return text
 
@@ -231,8 +231,8 @@ def compare_table_html(rows, fields, dropped=0):
         body += f"<tr><th>{html.escape(field)}</th>{cells}</tr>"
     note = ""
     if dropped:
-        note = (f"<p class=\"note\">{dropped} tab(s) left out — "
-                f"the comparison covers {len(rows)} tabs.</p>")
+        note = (f"<p class=\"note\">{dropped} tab(s) left out. "
+                f"The comparison covers {len(rows)} tabs.</p>")
     links = ""
     if _SERVER_BASE:
         links = (f"<p class=\"actions\"><a href=\"{_SERVER_BASE}compare-refresh\">"

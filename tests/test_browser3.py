@@ -2519,10 +2519,10 @@ class TurnStatusTests(unittest.TestCase):
         from forge.browser.app import turn_status_text
         # V1: plain words, not the raw action kind.
         self.assertEqual(turn_status_text("search", 100.0, now=112.0),
-                         "working: searching… — 12s")
+                         "working: searching… 12s")
         # V5: "<1s", not "0s".
         self.assertEqual(turn_status_text("thinking", 100.0, now=100.4),
-                         "working: thinking… — <1s")
+                         "working: thinking… <1s")
 
     def test_step_words_plain(self):
         # V1: the working line's vocabulary, from describe_action.
@@ -2551,7 +2551,7 @@ class TurnStatusTests(unittest.TestCase):
         from forge.browser.app import turn_status_text
         self.assertEqual(
             turn_status_text("search", 100.0, now=112.0, waited=11.0),
-            "working: searching… — 1s")
+            "working: searching… 1s")
 
     def test_done_line_names_waiting(self):
         # V2: the done line names the waiting time it excluded.

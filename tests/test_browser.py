@@ -7,6 +7,7 @@ server on 127.0.0.1 serving a fixture page — the same pattern Forge's
 never a unit test.
 """
 
+import io
 import json
 import os
 import socket
@@ -609,6 +610,241 @@ class FenceAuditTests(_ServerCase):
         self.assertEqual(entries[-1]["host"], "2130706433")
         self.assertIn("127.0.0.1", entries[-1]["reason"])
         self.assertIn("time", entries[-1])
+
+
+class FencePinningTests(unittest.TestCase):
+    """G1: the connection goes to the address the fence checked —
+    resolve once, connect to the checked address. The socket is
+    faked (no network): a scripted socket serves canned HTTP
+    responses, and a scripted resolver flips its answer, so the
+    test can prove the fetch connected to the CHECKED address
+    even after DNS changed its mind."""
+
+    _PUBLIC = "93.184.216.34"
+    _PUBLIC_2 = "198.51.100.7"
+
+    class _FakeSocket:
+        """Enough of a socket for http.client: sendall swallows
+        the request, makefile serves the canned response."""
+
+        def __init__(self, response):
+            self._response = response
+            self.sent = []
+
+        def sendall(self, data):
+            self.sent.append(data)
+
+        def makefile(self, mode):
+            return io.BytesIO(self._response)
+
+        def setsockopt(self, *args):
+            pass
+
+        def settimeout(self, timeout):
+            pass
+
+        def gettimeout(self):
+            return None
+
+        def close(self):
+            pass
+
+    def setUp(self):
+        self._orig_getaddrinfo = socket.getaddrinfo
+        self._orig_create_connection = socket.create_connection
+        # The sandbox sets a proxy; these tests drive direct
+        # connections, so the proxy env stays out of them.
+        self._orig_proxy_env = {}
+        for var in ("http_proxy", "https_proxy", "HTTP_PROXY",
+                    "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+            if var in os.environ:
+                self._orig_proxy_env[var] = os.environ.pop(var)
+        self.targets = []       # (host, port) per connect attempt
+        self.resolutions = []   # host per getaddrinfo call
+        self._responses = []    # canned responses, in connect order
+
+    def tearDown(self):
+        socket.getaddrinfo = self._orig_getaddrinfo
+        socket.create_connection = self._orig_create_connection
+        for var, value in self._orig_proxy_env.items():
+            os.environ[var] = value
+
+    def _install_fakes(self, answers, responses):
+        """answers: host -> [ip, ...], or a callable(host, call)
+        returning [ip, ...]. responses: canned HTTP bytes, one
+        per connection, in order."""
+        calls = {"n": 0}
+        self._responses = list(responses)
+
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            calls["n"] += 1
+            self.resolutions.append(host)
+            if callable(answers):
+                ips = answers(host, calls["n"])
+            else:
+                ips = answers.get(host, [])
+            if isinstance(ips, Exception):
+                raise ips
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     (ip, 0)) for ip in ips]
+
+        def fake_create_connection(address, timeout=None,
+                                   source_address=None):
+            self.targets.append(address)
+            if not self._responses:
+                raise OSError("no canned response left")
+            return self._FakeSocket(self._responses.pop(0))
+
+        socket.getaddrinfo = fake_getaddrinfo
+        socket.create_connection = fake_create_connection
+        return calls
+
+    def test_connection_goes_to_checked_address_despite_flip(self):
+        # The flip: the first two resolutions (the up-front fence
+        # check, then the pin at open time) answer the public
+        # address; any later resolution would answer 127.0.0.1.
+        # The fetch must connect to the checked public address —
+        # and must never make that third resolution at all.
+        from forge.browser._http import http_get
+        calls = self._install_fakes(
+            lambda host, n: ([self._PUBLIC] if n <= 2
+                             else ["127.0.0.1"]),
+            [b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+             b"Content-Length: 5\r\n\r\nhello"])
+        _final, _headers, body = http_get("http://flipping.example/")
+        self.assertEqual(body, b"hello")
+        self.assertEqual(self.targets, [(self._PUBLIC, 80)])
+        self.assertEqual(calls["n"], 2)
+
+    def test_redirect_hop_is_pinned_to_its_own_answer(self):
+        # Each hop pins to its own checked answer: the first host
+        # resolves to one public address, the redirect target to
+        # another, and each connection goes to its own.
+        from forge.browser._http import http_get
+        self._install_fakes(
+            {"first.example": [self._PUBLIC],
+             "second.example": [self._PUBLIC_2]},
+            [b"HTTP/1.1 302 Found\r\n"
+             b"Location: http://second.example/page\r\n"
+             b"Content-Length: 0\r\n\r\n",
+             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+             b"Content-Length: 5\r\n\r\nhello"])
+        _final, _headers, body = http_get("http://first.example/start")
+        self.assertEqual(body, b"hello")
+        self.assertEqual(self.targets,
+                         [(self._PUBLIC, 80), (self._PUBLIC_2, 80)])
+
+    def test_pin_falls_through_to_next_address(self):
+        # A pinned host with several answers behaves like a
+        # normal connection: a dead first address falls through
+        # to the next, in resolver order.
+        from forge.browser._http import _PinnedHTTPConnection
+        attempted = []
+
+        def flaky(address, timeout=None, source_address=None):
+            attempted.append(address)
+            if address[0] == "192.0.2.1":
+                raise OSError("unreachable")
+            return self._FakeSocket(b"")
+
+        socket.create_connection = flaky
+        conn = _PinnedHTTPConnection(
+            "example.com",
+            pinned_addrs=["192.0.2.1", self._PUBLIC])
+        conn.connect()
+        self.assertEqual(attempted,
+                         [("192.0.2.1", 80), (self._PUBLIC, 80)])
+
+    def test_pin_raises_when_every_address_fails(self):
+        from forge.browser._http import _PinnedHTTPConnection
+
+        def dead(address, timeout=None, source_address=None):
+            raise OSError("unreachable")
+
+        socket.create_connection = dead
+        conn = _PinnedHTTPConnection(
+            "example.com", pinned_addrs=["192.0.2.1", "192.0.2.2"])
+        with self.assertRaises(OSError):
+            conn.connect()
+
+    def test_https_pin_keeps_the_name_for_tls(self):
+        # The TCP socket goes to the pinned address, but the TLS
+        # handshake still names the DNS host — the certificate is
+        # issued for the name, not the address.
+        from forge.browser._http import _PinnedHTTPSConnection
+
+        class _FakeContext:
+            def __init__(self):
+                self.seen_hostname = None
+
+            def wrap_socket(self, sock, server_hostname=None):
+                self.seen_hostname = server_hostname
+                return sock
+
+        context = _FakeContext()
+        socket.create_connection = lambda address, timeout=None, \
+            source_address=None: (
+                self.targets.append(address),
+                self._FakeSocket(b""))[1]
+        conn = _PinnedHTTPSConnection(
+            "example.com", context=context,
+            pinned_addrs=[self._PUBLIC])
+        conn.connect()
+        self.assertEqual(self.targets, [(self._PUBLIC, 443)])
+        self.assertEqual(context.seen_hostname, "example.com")
+
+    def test_literals_localhost_and_allow_local_get_no_pin(self):
+        # Nothing to pin when there is no DNS answer to flip:
+        # an IP literal IS the address, and localhost is fenced
+        # elsewhere. No resolution happens at all.
+        import urllib.request as _urlreq
+        from forge.browser._http import _pinned_addrs_for
+
+        def exploding(host, port, *args, **kwargs):
+            raise AssertionError("must not resolve")
+
+        socket.getaddrinfo = exploding
+        self.assertIsNone(_pinned_addrs_for(
+            _urlreq.Request("http://93.184.216.34/"), False))
+        self.assertIsNone(_pinned_addrs_for(
+            _urlreq.Request("http://localhost:8080/"), False))
+        self.assertIsNone(_pinned_addrs_for(
+            _urlreq.Request("http://example.org/"), True))
+
+    def test_unresolvable_name_gets_no_pin(self):
+        # A name that does not resolve pins to nothing — the
+        # fetch then fails with "could not reach", as before.
+        import urllib.request as _urlreq
+        from forge.browser._http import _pinned_addrs_for
+
+        def failing(host, port, *args, **kwargs):
+            raise socket.gaierror("no such host")
+
+        socket.getaddrinfo = failing
+        self.assertEqual(_pinned_addrs_for(
+            _urlreq.Request("http://does-not-exist.invalid/"), False),
+            [])
+
+    def test_proxied_request_gets_no_pin(self):
+        # Through a proxy the socket goes to the proxy, not the
+        # origin — pinning to the origin's address would connect
+        # to the wrong host. ProxyHandler rewrites req.host to
+        # the proxy before http_open runs; that rewrite is what
+        # the pin check sees. (The unrewritten request pins, as
+        # the control below shows.)
+        import urllib.request as _urlreq
+        from forge.browser._http import _pinned_addrs_for
+
+        def public(host, port, *args, **kwargs):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "",
+                     (self._PUBLIC, 0))]
+
+        socket.getaddrinfo = public
+        request = _urlreq.Request("http://example.org/")
+        self.assertEqual(_pinned_addrs_for(request, False),
+                         [self._PUBLIC])
+        request.host = "proxy.local:3128"  # ProxyHandler's rewrite
+        self.assertIsNone(_pinned_addrs_for(request, False))
 
 
 class CliTests(_ServerCase):

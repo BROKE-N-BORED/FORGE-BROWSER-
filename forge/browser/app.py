@@ -29,7 +29,7 @@ from .chat import format_duration, step_words
 from .errors import BrowserError
 from .preview import dwell_ms
 
-_TAGLINE = "Forge Browser — no accounts, no API keys, nothing tracked."
+_TAGLINE = "Forge Browser: no accounts, no API keys, nothing tracked."
 
 # N7: tab titles — raw and tidy alike — are capped at this many
 # characters on display, so five long words can't make a wide tab.
@@ -52,7 +52,7 @@ def needs_all_tab_text(text):
 
 
 def turn_status_text(step, started, now=None, waited=0):
-    """The dock's working line: 'working: searching… — 12s'.
+    """The dock's working line: 'working: searching… 12s'.
     The step is named in plain words (V1), not the raw action
     kind ("recall_pages"). waited seconds — time spent at the
     plan gate — do not count as work (V2), so the clock pauses
@@ -60,7 +60,7 @@ def turn_status_text(step, started, now=None, waited=0):
     "<1s", not "0s" (V5)."""
     now = time.monotonic() if now is None else now
     elapsed = max(0.0, now - started - waited)
-    return f"working: {step_words(step)}… — {format_duration(elapsed)}"
+    return f"working: {step_words(step)}… {format_duration(elapsed)}"
 
 
 def turn_done_text(outcome, started, now=None, speed=None, waited=0):
@@ -107,7 +107,7 @@ def _load_qt():
     except ImportError as exc:
         raise BrowserError(
             "Forge Browser's window needs PySide6, which is not in "
-            "this Python. Run install.sh — it builds the app venv — "
+            "this Python. Run install.sh (it builds the app venv), "
             "then start it with run.sh.") from exc
     _QT = (QtCore, QtGui, QtWidgets, QWebEnginePage, QWebEngineProfile,
            QWebEngineView, QWebEngineDownloadRequest)
@@ -123,6 +123,100 @@ def _human_size(size):
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+_DEBUG_LOG = None
+
+
+def get_debug_log():
+    """The app's debug logger (U12, BNB S61 + T21), created on
+    first use. Logs live under ~/.forge/logs, so an update never
+    wipes them and the install dir stays clean."""
+    global _DEBUG_LOG
+    if _DEBUG_LOG is None:
+        from . import __version__
+        from .debug_log import DebugLogger, check_ollama
+        _DEBUG_LOG = DebugLogger(
+            "forge-browser", __version__,
+            log_dir=os.path.join(os.path.expanduser("~"), ".forge",
+                                 "logs"))
+        _DEBUG_LOG.register_service("ollama", check_ollama)
+        _DEBUG_LOG.register_dependency("PySide6")
+        _DEBUG_LOG.register_dependency("PySide6-WebEngine")
+    return _DEBUG_LOG
+
+
+def app_icon_path():
+    """Path to the shipped forge-browser.svg, or None.
+
+    The app root first (covers a repo checkout and the installed
+    app, whose tree is copied whole), then the icons dir the
+    installer writes to — the icon must show in the installed
+    app, not just the repo.
+    """
+    here = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))
+    candidates = (
+        os.path.join(here, "forge-browser.svg"),
+        os.path.join(os.path.expanduser("~"), ".local", "share",
+                     "icons", "forge-browser.svg"),
+    )
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+_SINGLE_INSTANCE_NAME = "forge-browser"
+
+
+def _take_single_instance():
+    """First instance: (lock, server) to hold for the app's life.
+
+    Second instance: asks the running copy to show itself and
+    returns None — the caller exits without opening a window.
+    A lock whose owner died is retakable at once (stale time 0),
+    so a crash never blocks a relaunch; a stale local socket is
+    removed before listening. When the lock is held but no server
+    answers (a first instance still starting up), the person is
+    told plainly instead of watching nothing happen.
+    """
+    from PySide6 import QtCore, QtWidgets
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    from .cdp import default_profile_dir
+    os.makedirs(default_profile_dir(), exist_ok=True)
+    lock = QtCore.QLockFile(
+        os.path.join(default_profile_dir(), "app.lock"))
+    lock.setStaleLockTime(0)
+    # tryLock takes its timeout as an argument in this PySide6
+    # build — bare tryLock() raises TypeError.
+    if not lock.tryLock(0):
+        sock = QLocalSocket()
+        sock.connectToServer(_SINGLE_INSTANCE_NAME)
+        if sock.waitForConnected(1000):
+            sock.write(b"show")
+            sock.waitForBytesWritten(1000)
+            sock.disconnectFromServer()
+        else:
+            QtWidgets.QMessageBox.information(
+                None, "Forge Browser",
+                "Forge Browser is already running.")
+        return None
+    QLocalServer.removeServer(_SINGLE_INSTANCE_NAME)
+    server = QLocalServer()
+    server.listen(_SINGLE_INSTANCE_NAME)
+    return lock, server
+
+
+def _handle_show_request(server, window):
+    """A second launch pinged the running copy: raise its window.
+    The connection itself is the signal — no payload to read."""
+    sock = server.nextPendingConnection()
+    if sock is not None:
+        sock.disconnectFromServer()
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
 
 
 def create_window(server, profile, start_url=None):
@@ -170,6 +264,14 @@ def create_window(server, profile, start_url=None):
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Forge Browser")
+            # B4: the window carries the shipped icon (taskbar,
+            # window switcher) — resolved from the app root first,
+            # the installed icons dir as fallback.
+            icon_path = app_icon_path()
+            if icon_path is not None:
+                icon = QtGui.QIcon(icon_path)
+                if not icon.isNull():
+                    self.setWindowIcon(icon)
             # Geometry: restore where the window was left last time
             # (QSettings), else open at the default size, centred.
             # A saved geometry from a bigger screen must not strand
@@ -287,7 +389,7 @@ def create_window(server, profile, start_url=None):
                 QtCore.QUrl(server.home_url)))
             self.address = QtWidgets.QLineEdit()
             self.address.setPlaceholderText(
-                "Type an address, or words to search — Forge Browser searches keyless")
+                "Type an address, or words to search. Forge Browser searches keyless")
             self.address.returnPressed.connect(self._go)
             bar.addWidget(self.address)
             bar.addAction("＋ Tab", lambda: self.new_tab())
@@ -540,7 +642,7 @@ def create_window(server, profile, start_url=None):
             view = self._view()
             title = (view.title() or "").strip() if view is not None else ""
             if title and title != "Forge Browser":
-                self.setWindowTitle(f"{title} — Forge Browser")
+                self.setWindowTitle(f"{title} · Forge Browser")
             else:
                 self.setWindowTitle("Forge Browser")
 
@@ -661,7 +763,7 @@ def create_window(server, profile, start_url=None):
 
             if not rows:
                 view.setHtml(note_page(
-                    "No comparison to refresh — ask the chat to compare "
+                    "No comparison to refresh. Ask the chat to compare "
                     "some tabs first."))
                 return
             session = getattr(self, "_chat_session", None)
@@ -681,7 +783,7 @@ def create_window(server, profile, start_url=None):
                     views.append(candidate)
             if not views:
                 view.setHtml(note_page(
-                    "The compared tabs are closed — nothing to refresh."))
+                    "The compared tabs are closed. Nothing to refresh."))
                 return
             self._refreshing_views.add(id(view))
             view.setHtml(note_page("Refreshing the comparison…"))
@@ -769,8 +871,60 @@ def create_window(server, profile, start_url=None):
                               self._open_downloads_dialog)
             self._menu_action(tools_menu, "Settings…", self._open_settings)
             help_menu = bar.addMenu("&Help")
+            self._menu_action(help_menu, "How to Use…",
+                              self._show_howto)
+            self._menu_action(help_menu, "Debug Report…",
+                              self._show_debug_report)
             self._menu_action(help_menu, "About Forge Browser",
                               self._show_about)
+
+        def _show_howto(self):
+            """U22: the manual as an index window — sections from
+            BROWSER.md's own headings; clicking one shows its text."""
+            from .howto import load_sections
+            sections = load_sections()
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("How to Use")
+            dialog.resize(900, 600)
+            layout = QtWidgets.QHBoxLayout(dialog)
+            listing = QtWidgets.QListWidget()
+            listing.setObjectName("howto_list")
+            text = QtWidgets.QTextBrowser()
+            text.setObjectName("howto_text")
+            text.setOpenExternalLinks(False)
+            for _level, title, _body in sections:
+                listing.addItem("  " * (_level - 1) + title)
+
+            def show_section(row):
+                if 0 <= row < len(sections):
+                    text.setPlainText(sections[row][2])
+
+            listing.currentRowChanged.connect(show_section)
+            if sections:
+                listing.setCurrentRow(0)
+            else:
+                text.setPlainText(
+                    "The manual (BROWSER.md) is not installed with "
+                    "this copy of Forge Browser, so there is nothing "
+                    "to show here. Reinstalling puts it back.")
+            layout.addWidget(listing, 1)
+            layout.addWidget(text, 2)
+            dialog.exec()
+
+        def _show_debug_report(self):
+            """U12: write a debug report and say where it went."""
+            try:
+                path = get_debug_log().generate_report()
+            except Exception as exc:  # noqa: BLE001 — report it plainly
+                QtWidgets.QMessageBox.warning(
+                    self, "Debug Report",
+                    f"Could not write the debug report: {exc}")
+                return
+            QtWidgets.QMessageBox.information(
+                self, "Debug Report",
+                f"Debug report written to:\n{path}\n\nIt holds the "
+                "recent actions, any errors, and the log tail. "
+                "Nothing in it carries passwords or keys.")
 
         def _show_about(self):
             from . import __version__
@@ -778,7 +932,7 @@ def create_window(server, profile, start_url=None):
                 self, "About Forge Browser",
                 f"Forge Browser {__version__}\n\nYour browser. "
                 "No accounts, no API keys, nothing tracked.\n\n"
-                "A local AI model drives the browsing — search, pages, "
+                "A local AI model drives the browsing: search, pages, "
                 "and research, all on this machine.")
 
         # --- find in page (E4) --------------------------------------
@@ -879,7 +1033,7 @@ def create_window(server, profile, start_url=None):
         def _open_bookmarks_dialog(self):
             from .bookmarks import list_bookmarks, remove_bookmark
             dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle("Forge Browser — Bookmarks")
+            dialog.setWindowTitle("Bookmarks")
             dialog.setMinimumSize(500, 300)
             layout = QtWidgets.QVBoxLayout(dialog)
             listing = QtWidgets.QListWidget()
@@ -890,7 +1044,7 @@ def create_window(server, profile, start_url=None):
                 listing.clear()
                 for mark in list_bookmarks():
                     item = QtWidgets.QListWidgetItem(
-                        f"{mark.get('title') or mark['url']} — {mark['url']}")
+                        f"{mark.get('title') or mark['url']}: {mark['url']}")
                     item.setData(QtCore.Qt.ItemDataRole.UserRole,
                                  mark["url"])
                     listing.addItem(item)
@@ -957,18 +1111,18 @@ def create_window(server, profile, start_url=None):
             download = record["download"]
             name = record["name"]
             if record["status"] == "done":
-                return f"{name} — Saved to {record['final']}"
+                return f"{name}: Saved to {record['final']}"
             if record["status"] == "cancelled":
-                return f"{name} — Cancelled"
+                return f"{name}: Cancelled"
             if record["status"] == "failed":
-                return f"{name} — Failed"
+                return f"{name}: Failed"
             received = download.receivedBytes()
             total = download.totalBytes()
             if total > 0:
                 pct = int(received * 100 / total)
-                return (f"{name} — {pct}% ({_human_size(received)} of "
+                return (f"{name}: {pct}% ({_human_size(received)} of "
                         f"{_human_size(total)})")
-            return f"{name} — {_human_size(received)}"
+            return f"{name}: {_human_size(received)}"
 
         def _refresh_downloads_list(self):
             listing = getattr(self, "_downloads_list", None)
@@ -1023,7 +1177,7 @@ def create_window(server, profile, start_url=None):
                 self._downloads_dialog.raise_()
                 return
             dialog = QtWidgets.QDialog(self)
-            dialog.setWindowTitle("Forge Browser — Downloads")
+            dialog.setWindowTitle("Downloads")
             dialog.setMinimumSize(500, 300)
             dialog.setObjectName("downloads_dialog")
             # A modeless dialog's close() doesn't emit finished(),
@@ -1112,7 +1266,7 @@ def create_window(server, profile, start_url=None):
                 return  # no saved login for this site
             site, entry = found
             answer = QtWidgets.QMessageBox.question(
-                self, "Forge Browser — fill login?",
+                self, "Fill login?",
                 f"Fill the saved login for {site}?\n\n"
                 f"Username: {entry.get('username', '')}\n"
                 "The password is filled in but never shown.",
@@ -1124,13 +1278,13 @@ def create_window(server, profile, start_url=None):
                              entry.get("password", ""))
             self._autofill_done.add(host)
             self.statusBar().showMessage(
-                f"Filled the saved login for {site} — check it and sign in.",
+                f"Filled the saved login for {site}. Check it and sign in.",
                 8000)
 
         def _unlock_vault(self):
             from .vault import Vault, default_vault_path
             passphrase, ok = QtWidgets.QInputDialog.getText(
-                self, "Forge Browser — vault",
+                self, "Vault",
                 "Vault passphrase (to check for a saved login):",
                 QtWidgets.QLineEdit.EchoMode.Password)
             if not ok or not passphrase:
@@ -1139,7 +1293,7 @@ def create_window(server, profile, start_url=None):
                 return Vault.open(default_vault_path(), passphrase)
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(
-                    self, "Forge Browser — vault", str(exc))
+                    self, "Vault", str(exc))
                 return None
 
         def _fill_login(self, view, username, password):
@@ -1217,31 +1371,31 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         retrieval line (I1): on when nomic-embed-text is
         installed, off with the fix otherwise."""
         if session.brain_state == "ollama-down":
-            text = ("Brain: none — Ollama is not running. Start Ollama, "
+            text = ("Brain: none. Ollama is not running. Start Ollama, "
                     "then ↻. Browsing still works.")
         elif session.brain_state == "no-models":
-            text = ("Brain: none — Ollama is running but no chat model "
+            text = ("Brain: none. Ollama is running but no chat model "
                     "is installed. Pull a small model, then ↻. "
                     "Browsing still works.")
         elif not session.model:
-            text = ("Brain: none answering — start Ollama, then ↻. "
+            text = ("Brain: none answering. Start Ollama, then ↻. "
                     "Browsing still works.")
         else:
             text = f"Brain: {session.model}"
             if session.pick_reason and session.pick_reason != "given":
                 text += f" ({session.pick_reason})"
             if brain_health["checked"]:
-                text += (" — answering" if brain_health["answers"]
-                         else " — not answering")
+                text += (" (answering)" if brain_health["answers"]
+                         else " (not answering)")
             if session.pick_note:
                 text += f"\n{session.pick_note}"
         models = retrieval_state.get("models") or []
         if any("nomic-embed-text" in m for m in models):
             text += "\nRetrieval: on"
         elif session.brain_state == "ollama-down":
-            text += "\nRetrieval: off — Ollama is not running"
+            text += "\nRetrieval: off. Ollama is not running"
         else:
-            text += "\nRetrieval: off — pull nomic-embed-text"
+            text += "\nRetrieval: off. Pull nomic-embed-text"
         return text
 
     def _check_brain_in_background():
@@ -1272,7 +1426,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     threading.Thread(target=_build_brief_in_background, daemon=True).start()
 
-    dock = QtWidgets.QDockWidget("Chat — talk to your browser", window)
+    dock = QtWidgets.QDockWidget("Chat: talk to your browser", window)
     dock.setObjectName("chat_dock")  # saveState needs a name
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
@@ -1346,8 +1500,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     memory_row = QtWidgets.QHBoxLayout()
     memory_btn = QtWidgets.QPushButton("Memory…")
     memory_btn.setObjectName("memory_button")
-    memory_btn.setToolTip("See what the browser remembers — facts and "
-                          "stored pages — and forget things.")
+    memory_btn.setToolTip("See what the browser remembers: facts and "
+                          "stored pages, and forget things.")
     memory_row.addWidget(memory_btn)
     memory_row.addStretch(1)
     layout.addLayout(memory_row)
@@ -1355,7 +1509,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def show_memory_view():
         from .memory import (forget, forget_page, list_entries, list_pages)
         dialog = QtWidgets.QDialog(window)
-        dialog.setWindowTitle("Forge Browser — memory")
+        dialog.setWindowTitle("Memory")
         dialog.setObjectName("memory_dialog")
         vbox = QtWidgets.QVBoxLayout(dialog)
         facts_list = QtWidgets.QListWidget()
@@ -1372,7 +1526,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             pages_list.clear()
             for page in list_pages():
                 item = QtWidgets.QListWidgetItem(
-                    f"{page['title']} — {page['url']}")
+                    f"{page['title']}: {page['url']}")
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, page["url"])
                 pages_list.addItem(item)
 
@@ -1499,7 +1653,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     ai_toggle.setObjectName("ai_toggle")
     # T11: each toggle says what it covers — no guessing.
     ai_toggle.setToolTip(
-        "Master switch — turns off every AI feature: chat, the "
+        "Master switch: turns off every AI feature: chat, the "
         "morning brief, image describing, tidy titles, and memory.")
     chat_toggle = QtWidgets.QCheckBox("Chat")
     chat_toggle.setObjectName("chat_toggle")
@@ -1526,10 +1680,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         ai_on = seats["ai_enabled"]
         chat_on = seats["features"]["chat"]
         if not ai_on:
-            header.setText("AI is off — turn it on below to use chat, "
+            header.setText("AI is off: turn it on below to use chat, "
                            "tidy titles, and memory.")
         elif not chat_on:
-            header.setText("Chat is off — turn it on below to talk "
+            header.setText("Chat is off: turn it on below to talk "
                            "to the browser.")
         else:
             header.setText(brain_header_text())
@@ -1778,7 +1932,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # job's completion does not yank the person from their page.
         window.new_tab(html=report_to_html(report), background=True)
         append("Forge Browser",
-               "Research done — the report opened in a new tab behind this one.")
+               "Research done. The report opened in a new tab behind this one.")
         progress_label.setText("Research done.")
 
     signals.research_done.connect(on_research_done)
@@ -1805,7 +1959,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 status_text("waiting for approval", turn["started"]))
         append("Forge Browser", f"Plan: {plan_text}")
         dialog = QtWidgets.QMessageBox(window)
-        dialog.setWindowTitle("Forge Browser — approve this step?")
+        dialog.setWindowTitle("Approve this step?")
         dialog.setText(f"The browser wants to:\n\n{plan_text}\n\nAllow it?")
         dialog.setStandardButtons(
             QtWidgets.QMessageBox.StandardButton.Yes |
@@ -1837,7 +1991,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             answer == QtWidgets.QMessageBox.StandardButton.Yes)
         if timed_out["value"]:
             append("Forge Browser",
-                   "Plan timed out after 5 minutes — treated as no.")
+                   "Plan timed out after 5 minutes. Treated as no.")
         elif (state["approved"] and always_box is not None
                 and always_box.isChecked()):
             from .seats import set_always_allow
@@ -1863,7 +2017,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         signals.plan.emit(plan_text, state)
         if not state["event"].wait(timeout=PLAN_TIMEOUT_SECONDS):
             signals.notice.emit(
-                "Plan timed out after 5 minutes — treated as no.")
+                "Plan timed out after 5 minutes. Treated as no.")
         turn["waited"] = (turn.get("waited", 0.0)
                           + (time.monotonic() - turn["wait_started"]))
         turn["wait_started"] = None
@@ -1890,10 +2044,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         voice_state["transcribing"] = False
         apply_ai_state()
         if reason == "no-transcriber":
-            message = ("⚠ No transcriber is installed — install whisper "
+            message = ("⚠ No transcriber is installed. Install whisper "
                        "or set FORGE_TRANSCRIBE_CMD.")
         elif reason == "failed":
-            message = ("⚠ Transcription failed — the transcriber "
+            message = ("⚠ Transcription failed. The transcriber "
                        "errored on that recording.")
         else:
             message = "⚠ Couldn't make out anything in the recording."
@@ -1924,7 +2078,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         voice_state["last_size"] = size
         text = f"● Listening… {int(elapsed // 60)}:{int(elapsed % 60):02d}"
         if elapsed > 2 and not growing:
-            text += " — no audio yet"
+            text += ": no audio yet"
         mic_btn.setText(text)
 
     voice_timer = QtCore.QTimer(window)
@@ -1976,7 +2130,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         if path is None:
             append("Forge Browser",
-                   "⚠ Nothing recorded — check the microphone.")
+                   "⚠ Nothing recorded. Check the microphone.")
             return
         voice_state["transcribing"] = True
         apply_ai_state()
@@ -2041,11 +2195,11 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         session._retrieve_notice_shown = True
         if reason == "model-missing":
             signals.notice.emit(
-                "Retrieval is off: nomic-embed-text is not installed — "
-                "run install.sh to pull it")
+                "Retrieval is off: nomic-embed-text is not installed. "
+                "Run install.sh to pull it")
         elif reason == "ollama-down":
             signals.notice.emit(
-                "Ollama is not running — start Ollama to search long pages")
+                "Ollama is not running. Start Ollama to search long pages")
         else:
             signals.notice.emit(
                 "Retrieval is off: the embeddings model did not answer")
@@ -2111,7 +2265,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             flush_tokens(display.flush())
             # K5: "" now means the page itself was empty — a blank
             # brain raises instead, so this message is honest.
-            signals.answer.emit(summary or "(no summary — the page text was empty)")
+            signals.answer.emit(summary or "(no summary: the page text was empty)")
         except SummarizeStopped:
             # K1: a stopped summarize ends as "Stopped.", not a
             # failure.
@@ -2119,7 +2273,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             signals.answer.emit("Stopped.")
         except SummarizeEmptyError:
             flush_tokens(display.flush())
-            signals.answer.emit("(no summary — the brain produced nothing)")
+            signals.answer.emit("(no summary: the brain produced nothing)")
         except Exception as exc:
             flush_tokens(display.flush())
             signals.failed.emit(str(exc))
@@ -2223,7 +2377,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 target = n - 1
             else:
                 append("Forge Browser",
-                       f"There is no tab {n} — summarizing the current tab.")
+                       f"There is no tab {n}. Summarizing the current tab.")
         view = window.tabs.widget(target)
         url = view.url().toString() if view is not None else None
         length = "short" if short_box.isChecked() else "standard"
@@ -2336,7 +2490,7 @@ def open_settings_dialog(parent, on_applied=None):
     from .media import OLLAMA_URL
 
     dialog = QtWidgets.QDialog(parent)
-    dialog.setWindowTitle("Forge Browser — Settings")
+    dialog.setWindowTitle("Settings")
     dialog.setMinimumSize(480, 420)
     layout = QtWidgets.QVBoxLayout(dialog)
     models = list_models()
@@ -2462,17 +2616,31 @@ def run_app(start_url=None):
     from .cdp import default_profile_dir
     from .webui import LocalPageServer
 
-    server = LocalPageServer().start()
+    # U12: the debug log starts with the app — a crash writes a
+    # report instead of vanishing without a trace.
+    get_debug_log().install_crash_handler()
+    get_debug_log().action("Forge Browser started")
+
     app = QtWidgets.QApplication([])
     app.setApplicationName("Forge Browser")
     app.setOrganizationName("Forge Browser")
 
+    # U27: one copy at a time — a second launch raises this one
+    # and exits. The guard is held for the life of the app.
+    guard = _take_single_instance()
+    if guard is None:
+        return 0
+    _lock, local_server = guard
+
+    server = LocalPageServer().start()
     profile = QWebEngineProfile("forge-browser")
     profile.setPersistentStoragePath(
         os.path.join(default_profile_dir(), "app-profile"))
     profile.setCachePath(os.path.join(default_profile_dir(), "app-cache"))
 
     window = create_window(server, profile, start_url)
+    local_server.newConnection.connect(
+        lambda: _handle_show_request(local_server, window))
     window.show()
     try:
         return app.exec()

@@ -1,5 +1,69 @@
 # Forge Browser — Changelog
 
+## 0.9 — 2026-11-13
+
+The deep-audit list, built (docs/DEEP-AUDIT-TASK-LIST.md): the
+em-dash sweep, the design-rules pass, the doc fixes, the fence's
+DNS pinning, a quieter suite, the CLI's missing pieces, and a
+free CI to replace billing-locked GitHub Actions.
+
+- U33 sweep (A1/A2): all 48 em-dash literals out of the window's
+  visible strings in `app.py` — dialog titles to one pattern,
+  the status-bar tagline first, the "memory" vs "Bookmarks"
+  capitalization fixed. The sweep went further than the list
+  asked: the served pages in `webui.py` (13 literals) and the
+  comparison page in `compare.py` (2) are visible text too, so
+  they were swept as well. A guard test fails the suite if an
+  em-dash ever appears in a non-docstring string literal in any
+  of the three files again.
+- Design-rules pass (B1–B4): the BNB debug log layer, vendored
+  verbatim, with a Debug report item in the Help menu; a How to
+  Use index built from BROWSER.md's own headings, in the Help
+  menu, with a first-run link on the start page; a
+  single-instance guard (QLockFile + a local server — re-clicking
+  the icon focuses the running app); and the window icon set
+  from the shipped `forge-browser.svg`, resolved from the app
+  folder first so it shows in the installed app, not just the
+  repo.
+- Doc fixes (E1–E4): the Limits section no longer calls OCR
+  missing (it is in the build — `ocr.py`), and the one-page
+  limit now says plainly it is the engine room's CDP session,
+  not the window. The changelog no longer claims a GitHub
+  Release v0.3 — versions 0.3–0.6 were built but shipped
+  together in v0.7 at Joshua's order, so there are no v0.3–v0.6
+  tags or releases. One `__version__`: `forge/__init__.py` used
+  to say "2.5" (the Code Forge parent version) while the browser
+  said "0.8"; the parent now mirrors the browser, pinned by a
+  test.
+- Fence DNS pinning (G1): the fetch no longer re-resolves after
+  the fence's check — each request's host is resolved once, the
+  answer is checked, and the socket connects to that same
+  answer, so a hostile DNS cannot flip the answer between the
+  check and the connection. For HTTPS the TLS handshake still
+  uses the DNS name; only the socket is pinned. Proxied requests
+  are not pinned (the socket goes to the proxy, not the origin).
+  Proven by tests, including a scripted DNS flip mid-fetch.
+- Suite hygiene (H1): `LocalPageServer.stop()` now closes the
+  listening socket as well as stopping the serve loop — the
+  ResourceWarnings are gone (16 of them across the web UI tests).
+- CLI (I2–I4): `sh run.sh check` reports the engines plus the
+  threshold validators' verdicts — no Ollama answering means
+  "not run", never a crash. `--version` prints the whatsnew line
+  (engine-room parity with the window's "what changed" line).
+  `history export <file>` writes the visit history out as JSON,
+  and `reports` lists the saved research reports.
+- Free CI (J1): GitHub Actions is billing-locked account-wide,
+  so `ci/check.sh` is the push-time check — the full suite under
+  timeout, a Release-shaped zip build from the tree with
+  stored-modes + SHA verification, and the verdict in
+  `CI-STATUS.md` at the repo root. The zip step is vendored in
+  `ci/` because the Release builder lives outside the repo and
+  hardcodes the main tree path. `.github/workflows/test.yml`
+  stays in place.
+- Not built (blocked, still open in the list): C1, C2, D1, D2,
+  D3 (need his real PC), F1, F2 (the GitHub billing lock — his
+  account action), I1 (needs D1's live Kitesurf build first).
+
 ## 0.8 — 2026-11-13
 
 The Kitesurf borrowables (ordered 2026-11-13): Kitesurf-local as a
@@ -280,8 +344,11 @@ Audit batch 3 (sections J–M of `docs/AUDIT-TASK-LIST.md`), built
 ## 0.3 — 2026-11-12
 
 Audit batch 2 (sections F–I of `docs/AUDIT-TASK-LIST.md`), built
-2026-11-12 from the per-item audits #1–#3 (GitHub Release v0.3,
-2026-11-12):
+2026-11-12 from the per-item audits #1–#3. Versions 0.3–0.6 were
+built as version lines but never released separately — batches
+2–6 shipped together as GitHub Release v0.7 (2026-11-13) at
+Joshua's order ("ship them together"), so there are no v0.3–v0.6
+tags or releases:
 
 - F1–F4: research asks queue instead of being refused; scanned
   PDFs are read with OCR when tesseract is installed (and say
