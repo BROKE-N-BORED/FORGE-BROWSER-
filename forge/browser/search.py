@@ -60,8 +60,18 @@ def parse_searxng_json(text, max_results):
         data = json.loads(text)
     except json.JSONDecodeError as exc:
         raise BrowserError("the search instance answered with invalid JSON") from exc
+    if not isinstance(data, dict):
+        # G-C7: a list or string answer used to raise a raw
+        # AttributeError on .get — it is a bad answer, in plain
+        # words.
+        raise BrowserError("the search instance answered with invalid JSON")
+    field = data.get("results", [])
+    if not isinstance(field, list):
+        raise BrowserError("the search instance answered with invalid JSON")
     results = []
-    for item in data.get("results", []):
+    for item in field:
+        if not isinstance(item, dict):
+            raise BrowserError("the search instance answered with invalid JSON")
         url = item.get("url") or ""
         if not url:
             continue
@@ -181,19 +191,27 @@ class _BingParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.results = []
         self._current = None
-        self._in_algo = 0
+        # G-C8: the <li> nesting depth, and the depth at which the
+        # current b_algo <li> opened. A nested </li> inside a
+        # result used to close the result (the old counter fell
+        # on EVERY </li>); now only the </li> matching the
+        # b_algo <li> closes it.
+        self._li_depth = 0
+        self._algo_depth = 0
         self._in_h2 = False
         self._capture = None  # "title" | "snippet"
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         classes = (attrs.get("class") or "").split()
-        if tag == "li" and "b_algo" in classes:
-            self._in_algo += 1
-            self._current = {"title": "", "url": "", "snippet": ""}
-            self.results.append(self._current)
+        if tag == "li":
+            self._li_depth += 1
+            if "b_algo" in classes:
+                self._algo_depth = self._li_depth
+                self._current = {"title": "", "url": "", "snippet": ""}
+                self.results.append(self._current)
             return
-        if not self._in_algo or self._current is None:
+        if not self._algo_depth or self._current is None:
             return
         if tag == "h2":
             self._in_h2 = True
@@ -204,10 +222,11 @@ class _BingParser(HTMLParser):
             self._capture = "snippet"
 
     def handle_endtag(self, tag):
-        if tag == "li" and self._in_algo:
-            self._in_algo -= 1
-            if not self._in_algo:
+        if tag == "li":
+            if self._algo_depth and self._li_depth == self._algo_depth:
+                self._algo_depth = 0
                 self._current = None
+            self._li_depth = max(0, self._li_depth - 1)
         elif tag == "h2":
             self._in_h2 = False
         elif tag in ("a", "p"):
@@ -280,8 +299,15 @@ def search(query, max_results=DEFAULT_MAX_RESULTS, timeout=20):
     if not searxng_url:
         from .settings import get_setting
         searxng_url = get_setting("searxng_url")
+    last_error = None
     if searxng_url:
-        return search_searxng(query, max_results, searxng_url, timeout=timeout)
+        try:
+            return search_searxng(query, max_results, searxng_url, timeout=timeout)
+        except BrowserError as exc:
+            # G-C6: a configured-but-down SearXNG used to break
+            # search outright; it falls through to the keyless
+            # chain the module docstring promises instead.
+            last_error = exc
     # Keyless fallback chain: first backend with results wins. A
     # backend that errors or answers empty (bot-check pages answer
     # 200 with no results) falls through to the next.
@@ -291,7 +317,6 @@ def search(query, max_results=DEFAULT_MAX_RESULTS, timeout=20):
                            host="html.duckduckgo.com", path="/html/"),
         lambda: search_bing(query, max_results, timeout=timeout),
     ]
-    last_error = None
     for backend in backends:
         try:
             results = backend()

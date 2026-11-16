@@ -34,6 +34,7 @@ import json
 import os
 import shutil
 import socket
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -70,13 +71,21 @@ def check_fetch_url(url, allow_local=False):
     and those addresses are ISP space, not this machine or LAN. A
     name that does not resolve at all passes the fence — the fetch
     itself then fails with "could not reach". There is no TOCTOU
-    between this check and the connection (G1): the pinned
-    handlers resolve the request host once more at open time,
-    check that answer the same way, and connect to it — the
-    address that is checked is the address that is connected to,
-    so a hostile DNS cannot flip the answer in between. This
-    up-front check is fail-fast (a plain refusal before any
-    socket work); the connection-time check is authoritative.
+    between this check and the connection (G1): this one
+    resolution IS the pin — the checked addresses are returned
+    and ride on the request to the connection, which opens its
+    socket to a checked address and never re-resolves. A hostile
+    DNS cannot flip the answer in between, because there is no
+    second resolution to flip. (G-P3: the fence used to resolve
+    once here and the pin resolved once more at open time; the
+    second resolution is gone — the checked addresses pass
+    through instead.)
+
+    Returns the checked addresses for a DNS name (an empty list
+    when the name did not resolve — the connection then fails
+    closed rather than connecting unchecked), or None when no
+    pin applies (local fetching allowed, or an IP literal — the
+    literal IS the address, nothing to pin).
 
     Redirects are re-fenced on every hop (Z2): the redirect
     handler runs this check on each new URL before following it,
@@ -96,7 +105,7 @@ def check_fetch_url(url, allow_local=False):
     person is not choosing the address.
     """
     if allow_local or _allow_local_switch():
-        return
+        return None
     host = (urllib.parse.urlparse(url).hostname or "").lower().rstrip(".")
     if not host:
         raise BrowserError(f"cannot fetch {url!r} — it has no host to check")
@@ -106,8 +115,8 @@ def check_fetch_url(url, allow_local=False):
     if address is not None:
         if not address.is_global:
             _refuse_local(host, f"non-global IP literal {address}")
-        return
-    _resolve_checked_host(host)  # raises on a local resolution
+        return None
+    return _resolve_checked_host(host)  # raises on a local resolution
 
 
 def _parse_ip_literal(host):
@@ -261,22 +270,28 @@ class _FencedRedirectHandler(urllib.request.HTTPRedirectHandler):
         # against the request URL first, so the fence checks the
         # address the fetch would actually reach. The parent
         # resolves it again (idempotent for an absolute URL).
+        # The hop's checked addresses ride on the new request as
+        # its pin (G-P3) — the hop resolves once, here, not again
+        # at open time.
         resolved = urllib.parse.urljoin(req.get_full_url(), newurl)
-        check_fetch_url(resolved, allow_local=self._allow_local)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        addrs = check_fetch_url(resolved, allow_local=self._allow_local)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        new_req._forge_pinned_addrs = addrs
+        return new_req
 
 
 # G1: DNS pinning — resolve once, connect to the checked address.
-# The pinned handlers resolve each request's host at open time
-# (initial request and every redirect hop), check that answer
-# with the fence, and hand the checked addresses to the
-# connection, which tries them in resolver order. The socket is
-# opened to a checked address, never to a fresh re-resolution —
-# the TOCTOU the 0.7 changelog named is closed. For HTTPS the
-# TLS handshake still uses the DNS name for SNI and certificate
-# verification (the name, not the address, is what the
-# certificate is issued for); only the TCP socket goes to the
-# pinned address.
+# The fence resolves each request's host once (the up-front
+# check, and the redirect handler's re-fence on every hop), and
+# the checked addresses ride on the request as its pin. The
+# pinned handlers connect to those addresses, in resolver
+# order. The socket is opened to a checked address, never to a
+# fresh re-resolution — the TOCTOU the 0.7 changelog named is
+# closed, because there is no second resolution to flip. For
+# HTTPS the TLS handshake still uses the DNS name for SNI and
+# certificate verification (the name, not the address, is what
+# the certificate is issued for); only the TCP socket goes to
+# the pinned address.
 
 def _pinned_addrs_for(req, allow_local):
     """The checked addresses a request may connect to (G1), or
@@ -285,7 +300,12 @@ def _pinned_addrs_for(req, allow_local):
     name, or a name that does not resolve (the fetch then fails
     with "could not reach", as before). The fence still refuses
     literals and localhost names up front in check_fetch_url and
-    on redirect hops; this function only decides the pin."""
+    on redirect hops; this function only decides the pin. The
+    pin normally rides on the request (G-P3: the fence resolved
+    the host once and passed the checked addresses through), so
+    no second resolution happens. A request that did not come
+    through the fence — a bare _urlopen call — resolves here
+    instead, the same way as before, so it is never unchecked."""
     if allow_local or _allow_local_switch():
         return None
     host = (urllib.parse.urlparse(req.get_full_url()).hostname
@@ -306,6 +326,9 @@ def _pinned_addrs_for(req, allow_local):
         return None
     if _parse_ip_literal(host) is not None:
         return None
+    carried = getattr(req, "_forge_pinned_addrs", None)
+    if carried is not None:
+        return carried
     return _resolve_checked_host(host)
 
 
@@ -314,18 +337,28 @@ class _PinnedConnectionMixin:
     fence already checked. http.client keeps the socket factory
     as an instance attribute (_create_connection) precisely so
     it can be replaced; the pinned subclasses point it at this
-    method. With no pin, the behaviour is exactly the default.
-    With a pin, each checked address is tried in resolver order
-    — the same fall-through create_connection does on its own
-    when a host has several answers and the first is dead."""
+    method. With no pin (None — a literal, localhost, a proxied
+    request, or local fetching allowed), the behaviour is exactly
+    the default. With a pin, each checked address is tried in
+    resolver order — the same fall-through create_connection does
+    on its own when a host has several answers and the first is
+    dead. With an EMPTY pin (the name did not resolve), the fetch
+    FAILS instead of connecting to a fresh, unchecked resolution
+    (G-S8): an unresolvable name must never become an unchecked
+    connect, or a flipped DNS answer could steer it local."""
 
     _pinned_addrs = None
 
     def _pinned_create_connection(self, address, timeout,
                                   source_address=None):
-        if not self._pinned_addrs:
+        if self._pinned_addrs is None:
             return socket.create_connection(address, timeout,
                                             source_address)
+        if not self._pinned_addrs:
+            raise BrowserError(
+                f"could not reach {address[0]} — it did not resolve "
+                "to an address Forge Browser could check, so the "
+                "fetch was refused rather than connecting unchecked")
         _host, port = address
         last_error = None
         for ip in self._pinned_addrs:
@@ -341,7 +374,9 @@ class _PinnedHTTPConnection(_PinnedConnectionMixin,
                             http.client.HTTPConnection):
     def __init__(self, *args, pinned_addrs=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self._pinned_addrs = pinned_addrs or []
+        # None and [] are different pins (see the mixin): keep them
+        # distinct — the old `pinned_addrs or []` collapsed them.
+        self._pinned_addrs = pinned_addrs
         self._create_connection = self._pinned_create_connection
 
 
@@ -349,7 +384,7 @@ class _PinnedHTTPSConnection(_PinnedConnectionMixin,
                              http.client.HTTPSConnection):
     def __init__(self, *args, pinned_addrs=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self._pinned_addrs = pinned_addrs or []
+        self._pinned_addrs = pinned_addrs
         self._create_connection = self._pinned_create_connection
 
 
@@ -385,19 +420,53 @@ class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
 def _urlopen(request, timeout, allow_local):
     """urlopen with the fence on redirects (Z2) and DNS pinning
-    (G1): a fresh opener per call, so the handlers' allow_local
-    matches this fetch. Separated from the fetch functions so
-    tests can stand in a fake transport."""
-    opener = urllib.request.build_opener(
-        _FencedRedirectHandler(allow_local=allow_local),
-        _PinnedHTTPHandler(allow_local=allow_local),
-        _PinnedHTTPSHandler(allow_local=allow_local))
-    return opener.open(request, timeout=timeout)
+    (G1). The opener is reused per (allow_local, proxy env)
+    setting (G-P4) instead of rebuilt per call. Separated from
+    the fetch functions so tests can stand in a fake transport."""
+    return _opener_for(allow_local).open(request, timeout=timeout)
+
+
+# G-P4: the proxy environment urllib's ProxyHandler reads at
+# opener-build time. It is part of the cache key: an opener built
+# while a proxy was set must never be reused after the proxy env
+# changes (the suite itself pops the proxy env for the pinning
+# tests, and a stale proxied opener would route their requests
+# to the proxy). The handlers themselves are stateless — the pin
+# is resolved per request inside http_open — so reuse across
+# requests is safe; the cache is per-thread because an opener
+# is not documented thread-safe.
+_PROXY_ENV_VARS = ("http_proxy", "https_proxy", "HTTP_PROXY",
+                   "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+                   "no_proxy", "NO_PROXY", "REQUEST_METHOD")
+_opener_local = threading.local()
+
+
+def _opener_for(allow_local):
+    """One opener per allow_local setting (and proxy env), reused
+    across requests on the same thread. Honest limit: urllib
+    still opens a fresh TCP/TLS connection per request — opener
+    reuse saves the opener construction, not the handshakes.
+    Real keep-alive would need a connection pool, which urllib
+    does not offer."""
+    cache = getattr(_opener_local, "openers", None)
+    if cache is None:
+        cache = {}
+        _opener_local.openers = cache
+    key = (allow_local,
+           tuple(os.environ.get(var) for var in _PROXY_ENV_VARS))
+    opener = cache.get(key)
+    if opener is None:
+        opener = urllib.request.build_opener(
+            _FencedRedirectHandler(allow_local=allow_local),
+            _PinnedHTTPHandler(allow_local=allow_local),
+            _PinnedHTTPSHandler(allow_local=allow_local))
+        cache[key] = opener
+    return opener
 
 # W6: the browser names its own repo (the old string said Code
 # Forge's). The version tracks the package — bump it with the
 # version bump.
-USER_AGENT = "ForgeBrowser/0.9 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
+USER_AGENT = "ForgeBrowser/0.10 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
 DEFAULT_TIMEOUT = 20  # seconds
 
 # W5: the full-disk guard — a download stops cleanly when free
@@ -508,7 +577,24 @@ def _iter_chunks(response, max_bytes, url, kind="download",
         if not raw:
             break
         try:
-            chunk = decoder.decompress(raw) if decoder else raw
+            if decoder is None:
+                chunk = raw
+            elif max_bytes is None:
+                chunk = decoder.decompress(raw)
+            else:
+                # G-P2: decompress with max_length set to the
+                # remaining budget, so one 64 KB compressed chunk
+                # cannot balloon past the cap in RAM before the
+                # check runs. Leftover input (unconsumed_tail)
+                # means the output hit the budget with more to
+                # come — that is the refusal, right here.
+                remaining = max_bytes - total
+                if remaining <= 0:
+                    _refuse_too_big(url, total, max_bytes, kind)
+                chunk = decoder.decompress(raw, remaining)
+                if decoder.unconsumed_tail:
+                    _refuse_too_big(url, total + len(chunk) + 1,
+                                    max_bytes, kind)
         except zlib.error as exc:
             raise BrowserError(
                 f"the site sent a {kind} Forge Browser could not "
@@ -555,10 +641,11 @@ def http_head(url, timeout=DEFAULT_TIMEOUT, allow_local=False):
     task L1: a media link is named from its headers, never
     downloaded). Raises BrowserError in plain words on failure.
     Local addresses are refused unless allow_local (task #20)."""
-    check_fetch_url(url, allow_local=allow_local)
+    addrs = check_fetch_url(url, allow_local=allow_local)
     request = urllib.request.Request(
         url, method="HEAD",
         headers={"User-Agent": USER_AGENT, "Accept": "*/*"})
+    request._forge_pinned_addrs = addrs  # G-P3: one resolution
     try:
         with _urlopen(request, timeout, allow_local) as response:
             return response.geturl(), response.headers
@@ -568,6 +655,12 @@ def http_head(url, timeout=DEFAULT_TIMEOUT, allow_local=False):
         raise BrowserError(f"could not reach {url} ({exc.reason})") from exc
     except TimeoutError as exc:
         raise BrowserError(f"timed out after {timeout}s reading {url}") from exc
+    except (http.client.HTTPException, ConnectionError) as exc:
+        # G-C9: the dropped-connection handler http_get has — a
+        # reset mid-HEAD used to surface as a raw
+        # RemoteDisconnected.
+        raise BrowserError(
+            f"the connection dropped while reading {url} ({exc})") from exc
 
 
 def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES,
@@ -579,9 +672,11 @@ def http_get(url, timeout=DEFAULT_TIMEOUT, max_bytes=MAX_BODY_BYTES,
     Raises BrowserError with a plain-words message on any failure.
     Local addresses are refused unless allow_local (task #20).
     """
-    check_fetch_url(url, allow_local=allow_local)
+    addrs = check_fetch_url(url, allow_local=allow_local)
+    request = _request(url)
+    request._forge_pinned_addrs = addrs  # G-P3: one resolution
     try:
-        with _urlopen(_request(url), timeout, allow_local) as response:
+        with _urlopen(request, timeout, allow_local) as response:
             _precheck_length(response.headers, max_bytes, url, kind="page")
             body = b"".join(_iter_chunks(
                 response, max_bytes, url, kind="page",
@@ -626,7 +721,7 @@ def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=None,
     full-disk guard (W5) stops cleanly when free space runs low,
     and stall detection (W8) aborts a connection that dribbles
     slower than stall_min_bytes in stall_window seconds."""
-    check_fetch_url(url, allow_local=allow_local)
+    addrs = check_fetch_url(url, allow_local=allow_local)
     existing = 0
     if resume:
         try:
@@ -634,6 +729,7 @@ def http_get_to_file(url, path, timeout=DEFAULT_TIMEOUT, max_bytes=None,
         except OSError:
             existing = 0
     request = _request(url)
+    request._forge_pinned_addrs = addrs  # G-P3: one resolution
     if existing:
         request.add_header("Range", f"bytes={existing}-")
     try:

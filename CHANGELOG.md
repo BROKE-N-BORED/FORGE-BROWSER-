@@ -1,5 +1,49 @@
 # Forge Browser — Changelog
 
+## 0.10 - 2026-11-15
+
+The 2026-11-15 review list, built
+(docs/REVIEW-TASK-LIST-2026-11-15.md): 157 items across the
+engine room, the brain, the window, and the ship tooling, plus
+the merge fixes. 900 checks, all green.
+
+- Safety (A1-A6): the vault saves atomically, so a crash
+  mid-save no longer loses every password, and a corrupt vault
+  file reports plainly instead of raising raw. Forgetting a
+  fact, removing a stored page, and removing a bookmark confirm
+  first. Transcription no longer passes a filename through a
+  shell. The engine room tries the sandbox first and falls back
+  to --no-sandbox only when the launch fails, on a random
+  per-launch port instead of fixed 9222. WebSocket frames are
+  capped so a hostile page cannot fill the RAM. The local
+  search setup mints a random per-install secret instead of
+  shipping a published one.
+- Engine room: DNS resolves once per fetch (G-P3: the fence's
+  checked addresses pass through as the pin, so there is no
+  second resolution to flip). One malformed CMap entry no
+  longer kills whole-PDF extraction (G-C19). The CDP wait no
+  longer busy-spins on a dead engine, the opener is reused
+  across requests, gzip bombs are refused on decompressed size,
+  and the connection goes to the checked address even when the
+  first answer is dead.
+- Brain: the chat has an overall timeout, memory add no longer
+  crashes, the seat picker and the embed cache are fixed, and
+  the research loop, the brief, and the memory stores got their
+  share of the review fixes.
+- Window: the chat dock closes, reopens from the View menu,
+  resizes freely by dragging, and remembers its size (G-UX4).
+  The window opens at once even when Ollama is down (G-P1).
+  The copy is honest everywhere it used to say nothing was
+  tracked (B9). The debug log is fed now: one line per user
+  action and per caught failure, including failures caught
+  inside a chat turn (B10). Served pages and agent-made tabs
+  carry rel="noopener" on their links (G-S4).
+- Ship: the docs were corrected (C1-C14), the release zip
+  verifier matches by full path instead of basename (D7), the
+  suite's flaky timing bounds were widened with evidence
+  (D3), and the free CI timeout was raised to cover the 900
+  checks.
+
 ## 0.9 — 2026-11-13
 
 The deep-audit list, built (docs/DEEP-AUDIT-TASK-LIST.md): the
@@ -28,10 +72,10 @@ free CI to replace billing-locked GitHub Actions.
 - Doc fixes (E1–E4): the Limits section no longer calls OCR
   missing (it is in the build — `ocr.py`), and the one-page
   limit now says plainly it is the engine room's CDP session,
-  not the window. The changelog no longer claims a GitHub
-  Release v0.3 — versions 0.3–0.6 were built but shipped
-  together in v0.7 at Joshua's order, so there are no v0.3–v0.6
-  tags or releases. One `__version__`: `forge/__init__.py` used
+  not the window. The changelog no longer claims a release for
+  versions 0.3–0.6, which were built but shipped together in
+  v0.7 at Joshua's order, so there are no v0.3–v0.6 tags or
+  releases. One `__version__`: `forge/__init__.py` used
   to say "2.5" (the Code Forge parent version) while the browser
   said "0.8"; the parent now mirrors the browser, pinned by a
   test.
@@ -193,7 +237,7 @@ the real PC).
   resumes a broken download; and only the known executables get
   +x. Honest limit, recorded in the pins file and the docs: a
   hash computed from a download proves the bytes match what was
-  recorded, not that Google published them.
+  recorded, not that the snapshot publisher published them.
 - AB1–AB7: filename collisions fixed — long names truncate to
   the 255-byte limit keeping the extension (the uniquification
   suffix always survives truncation); basenames are URL-decoded

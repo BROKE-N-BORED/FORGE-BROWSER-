@@ -16,10 +16,17 @@ transient failure retries on the next hover.
 
 import os
 import urllib.parse
+import urllib.request
+import zlib
 
 from .files import fetch_any
 
 DWELL_MS = 600
+# G-P17: a link hover never downloads more than this to show two
+# lines. A page bigger than the cap is previewed from its head
+# (Range request); a bigger PDF is only named, since a PDF's text
+# lives at the end of the file and its head says nothing.
+PREVIEW_MAX_BYTES = 256 * 1024
 _CACHE_LIMIT = 50
 _CACHE = {}
 
@@ -152,6 +159,37 @@ def clear_preview_cache():
     _CACHE.clear()
 
 
+def _fetch_head_text(url, content_type):
+    """(title, text) from the first PREVIEW_MAX_BYTES of a text-kind
+    URL (G-P17): a hover on a 10 MB page costs 256 KB, not the whole
+    file. The request goes through the fence (_urlopen: pinned DNS,
+    fenced redirects) with a Range header; a server that ignores
+    Range still only yields the head, because only that many bytes
+    are ever read. A gzipped head is decompressed with a bound, so
+    a gzip bomb cannot expand past a few times the fetched head.
+    Raises BrowserError (or the transport's error) on failure."""
+    from ._http import USER_AGENT, _urlopen, check_fetch_url, decode_body
+    from .html2md import html_to_markdown
+    addrs = check_fetch_url(url)
+    request = urllib.request.Request(
+        url, headers={"User-Agent": USER_AGENT,
+                      "Range": "bytes=0-%d" % (PREVIEW_MAX_BYTES - 1)})
+    request._forge_pinned_addrs = addrs  # G-P3: one resolution
+    with _urlopen(request, timeout=10, allow_local=False) as response:
+        raw = response.read(PREVIEW_MAX_BYTES)
+        headers = response.headers
+        final_url = response.geturl()
+    if (headers.get("Content-Encoding") or "").lower() == "gzip":
+        decoder = zlib.decompressobj(31)
+        raw = decoder.decompress(raw, PREVIEW_MAX_BYTES * 4)
+    text = decode_body(raw, headers)
+    lowered = (content_type or "").lower()
+    if lowered.startswith("text/html") or lowered.endswith(("+xml", "+html")):
+        title, body, _links = html_to_markdown(text, final_url)
+        return title, body
+    return "", text
+
+
 def preview_url(url, fetcher=None, head_fetcher=None):
     """Two lines about a link's destination. "" when there is
     nothing sensible to say (empty URL, anchor-only). A plain note
@@ -183,6 +221,41 @@ def preview_url(url, fetcher=None, head_fetcher=None):
                         f"({content_type}).")
             _store(key, text)
             return text
+        if content_type is not None and _is_text_kind(content_type):
+            # G-P17: a big text file is previewed from its head,
+            # never downloaded whole. An undeclared size (0) takes
+            # the same path on the real fetch — a chunked page must
+            # not cost a full download either — but an injected
+            # fetcher (tests) still runs as before.
+            lowered = content_type.lower()
+            over_cap = size > PREVIEW_MAX_BYTES
+            unknown = (size == 0 and fetcher is None)
+            if over_cap or unknown:
+                if lowered == "application/pdf":
+                    # A PDF's text lives at the end of the file —
+                    # its head says nothing, so a big PDF is only
+                    # named, never fetched for a preview.
+                    text = (f"PDF file{_format_size(size)}. Too big "
+                            "to preview, open it to read it.")
+                    _store(key, text)
+                    return text
+                try:
+                    title, body = _fetch_head_text(url, content_type)
+                except Exception:
+                    # L2: failures are NOT cached — a transient
+                    # failure retries on the next hover.
+                    return "Couldn't fetch that link."
+                snippet = _first_lines(body)
+                if title and snippet:
+                    text = f"{title}\n{snippet}"
+                elif title:
+                    text = title
+                elif snippet:
+                    text = snippet
+                else:
+                    text = "That page has no readable text."
+                _store(key, text)
+                return text
     fetch = fetcher or (lambda u: fetch_any(u, describe=False, transcribe=False))
     try:
         result = fetch(url)

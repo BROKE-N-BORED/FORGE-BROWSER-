@@ -27,12 +27,16 @@ faster-whisper Python package. Model size defaults to "base"
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
 from html.parser import HTMLParser
 from urllib.parse import urljoin
+
+from .errors import BrowserError
 
 def ollama_url():
     """Where Ollama answers: FORGE_OLLAMA_URL, else the address
@@ -79,6 +83,22 @@ def installed_models():
         return []
 
 
+# The vision-seat pick is cached briefly (G-P11): picking from
+# scratch costs /api/tags plus up to one /api/show per installed
+# model, and describe + status checks ask on every call. The
+# cache is keyed on the installed-model list, so a newly pulled
+# (or removed) model is picked up at once; the 60 s TTL only
+# bounds how long a capability answer is believed.
+_VISION_PICK_TTL = 60.0
+_vision_pick_cache = {"names": None, "pick": None, "at": 0.0}
+
+
+def clear_vision_pick_cache():
+    """Forget the cached vision pick (tests, and any caller that
+    just installed or removed a model)."""
+    _vision_pick_cache.update({"names": None, "pick": None, "at": 0.0})
+
+
 def pick_vision_model():
     """The configured/installed local vision seat's model name, or None.
     A pick saved in the seats file wins; then the env var."""
@@ -92,23 +112,47 @@ def pick_vision_model():
     names = installed_models()
     if not names:
         return None
+    key = tuple(names)
+    now = time.monotonic()
+    if (_vision_pick_cache["names"] == key
+            and now - _vision_pick_cache["at"] < _VISION_PICK_TTL):
+        return _vision_pick_cache["pick"]
+    pick = None
     lowered = {name.lower(): name for name in names}
     for wanted in _SEAT_PREFERENCE + _KNOWN_VISION:
         for lowered_name, original in lowered.items():
             if wanted in lowered_name:
-                return original
-    for name in names:  # last resort: ask Ollama what each model can do
-        try:
-            info = _ollama_json("/api/show", {"model": name}, timeout=5)
-            if "vision" in (info.get("capabilities") or []):
-                return name
-        except Exception:
-            continue
-    return None
+                pick = original
+                break
+        if pick is not None:
+            break
+    if pick is None:  # last resort: ask Ollama what each model can do
+        for name in names:
+            try:
+                info = _ollama_json("/api/show", {"model": name}, timeout=5)
+                if "vision" in (info.get("capabilities") or []):
+                    pick = name
+                    break
+            except Exception:
+                continue
+    _vision_pick_cache.update({"names": key, "pick": pick, "at": now})
+    return pick
+
+
+# An image over this size is refused, not sent (G-P24): the bytes
+# are base64-inflated by a third into a POST body held in RAM
+# twice over, so a 32 MB photo costs ~90 MB transiently on an
+# 8 GB machine — before Ollama even loads it.
+MAX_DESCRIBE_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def describe_image_bytes(image_bytes, prompt=_DESCRIBE_PROMPT):
-    """Describe image bytes via the local vision seat; "" if none."""
+    """Describe image bytes via the local vision seat; "" if none.
+    Raises BrowserError when the image is over the size cap."""
+    if len(image_bytes or b"") > MAX_DESCRIBE_IMAGE_BYTES:
+        raise BrowserError(
+            "that image is too big to describe (over 10 MB). "
+            "Shrink it first and try again")
     model = pick_vision_model()
     if not model:
         return ""
@@ -125,6 +169,17 @@ def describe_image_bytes(image_bytes, prompt=_DESCRIBE_PROMPT):
 
 
 def describe_saved_image(path, prompt=_DESCRIBE_PROMPT):
+    """Describe an image file via the local vision seat. The size
+    is checked before the file is read, so an oversize image is
+    refused without ever being slurped into memory."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    if size > MAX_DESCRIBE_IMAGE_BYTES:
+        raise BrowserError(
+            "that image is too big to describe (over 10 MB). "
+            "Shrink it first and try again")
     with open(path, "rb") as handle:
         return describe_image_bytes(handle.read(), prompt=prompt)
 
@@ -154,8 +209,16 @@ def transcribe_saved_audio_detailed(path):
     if template:
         try:
             with tempfile.TemporaryDirectory(prefix="forge-transcribe-") as out_dir:
-                command = template.replace("{file}", path).replace("{out_dir}", out_dir)
-                subprocess.run(command, shell=True, capture_output=True,
+                # A3: the template is split into argv and the paths
+                # substituted as argv items — never through a shell.
+                # A filename with spaces or shell metacharacters
+                # used to execute arbitrary commands (and plain
+                # spaces broke the command outright).
+                argv = [part.replace("{file}", path).replace("{out_dir}", out_dir)
+                        for part in shlex.split(template)]
+                if not argv:
+                    return ("", "failed")
+                subprocess.run(argv, capture_output=True,
                                timeout=1800, check=True)
                 for name in sorted(os.listdir(out_dir)):
                     if name.endswith((".txt", ".srt", ".vtt")):

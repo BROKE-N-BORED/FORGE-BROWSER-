@@ -91,8 +91,22 @@ class Vault:
     def open(cls, path, passphrase):
         if not os.path.exists(path):
             raise BrowserError(f"no vault at {path} — create one first")
-        with open(path, "r", encoding="utf-8") as handle:
-            blob = json.load(handle)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                blob = json.load(handle)
+        except OSError as exc:
+            raise BrowserError(
+                f"could not read the vault file at {path}") from exc
+        except ValueError as exc:
+            # A truncated file (a save cut off mid-write) used to
+            # surface as a raw JSON traceback; say it plainly and
+            # point at the backup save() keeps.
+            backup = path + ".bak"
+            hint = (f", the last good copy is at {backup}"
+                    if os.path.exists(backup) else "")
+            raise BrowserError(
+                "the vault file is damaged (it may have been cut off "
+                f"mid-save){hint}") from exc
         try:
             salt = base64.b64decode(blob["salt"])
             nonce = base64.b64decode(blob["nonce"])
@@ -129,9 +143,40 @@ class Vault:
             os.chmod(folder, 0o700)
         except OSError:
             pass
-        fd = os.open(self._path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Atomic save (A1): the new blob goes to a temp file, is
+        # fsynced, then renamed into place — a crash mid-write
+        # leaves the old vault, never a truncated one. The
+        # previous good vault is kept as one .bak beside it.
+        if os.path.exists(self._path):
+            try:
+                with open(self._path, "rb") as handle:
+                    previous = handle.read()
+                backup_tmp = self._path + ".bak.tmp"
+                fd = os.open(backup_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                             0o600)
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(previous)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(backup_tmp, self._path + ".bak")
+            except OSError:
+                pass  # a backup that cannot be written must not
+                # block the save itself
+        tmp = self._path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(blob, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self._path)
+        try:
+            dir_fd = os.open(folder, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
 
     # -- entries -----------------------------------------------------------
     def set(self, site, username, password, notes=""):

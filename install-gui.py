@@ -7,14 +7,17 @@ Subcommands:
   confirm|question <title> <text>   -> exit 0 on yes, 1 on no
   info <title> <text>               -> message, exit 0
   error <title> <text>              -> message, exit 0
-  progress <title> <text> <log> <done-file>
+  progress <title> <text> <log> <done-file> [install-pgid]
     -> pulsing progress window; the label follows the last line of
        <log>; the window closes when <done-file> appears. The
-       window cannot be closed early (closing it mid-install
-       would report a failure while the install still runs).
+       Cancel button stops the install (its whole process group,
+       via cancel_install) and exits 1; closing the window itself
+       stays disabled so the install is never left running
+       detached by accident.
 """
 
 import os
+import signal
 import sys
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -41,7 +44,18 @@ def _show(kind, title, text):
         root.destroy()
 
 
-def _progress(title, text, log_path, done_path):
+def cancel_install(pgid):
+    """Kill the install's whole process group (D21): the
+    install.sh shell plus its curl/pip children. Returns True if
+    the group was signalled, False if it was already gone."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
+
+
+def _progress(title, text, log_path, done_path, pgid=None):
     root = tk.Tk()
     root.title(title)
     root.resizable(False, False)
@@ -52,8 +66,21 @@ def _progress(title, text, log_path, done_path):
                       justify="left")
     status.pack(padx=16, pady=(0, 8))
     bar = ttk.Progressbar(root, mode="indeterminate", length=380)
-    bar.pack(padx=16, pady=(0, 16))
+    bar.pack(padx=16, pady=(0, 8))
     bar.start(20)
+    cancelled = []
+
+    def _cancel():
+        # D21: Cancel stops the install — the whole process
+        # group — instead of leaving it running detached. The
+        # installer sees the non-zero exit and reports it.
+        if pgid:
+            cancel_install(pgid)
+        cancelled.append(True)
+        root.destroy()
+
+    tk.Button(root, text="Cancel", command=_cancel).pack(
+        padx=16, pady=(0, 16))
 
     def tick():
         if os.path.exists(done_path):
@@ -71,6 +98,7 @@ def _progress(title, text, log_path, done_path):
 
     root.after(500, tick)
     root.mainloop()
+    return 1 if cancelled else 0
 
 
 def main(argv):
@@ -90,8 +118,13 @@ def main(argv):
     if mode == "progress":
         if len(argv) < 6:
             return 2
-        _progress(title, text, argv[4], argv[5])
-        return 0
+        pgid = None
+        if len(argv) > 6:
+            try:
+                pgid = int(argv[6])
+            except ValueError:
+                pgid = None
+        return _progress(title, text, argv[4], argv[5], pgid)
     return 2
 
 

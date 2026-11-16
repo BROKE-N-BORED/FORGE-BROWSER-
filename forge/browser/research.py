@@ -91,6 +91,14 @@ def make_plan(topic, queries=None, max_pages=6):
     searches = [q.strip() for q in (queries or []) if q and q.strip()]
     if not searches:
         searches = [topic.strip()]
+    # G-C27: max_pages is clamped to 1–20, as the chat action does
+    # — a negative value used to produce an empty "Done — no
+    # sources" report with no complaint.
+    try:
+        max_pages = int(max_pages) if max_pages is not None else 6
+    except (TypeError, ValueError):
+        max_pages = 6
+    max_pages = max(1, min(20, max_pages))
     return {
         "topic": topic.strip(),
         "queries": searches,
@@ -406,14 +414,29 @@ def build_report(plan, sources, failures, stopped=False):
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _link_or_text(match):
+    """A markdown link as an anchor — http(s) only (G-S4). Any
+    other scheme (javascript:, data:, ...) renders as plain text:
+    reports run on the privileged local-server origin, and a
+    prompt-injected link must not run script there. The scheme
+    check strips whitespace/control characters first, so a
+    "java<TAB>script:" smuggling attempt does not pass."""
+    label, url = match.group(1), match.group(2)
+    cleaned = re.sub(r"[\x00-\x20]", "", url).lower()
+    if cleaned.startswith(("http://", "https://")):
+        return f'<a href="{url}">{label}</a>'
+    return label
+
+
 def _inline(text):
     """Bold + links inside one line, everything else escaped.
     Bare URLs become links too (Q3) — the report's source lines
     are clickable, not copy-paste. A URL already inside a link
-    (after href=", or as link text after >) is left alone."""
+    (after href=", or as link text after >) is left alone.
+    Markdown links keep only http(s) hrefs (G-S4)."""
     text = html.escape(text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_or_text, text)
     text = re.sub(r"(?<![\w=\"'\(>])(https?://[^\s<]+)",
                   r'<a href="\1">\1</a>', text)
     return text

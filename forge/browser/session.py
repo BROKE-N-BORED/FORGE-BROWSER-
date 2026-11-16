@@ -10,6 +10,8 @@ after that filter is no session at all.
 import json
 import os
 
+from .memory import _write_json_atomic
+
 MAX_TABS = 50  # a runaway tab count must not make launch crawl
 
 
@@ -47,10 +49,8 @@ def save_session(tabs, current=0):
             pass
         return 0
     current = max(0, min(int(current or 0), len(kept) - 1))
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump({"tabs": kept, "current": current}, handle, indent=2)
-    os.replace(tmp, path)
+    # Atomic + 0600 (G-S7): the session lists the person's open tabs.
+    _write_json_atomic(path, {"tabs": kept, "current": current}, indent=2)
     return len(kept)
 
 
@@ -68,8 +68,12 @@ def load_session():
             if isinstance(t, dict) and _saveable(t.get("url", ""))]
     if not tabs:
         return None
+    # G-C32: slice first, then clamp — the old code clamped
+    # `current` against the pre-slice list, so a restored index
+    # could exceed the returned tab list.
+    tabs = tabs[:MAX_TABS]
     current = data.get("current", 0)
     if not isinstance(current, int):
         current = 0
-    return {"tabs": tabs[:MAX_TABS],
+    return {"tabs": tabs,
             "current": max(0, min(current, len(tabs) - 1))}

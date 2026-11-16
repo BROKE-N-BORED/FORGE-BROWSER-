@@ -218,8 +218,13 @@ def build_brief(session=None, now=None, force=False):
     try:
         path = brief_path(day)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
+        # G-C31: atomic write (tmp + replace) — the old direct
+        # open() left a half-written brief when a crash landed
+        # mid-write.
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(brief, handle)
+        os.replace(tmp, path)
     except OSError:
         pass
     prune_briefs(now=now)

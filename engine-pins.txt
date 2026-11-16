@@ -11,18 +11,35 @@ lightpanda-aarch64-linux 1.0.3 20a5348bf3b6f71e41088223b188552ab550c1b9c9a9cbd8f
 #
 # Chromium snapshot revision 1741687 (Chromium 160.0.8156.0 — the
 # revision the v0.5 window was verified with on the real PC).
-# Google publishes no SHA-256 for snapshots, so both hashes were
-# computed 2026-11-13 from a download verified against the GCS
-# metadata (size 258397444, MD5 NTKcUI5XHzwi+IgYatTYog== — both
-# matched): the zip's SHA-256 (field 3) verifies the download,
-# and the extracted chrome binary's SHA-256 (field 4) re-verifies
-# the installed tree on every run. Honest limit: a hash computed
-# from a download proves the bytes match what was recorded, not
-# that Google published them — a tamper baked in at recording
-# time would not be caught. What the pin does catch is any later
-# tamper or corruption, which the old metadata-MD5 check (same
-# source as the bytes) could not.
+# The snapshot publisher publishes no SHA-256 for snapshots, so
+# both hashes were computed 2026-11-13 from a download verified
+# against the GCS metadata (size 258397444, MD5
+# NTKcUI5XHzwi+IgYatTYog== — both matched): the zip's SHA-256
+# (field 3) verifies the download, and the extracted chrome
+# binary's SHA-256 (field 4) re-verifies the installed tree on
+# every install.sh run (--check included). Honest limit: a hash
+# computed from a download proves the bytes match what was
+# recorded, not that the snapshot publisher published them — a
+# tamper baked in at recording time would not be caught. What the
+# pin does catch is any later tamper or corruption, which the old
+# metadata-MD5 check (same source as the bytes) could not.
 chromium-linux-x64 1741687 ad9f5afa03ca3e44424d7a74f53730b9c037281ed15bea54556a5f62a95437f7 c6041b68d5a5c998e39717f94ab1944e0e9b0c5bd745624c6957a834870134a5
+#
+# Ollama 0.40.16 (2026-11-09, latest stable) — the chat brain's
+# server, installed by install.sh when no Ollama is on the
+# machine. Upstream publishes no hash for the Linux archive, so
+# only the version is pinned here (two fields, not three);
+# install.sh verifies the installed binary reports this version
+# (ollama --version). The archive is ~1.5 GB — it bundles GPU
+# runners even for CPU-only machines — and needs zstd to unpack.
+ollama-linux-amd64 0.40.16
+#
+# Whisper base.en model (ggml-base.en.bin, 147964211 bytes) — the
+# file install.sh --with-whisper fetches for transcription. The
+# pin is the Hugging Face repo commit (field 2) plus the file's
+# SHA-256 (field 3), verified 2026-11-15: the hash matches the
+# repo's own LFS record and a fresh download of the pinned commit.
+whisper-base.en 5359861c739e955e79d9a303bcbc70fb988958b1 a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002
 #
 # Cross-refs (AA6): PySide6 is pinned in pyside-requirements.txt
 # (B-section), not here; download resume is the curl

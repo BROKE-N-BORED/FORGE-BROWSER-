@@ -25,6 +25,7 @@ cannot clobber each other, and the write itself is atomic
 (tmp file + os.replace).
 """
 
+import copy
 import fcntl
 import json
 import os
@@ -54,15 +55,37 @@ def _defaults():
             "always_allow": {}}
 
 
+# G-P18: seats are re-read from disk on every call (per search,
+# per tab title change, per chat turn) — cache the parsed seats,
+# keyed on the file's mtime + size, so a changed file is re-read
+# at once. Callers get a copy: set_seat's mutate edits in place,
+# and must never edit the cached dict.
+_seats_cache = {"path": None, "key": None, "data": None}
+
+
+def _invalidate_seats_cache():
+    _seats_cache.update({"path": None, "key": None, "data": None})
+
+
 def load_seats():
+    path = seats_path()
+    try:
+        stat = os.stat(path)
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if (key is not None and _seats_cache["path"] == path
+            and _seats_cache["key"] == key
+            and _seats_cache["data"] is not None):
+        return copy.deepcopy(_seats_cache["data"])
     seats = _defaults()
     try:
-        with open(seats_path(), encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
         if isinstance(data, dict):
-            for key in ("brain", "fast", "vision"):
-                if isinstance(data.get(key), str) and data[key].strip():
-                    seats[key] = data[key].strip()
+            for seat in ("brain", "fast", "vision"):
+                if isinstance(data.get(seat), str) and data[seat].strip():
+                    seats[seat] = data[seat].strip()
             if isinstance(data.get("ai_enabled"), bool):
                 seats["ai_enabled"] = data["ai_enabled"]
             if isinstance(data.get("features"), dict):
@@ -75,6 +98,8 @@ def load_seats():
                         seats["always_allow"][name] = data["always_allow"][name]
     except (OSError, ValueError):
         pass
+    _seats_cache.update({"path": path, "key": key,
+                         "data": copy.deepcopy(seats)})
     return seats
 
 
@@ -108,14 +133,8 @@ def _locked_update(mutate):
             _write_seats(seats)
         except OSError:
             pass
+        _invalidate_seats_cache()
         return seats
-
-
-def save_seats(seats):
-    try:
-        _locked_update(lambda _loaded: seats)
-    except OSError:
-        pass
 
 
 def set_seat(name, model):

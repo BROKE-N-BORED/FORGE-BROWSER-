@@ -7,6 +7,8 @@ CLI (no API key, no account). Plain standard library.
 """
 
 import html
+import re
+import secrets
 import threading
 import time
 import urllib.parse
@@ -66,17 +68,163 @@ def _when(at):
         return ""
 
 
+_LINK_RE = re.compile(r"<a\s+([^>]*?)>")
+
+
+def _with_noopener(page):
+    """Add rel="noopener" to every link that lacks a rel (G-S4):
+    report links open outside the local origin's trust, so a
+    clicked link must not get a window.opener back into it."""
+    def add_rel(match):
+        attrs = match.group(1)
+        if "rel=" in attrs:
+            return match.group(0)
+        return f'<a {attrs} rel="noopener">'
+
+    return _LINK_RE.sub(add_rel, page)
+
+
+def _domain_of(entry):
+    """A history entry's host — the same key titles._domain uses
+    (netloc, or "other" when there is none), so the grouping
+    matches titles.grouped_history exactly."""
+    try:
+        return urllib.parse.urlparse(entry.get("url") or "").netloc or "other"
+    except Exception:
+        return "other"
+
+
+def _group_entries(entries):
+    """History entries grouped by site, newest group first — the
+    same grouping titles.grouped_history does, but from entries
+    already loaded (G-P13: the start page loads history once)."""
+    groups = {}
+    order = []
+    for entry in entries:
+        key = _domain_of(entry)
+        if key not in groups:
+            groups[key] = {"name": key, "items": []}
+            order.append(key)
+        groups[key]["items"].append(entry)
+    return [groups[key] for key in order]
+
+
+def _journey_entries(entries):
+    """History entries grouped into journeys (G-P13: same split
+    titles.journeys does, from already-loaded entries): runs of
+    visits with less than 30 quiet minutes between them."""
+    from .titles import JOURNEY_GAP_SECONDS
+    if not entries:
+        return []
+    ordered = list(reversed(entries))  # oldest first
+    runs = [[ordered[0]]]
+    for entry in ordered[1:]:
+        gap = entry.get("at", 0) - runs[-1][-1].get("at", 0)
+        if gap > JOURNEY_GAP_SECONDS:
+            runs.append([entry])
+        else:
+            runs[-1].append(entry)
+    out = []
+    for run in reversed(runs):  # newest journey first
+        items = list(reversed(run))  # newest visit first
+        counts = {}
+        for item in items:
+            domain = _domain_of(item)
+            counts[domain] = counts.get(domain, 0) + 1
+        best, count = max(counts.items(), key=lambda kv: kv[1])
+        name = (best if count >= 2
+                else (items[0].get("title") or items[0].get("url")
+                      or "Journey")[:40])
+        out.append({"name": name, "started": run[0].get("at", 0),
+                    "ended": run[-1].get("at", 0), "items": items})
+    return out
+
+
+def _today_pages_meta(entries, now=None):
+    """Today's visited pages so far (G-P13): url + title + time
+    only — the page store's metadata listing (list_pages), never
+    the chunk text, plus today's history entries to fill gaps.
+    Same window, dedup, and sensitive exclusion as
+    brief.today_pages, without parsing megabytes of chunks."""
+    import datetime
+    from .memory import is_sensitive_url, list_pages
+    if now is None:
+        today = datetime.date.today()
+        end = time.time()
+    else:
+        today = datetime.datetime.fromtimestamp(now).date()
+        end = now
+    start = time.mktime(today.timetuple())
+    pages = []
+    seen = set()
+    for page in list_pages():
+        at = page.get("at", 0)
+        if start <= at < end and page["url"] not in seen:
+            if is_sensitive_url(page["url"]):
+                continue
+            seen.add(page["url"])
+            pages.append({"url": page["url"], "title": page["title"],
+                          "at": at})
+    for entry in entries:
+        url = entry.get("url")
+        at = entry.get("at", 0)
+        if not url or url in seen:
+            continue
+        if start <= at < end:
+            if is_sensitive_url(url):
+                continue
+            seen.add(url)
+            pages.append({"url": url,
+                          "title": entry.get("title") or url, "at": at})
+    pages.sort(key=lambda p: -p["at"])
+    return pages
+
+
+# G-P12: the engine status is probed at most once a minute — every
+# start-page load used to pay for a Kitesurf HTTP probe plus the
+# uncached vision-model pick.
+_STATUS_TTL_SECONDS = 60
+_STATUS_CACHE = {"at": 0.0, "status": None}
+
+
+def cached_engine_status():
+    """engines.engine_status(), cached for a minute."""
+    now = time.monotonic()
+    if (_STATUS_CACHE["status"] is not None
+            and now - _STATUS_CACHE["at"] < _STATUS_TTL_SECONDS):
+        return _STATUS_CACHE["status"]
+    status = engines.engine_status()
+    _STATUS_CACHE["at"] = now
+    _STATUS_CACHE["status"] = status
+    return status
+
+
+def engine_status_line(status):
+    """One plain line about the engine room (B14): ready, or what
+    is missing and where its fix lives. The old full status dump
+    (paths, revisions, env-var names) met a child or grandparent
+    on first launch."""
+    found = (status.get("chromium") or status.get("lightpanda_binary")
+             or status.get("kitesurf_serving") or status.get("cdp_url"))
+    if not found:
+        return ('No page engine is installed, so the chat cannot open '
+                'pages yet. Browsing still works. '
+                '<a href="/howto">How to fix it</a>')
+    return "Everything is ready."
+
+
 def history_page(query=None, cleared=False):
     """The full history view (N11): every visit with its timestamp,
     a search box, and a clear-history control."""
-    from .titles import load_history
+    from .titles import _HISTORY_LIMIT, load_history
     entries = load_history()
     total = len(entries)
     if query:
         lowered = query.lower()
         entries = [e for e in entries
-                   if lowered in (e.get("title") or "").lower()
-                   or lowered in (e.get("url") or "").lower()]
+                   if isinstance(e, dict)
+                   and (lowered in (e.get("title") or "").lower()
+                        or lowered in (e.get("url") or "").lower())]
     note = ""
     if cleared:
         note = ('<p style="color:#7fae7a;">History cleared.</p>')
@@ -85,12 +233,23 @@ def history_page(query=None, cleared=False):
                  f'match "{html.escape(query)}".</p>')
     elif total:
         note += f'<p class="sub">{total} visits, newest first.</p>'
+    # B15: the cap is disclosed where the data is shown.
+    note += (f'<p class="sub">History keeps the newest '
+             f'{_HISTORY_LIMIT} visits. Older visits drop off.</p>')
     rows = []
     for entry in entries:
+        # G-C36: a malformed entry (no URL, or not a dict at all)
+        # is skipped, not a 500 — load_history returns
+        # unvalidated entries.
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        if not url:
+            continue
         rows.append(
-            f'<div class="result"><a class="t" href="{html.escape(entry["url"])}">'
-            f"{html.escape(entry.get('title') or entry['url'])}</a>"
-            f'<div class="u">{html.escape(entry["url"])}</div>'
+            f'<div class="result"><a class="t" href="{html.escape(url)}">'
+            f"{html.escape(entry.get('title') or url)}</a>"
+            f'<div class="u">{html.escape(url)}</div>'
             f'<div class="s">{html.escape(_when(entry.get("at")))}</div></div>')
     body = "\n".join(rows) or "<p>No history yet. Pages you visit show up here.</p>"
     return f"""<!doctype html><html><head><meta charset="utf-8">
@@ -107,26 +266,71 @@ def history_page(query=None, cleared=False):
 </div></body></html>"""
 
 
-def history_clear_page():
+def history_clear_page(token=None):
     """The clear-history confirmation (N3/N11) — a destructive
-    action gets a second look, not a one-click wipe."""
+    action gets a second look, not a one-click wipe. The confirm
+    link carries the per-launch token (G-S6): without it the wipe
+    route refuses."""
     from .titles import load_history
     count = len(load_history())
+    confirm = "/history-clear?confirm=1"
+    if token:
+        confirm += "&token=" + urllib.parse.quote(token)
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>Clear history · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>Clear history?</h1>
 <p>This deletes all {count} recorded visits. It cannot be undone.</p>
-<p><a href="/history-clear?confirm=1">Yes, clear it</a> &nbsp;·&nbsp;
+<p><a href="{confirm}">Yes, clear it</a> &nbsp;·&nbsp;
 <a href="/history">Cancel</a></p>
 </div></body></html>"""
 
 
-def start_page():
+def memory_page():
+    """What the browser remembers, as a page (B9): the facts and
+    stored pages, read-only — the same data the Memory window
+    shows, one click from the start page's honest line."""
+    from .memory import (_MEMORY_LIMIT, _PAGE_MEMORY_LIMIT, list_entries,
+                         list_pages)
+    facts = list_entries()
+    pages = list_pages()
+    fact_rows = "\n".join(
+        f'<div class="result"><div class="s">'
+        f"{html.escape(entry.get('text') or '')}</div></div>"
+        for entry in facts)
+    page_rows = "\n".join(
+        f'<div class="result"><a class="t" href="{html.escape(page["url"])}">'
+        f"{html.escape(page.get('title') or page['url'])}</a>"
+        f'<div class="u">{html.escape(page["url"])}</div></div>'
+        for page in pages)
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Memory · Forge Browser</title><style>{_STYLE}</style></head>
+<body><div class="wrap">
+<h1>Memory</h1>
+<p class="sub"><a href="/">← Start page</a></p>
+<p class="sub">Kept on this PC only. Nothing here leaves the machine.</p>
+<h2 style="font-size:18px;">Remembered facts ({len(facts)})</h2>
+<p class="sub">Keeps the newest {_MEMORY_LIMIT} facts.</p>
+{fact_rows or "<p>No facts remembered yet.</p>"}
+<h2 style="font-size:18px;">Stored pages ({len(pages)})</h2>
+<p class="sub">Keeps the newest {_PAGE_MEMORY_LIMIT} pages.</p>
+{page_rows or "<p>No pages stored yet.</p>"}
+<p class="sub">To forget a fact or remove a page, use the Memory window
+in the chat dock.</p>
+</div></body></html>"""
+
+
+def start_page(token=None):
     from .bookmarks import list_bookmarks
-    from .brief import load_brief, today_pages, yesterday_date
-    from .titles import grouped_history, journeys
-    status = html.escape(engines.format_status(engines.engine_status()))
+    from .brief import load_brief, yesterday_date
+    from .titles import load_history
+    # B14: one plain line about the engine room, not the full
+    # status dump. G-P12: the probe behind it is cached.
+    status = engine_status_line(cached_engine_status())
+    # G-P13: history is loaded once per request; the groups,
+    # journeys, and today's list below all derive from it, and
+    # today's list is metadata-only (no chunk text parsed).
+    entries = load_history()
     # Quick links: the person's bookmarks, first thing on the page.
     quick = ""
     marks = list_bookmarks()[:8]
@@ -160,12 +364,16 @@ def start_page():
                 f'<div class="u">{html.escape(page["url"])}</div></div>')
         brief = "\n".join(parts)
     # U7: rebuild the brief on demand — a bad summary re-rolls
-    # without deleting the file by hand.
-    brief += ('<p><a href="/brief-refresh">Refresh brief ↻</a></p>')
+    # without deleting the file by hand. The link carries the
+    # per-launch token (G-S6): the rebuild route refuses without it.
+    refresh_href = "/brief-refresh"
+    if token:
+        refresh_href += "?token=" + urllib.parse.quote(token)
+    brief += (f'<p><a href="{refresh_href}">Refresh brief ↻</a></p>')
     brief = f'<div class="brief-box">{brief}</div>'
     # U6: today so far, alongside yesterday — a list only,
     # computed live (today keeps changing, so it is not cached).
-    today = today_pages()
+    today = _today_pages_meta(entries)
     today_html = ""
     if today:
         parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">'
@@ -177,7 +385,7 @@ def start_page():
                 f'<div class="u">{html.escape(page["url"])}</div></div>')
         today_html = "\n".join(parts)
     recent = ""
-    groups = grouped_history()
+    groups = _group_entries(entries)
     if groups:
         parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Recent</h2>']
         for group in groups[:4]:
@@ -194,7 +402,7 @@ def start_page():
     # N2: journeys — browsing sessions, resumable by clicking any
     # of their pages back open.
     journey_html = ""
-    found = journeys()
+    found = _journey_entries(entries)
     if found:
         parts = ['<h2 style="font-size:18px;margin:28px 0 8px;">Journeys</h2>']
         for journey in found[:4]:
@@ -239,7 +447,9 @@ def start_page():
 <title>Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
 <h1>FORGE BROWSER<span class="dot">.</span></h1>
-<p class="sub">Your browser. No accounts, no API keys, nothing tracked.</p>
+<p class="sub">Your browser. No accounts, no API keys.
+Nothing leaves this machine. Visits and page text are kept on this PC:
+<a href="/history">History</a> · <a href="/memory">Memory</a>.</p>
 <p class="tip">Tip: in chat, write <b>@tab2</b> to ask about tab 2, or compare tabs by number.</p>
 {howto}
 <form action="/search" method="get">
@@ -323,7 +533,8 @@ def research_report_page(name):
     for report in list_reports():
         if report["name"] == name:
             with open(report["path"], encoding="utf-8") as handle:
-                return report_to_html(handle.read())
+                # G-S4: report links carry rel="noopener".
+                return _with_noopener(report_to_html(handle.read()))
     return None
 
 
@@ -360,24 +571,89 @@ def resolve_address(text):
         return ("url", "/")
     if "://" in text:
         return ("url", text)
-    if " " not in text and ("." in text or text.startswith("localhost")):
-        return ("url", "https://" + text)
+    if (" " not in text
+            and ("." in text or text.startswith("localhost")
+                 or text.startswith("[") or text.startswith("::"))):
+        # G-UX8: local servers are plain HTTP — https:// onto
+        # localhost or a loopback address always fails.
+        host_part = text.split("/")[0]
+        if host_part.startswith("["):
+            host = host_part.split("]")[0].strip("[]").lower()
+        elif host_part.startswith("::"):
+            host = host_part.lower()
+        else:
+            host = host_part.split(":")[0].lower()
+        if (host == "localhost" or host.startswith("127.")
+                or host == "::1" or host.endswith(".local")):
+            scheme = "http"
+        else:
+            scheme = "https"
+        if host_part.startswith("::"):
+            # A bare IPv6 literal needs brackets to be a URL.
+            rest = text[len(host_part):]
+            return ("url", scheme + "://[" + host_part + "]" + rest)
+        return ("url", scheme + "://" + text)
     return ("search", text)
 
 
 class _Handler(BaseHTTPRequestHandler):
+    # G-S6: the local server's own pages need no script or
+    # external resource — the policy says so, and MIME sniffing
+    # is off, on every response.
+    _SECURITY_HEADERS = (
+        ("X-Content-Type-Options", "nosniff"),
+        ("Content-Security-Policy",
+         "default-src 'self'; style-src 'unsafe-inline'"),
+    )
+
+    def _send_page(self, status, page, content_type="text/html; charset=utf-8",
+                   disposition=None):
+        # G-S4: every served HTML page gets rel="noopener" on
+        # links lacking a rel, at this one choke point — history,
+        # memory, start, search, research, howto, and compare
+        # pages all flow through here. Non-HTML bodies (CSV,
+        # Markdown, plain text) are left alone: the link regex
+        # must never rewrite data that merely looks like a link.
+        if content_type.startswith("text/html"):
+            page = _with_noopener(page)
+        body = page.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if disposition:
+            self.send_header("Content-Disposition", disposition)
+        for name, value in self._SECURITY_HEADERS:
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _token(self):
+        return getattr(self.server, "token", None)
+
+    def _token_ok(self, params):
+        # G-S6: state-changing routes need the per-launch token —
+        # any local process that finds the port must not be able
+        # to wipe history or trigger a rebuild.
+        token = self._token()
+        return token is not None and params.get("token", [""])[0] == token
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
         try:
             content_type = "text/html; charset=utf-8"
             disposition = None
+            status = 200
             if parsed.path == "/search":
-                query = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+                query = params.get("q", [""])[0]
                 page = search_page(query)
             elif parsed.path == "/history":
                 # N11: the full history view, with search.
-                query = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+                query = params.get("q", [""])[0]
                 page = history_page(query or None)
+            elif parsed.path == "/memory":
+                # B9: what the browser remembers, read-only.
+                page = memory_page()
             elif parsed.path == "/research":
                 # Q4: the saved reports, newest first.
                 page = research_list_page()
@@ -389,37 +665,50 @@ class _Handler(BaseHTTPRequestHandler):
                             "← All reports</a></p>")
             elif parsed.path == "/history-clear":
                 # N3/N11: confirm first; ?confirm=1 does the wipe.
-                params = urllib.parse.parse_qs(parsed.query)
                 if params.get("confirm", [""])[0] == "1":
-                    from .titles import clear_history
-                    clear_history()
-                    page = history_page(cleared=True)
+                    if not self._token_ok(params):
+                        status = 403
+                        page = ('<h1>History was not cleared</h1>'
+                                '<p>That link is missing its token. '
+                                'Go back to <a href="/history">History</a> '
+                                'and use the Clear link there.</p>')
+                    else:
+                        from .titles import clear_history
+                        clear_history()
+                        page = history_page(cleared=True)
                 else:
-                    page = history_clear_page()
+                    page = history_clear_page(token=self._token())
             elif parsed.path == "/brief-refresh":
                 # U7: rebuild the brief on demand, in the
                 # background — the page says to reload in a
                 # minute. Gated on the kill-switch (T2): no brain
                 # job runs while AI/chat is off.
-                from .seats import seats_enabled
-                if not seats_enabled("chat"):
-                    page = ('<h1>Morning brief</h1><p>AI is off. The '
-                            'brief does not build while AI/chat is off.</p>'
-                            '<p><a href="/">← Start page</a></p>')
+                if not self._token_ok(params):
+                    status = 403
+                    page = ('<h1>Brief was not refreshed</h1>'
+                            '<p>That link is missing its token. '
+                            'Go back to the <a href="/">start page</a> '
+                            'and use the Refresh brief link there.</p>')
                 else:
-                    def _rebuild_brief():
-                        from .brief import build_brief
-                        from .chat import ChatSession
-                        try:
-                            build_brief(ChatSession(), force=True)
-                        except Exception:
-                            pass
+                    from .seats import seats_enabled
+                    if not seats_enabled("chat"):
+                        page = ('<h1>Morning brief</h1><p>AI is off. The '
+                                'brief does not build while AI/chat is off.</p>'
+                                '<p><a href="/">← Start page</a></p>')
+                    else:
+                        def _rebuild_brief():
+                            from .brief import build_brief
+                            from .chat import ChatSession
+                            try:
+                                build_brief(ChatSession(), force=True)
+                            except Exception:
+                                pass
 
-                    threading.Thread(target=_rebuild_brief,
-                                     daemon=True).start()
-                    page = ('<h1>Morning brief</h1><p>Rebuilding the '
-                            'brief. Reload the start page in a minute.</p>'
-                            '<p><a href="/">← Start page</a></p>')
+                        threading.Thread(target=_rebuild_brief,
+                                         daemon=True).start()
+                        page = ('<h1>Morning brief</h1><p>Rebuilding the '
+                                'brief. Reload the start page in a minute.</p>'
+                                '<p><a href="/">← Start page</a></p>')
             elif parsed.path == "/compare.csv":
                 # M11: the last comparison as a CSV download.
                 from .compare import compare_table_csv, last_comparison
@@ -446,35 +735,35 @@ class _Handler(BaseHTTPRequestHandler):
                 # sections the Help menu's How to Use window shows.
                 page = howto_page()
             else:
-                page = start_page()
-            body = page.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            if disposition:
-                self.send_header("Content-Disposition", disposition)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+                page = start_page(token=self._token())
+            self._send_page(status, page, content_type, disposition)
         except Exception as exc:  # the page must say so, never hang
-            body = f"Forge Browser hit a problem: {exc}".encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_page(500, f"Forge Browser hit a problem: {exc}",
+                            "text/plain; charset=utf-8")
 
     def log_message(self, *args):
         pass
 
 
 class LocalPageServer:
-    """Serves Forge Browser's own pages on 127.0.0.1 (app use)."""
+    """Serves Forge Browser's own pages on 127.0.0.1 (app use).
+
+    Each launch mints a random token (G-S6): the state-changing
+    routes (/history-clear's confirm, /brief-refresh) refuse
+    requests without it, so another local process that finds the
+    port cannot wipe history or trigger work. The app's own pages
+    carry the token in their links."""
 
     def __init__(self):
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.token = secrets.token_hex(16)
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever,
                                         daemon=True)
+
+    @property
+    def token(self):
+        return self._server.token
 
     @property
     def home_url(self):

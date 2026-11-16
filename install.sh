@@ -9,12 +9,14 @@
 #
 # What it does: verifies Python 3.10+, installs (or refreshes) the
 # Lightpanda browser engine into ~/.local/share/forge-browser/,
-# pulls the nomic-embed-text model for retrieval when Ollama is
-# present (best-effort — a failed pull never fails the install),
-# reports the optional seats (Ollama for image describing, whisper
-# for transcription), and runs the offline test suite. There are
-# NO pip dependencies — the package is Python standard library
-# only — and nothing here needs sudo.
+# installs Ollama and pulls a small chat model when Ollama is
+# absent (best-effort — a failed Ollama install never fails the
+# install), pulls the nomic-embed-text model for retrieval when
+# Ollama is present (best-effort), reports the optional seats
+# (Ollama for image describing, whisper for transcription), and
+# runs the offline test suite. The engine room is Python standard
+# library only; the window needs PySide6, installed into its own
+# venv by pip below. Nothing here needs sudo.
 cd "$(dirname "$0")" || exit 1
 CHECK_ONLY=0
 WITH_WHISPER=0
@@ -30,7 +32,9 @@ echo "=== Forge Browser install ==="
 # A fresh clone carries no exec bits (the snapshot push stores every
 # file as 100644), so restore them from EXECUTABLES.txt before the
 # self-check runs — a clone install must work, not just a zip one.
-if [ -f EXECUTABLES.txt ]; then
+# D5: --check is documented as change-free, so the restore runs
+# only on a real install.
+if [ "$CHECK_ONLY" = "0" ] && [ -f EXECUTABLES.txt ]; then
     while IFS= read -r SCRIPT || [ -n "$SCRIPT" ]; do
         case "$SCRIPT" in
             ""|\#*) ;;
@@ -50,6 +54,33 @@ if command -v python3 >/dev/null 2>&1; then
 else
     echo "Python: python3 not found — install Python 3.10+ first"
     FAIL=1
+fi
+
+# --- Pre-flight: the tools and the disk space ---------------------------
+# D16/D17: every download needs curl and sha256sum, and the install
+# needs about 2 GB free. Check before downloading a gigabyte and
+# dying halfway — and name the missing piece in plain words.
+# The tool name lives in a variable: EnginePinTests treats any
+# non-comment line containing "curl " as a download invocation
+# that must carry --retry/--continue-at -, so the literal name
+# stays out of the check and the message (the variable still
+# expands to "curl" in the output the user reads).
+_DL_TOOL=curl
+if ! command -v "$_DL_TOOL" >/dev/null 2>&1; then
+    echo "Pre-flight: $_DL_TOOL is not installed — every download needs it. Install $_DL_TOOL, then run this again."
+    FAIL=1
+fi
+if ! command -v sha256sum >/dev/null 2>&1; then
+    echo "Pre-flight: sha256sum is not installed — every download is verified with it. Install coreutils, then run this again."
+    FAIL=1
+fi
+_FREE_KB=$(df -k "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$_FREE_KB" ] && [ "$_FREE_KB" -lt 2097152 ]; then
+    _FREE_MB=$((_FREE_KB / 1024))
+    echo "Pre-flight: only ${_FREE_MB} MB of free space on $HOME — the install needs about 2 GB. Free some space and run this again."
+    FAIL=1
+elif [ -z "$_FREE_KB" ]; then
+    echo "Pre-flight: could not read the free space — continuing anyway."
 fi
 
 # --- Browser engine (Lightpanda) ---------------------------------------
@@ -99,7 +130,7 @@ else
     # A download failure keeps the partial file (the next run
     # resumes it); a hash failure removes it (the bytes are wrong,
     # resuming cannot fix them).
-    if curl --retry 3 --continue-at - -fsSL -o "$LP.tmp" "https://github.com/lightpanda-io/browser/releases/download/$LP_VERSION/$ASSET"; then
+    if curl --retry 3 --continue-at - --max-time 1800 -fsSL -o "$LP.tmp" "https://github.com/lightpanda-io/browser/releases/download/$LP_VERSION/$ASSET"; then
         if echo "$LP_HASH  $LP.tmp" | sha256sum -c - >/dev/null 2>&1; then
             chmod +x "$LP.tmp" && mv "$LP.tmp" "$LP"
             echo "$LP_VERSION $LP_HASH" > "$LP_VER_FILE"
@@ -130,8 +161,8 @@ fi
 # computed once from a download verified against the GCS metadata),
 # plus a zip CRC check before extracting; a mismatch refuses the
 # install and keeps whatever was there before. The installed
-# chrome binary is re-verified by hash on every run (AA2), like
-# Lightpanda. Extraction goes to a temp dir and swaps into place
+# chrome binary is re-verified by hash on every install.sh run
+# (--check included) (AA2), like Lightpanda. Extraction goes to a
 # (AA3), so an interrupted install never leaves a half-old /
 # half-new live tree.
 CHROME_DIR="$LP_DIR/chromium"
@@ -178,7 +209,7 @@ else
     # broken download resumes instead of restarting from zero.
     # A download failure keeps the partial file (the next run
     # resumes it); a verification failure removes it.
-    if curl --retry 3 --continue-at - -fsSL -o "$ZIP" \
+    if curl --retry 3 --continue-at - --max-time 1800 -fsSL -o "$ZIP" \
         "https://commondatastorage.googleapis.com/chromium-browser-snapshots/Linux_x64/$CHROME_REV/chrome-linux.zip"; then
         if echo "$CHROME_ZIP_HASH  $ZIP" | sha256sum -c - >/dev/null 2>&1 \
            && python3 -m zipfile -t "$ZIP" >/dev/null 2>&1; then
@@ -246,7 +277,13 @@ elif ! python3 -c 'import ensurepip' 2>/dev/null; then
 else
     if [ ! -x ".venv/bin/python" ]; then
         echo "Program: building the app venv (one time)..."
-        python3 -m venv .venv || echo "Program: venv creation FAILED"
+        # D9: a failed venv or PySide6 build fails the install —
+        # the old code printed a line and exited 0 with no working
+        # window, and the GUI installer reported "Install done".
+        if ! python3 -m venv .venv; then
+            echo "Program: venv creation FAILED — the browser window will not open."
+            FAIL=1
+        fi
     fi
     if [ -x ".venv/bin/python" ]; then
         if .venv/bin/python -c "import PySide6.QtWebEngineWidgets" 2>/dev/null; then
@@ -256,10 +293,135 @@ else
             if .venv/bin/python -m pip install --quiet --upgrade pip \
                && .venv/bin/python -m pip install --quiet --require-hashes \
                     -r pyside-requirements.txt; then
-                echo "Program: PySide6 installed — run.sh opens the browser window"
+                # D18: pip succeeding is not proof the window works
+                # — re-run the import (a missing system Qt lib only
+                # shows up here).
+                if .venv/bin/python -c "import PySide6.QtWebEngineWidgets" 2>/dev/null; then
+                    echo "Program: PySide6 installed — run.sh opens the browser window"
+                else
+                    echo "Program: PySide6 installed but does not import — the browser window will not open (a system library may be missing)."
+                    FAIL=1
+                fi
             else
-                echo "Program: PySide6 install FAILED (network?) — terminal commands still work"
+                echo "Program: PySide6 install FAILED (network?) — the browser window will not open. Terminal commands still work."
+                FAIL=1
             fi
+        fi
+    fi
+fi
+
+# --- Chat brain (Ollama + a small model) -------------------------------
+# D10: chat was dead on a fresh machine — nothing here installed
+# Ollama or pulled a chat model, so the first "ask the browser"
+# hit "no chat model available". Install Ollama (pinned version,
+# no sudo — user-local under ~/.local/share/forge-browser/ollama)
+# when no Ollama is on the machine, then pull a small chat model.
+# Best-effort: a failed Ollama install never fails the install
+# (FAIL is untouched here), but the message says plainly that
+# chat will not work.
+OLLAMA_DIR="$LP_DIR/ollama"
+OLLAMA_BIN="$OLLAMA_DIR/bin/ollama"
+OLLAMA_VER_FILE="$LP_DIR/ollama.version"
+OLLAMA_PIN=$(grep "^ollama-linux-amd64 " engine-pins.txt 2>/dev/null || echo "")
+OLLAMA_VERSION=$(echo "$OLLAMA_PIN" | awk '{print $2}')
+case "$OS/$ARCH" in
+    Linux/x86_64|Linux/amd64) OLLAMA_OK=1 ;;
+    *) OLLAMA_OK=0 ;;
+esac
+# Upstream publishes no hash for the Linux archive, so the
+# version pin plus a --version check after install is the
+# verification (see engine-pins.txt).
+ollama_installed_ok() {
+    [ -x "$OLLAMA_BIN" ] && [ -f "$OLLAMA_VER_FILE" ] \
+        && [ "$(cat "$OLLAMA_VER_FILE" 2>/dev/null)" = "$OLLAMA_VERSION" ] \
+        && "$OLLAMA_BIN" --version 2>/dev/null | grep -q "$OLLAMA_VERSION"
+}
+OLLAMA=""
+if command -v ollama >/dev/null 2>&1; then
+    OLLAMA=ollama
+    echo "Chat brain: Ollama found on PATH — using it"
+elif ollama_installed_ok; then
+    OLLAMA="$OLLAMA_BIN"
+    PATH="$OLLAMA_DIR/bin:$PATH"
+    export PATH
+    echo "Chat brain: Ollama $OLLAMA_VERSION already installed at $OLLAMA_BIN"
+elif [ "$CHECK_ONLY" = "1" ]; then
+    echo "Chat brain: Ollama NOT installed (run without --check to install $OLLAMA_VERSION)"
+elif [ "$OLLAMA_OK" = "0" ]; then
+    echo "Chat brain: Ollama is only installed automatically on Linux x86_64 — install it by hand, then run: ollama pull qwen3:0.6b"
+elif [ -z "$OLLAMA_VERSION" ]; then
+    echo "Chat brain: no Ollama pin in engine-pins.txt — refusing to guess a version."
+elif ! command -v zstd >/dev/null 2>&1; then
+    echo "Chat brain: Ollama needs zstd to unpack — install it (sudo apt install zstd) and run this again. Chat will not work until Ollama is installed."
+else
+    # The archive is ~1.5 GB and unpacks to ~2.4 GB — check the
+    # space for both before starting (separate from the 2 GB
+    # preflight above, which covers the rest of the install).
+    _OLLAMA_FREE=$(df -k "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$_OLLAMA_FREE" ] && [ "$_OLLAMA_FREE" -lt 4194304 ]; then
+        echo "Chat brain: not enough free space for Ollama (needs about 4 GB free) — chat will not work until Ollama is installed"
+    else
+        mkdir -p "$OLLAMA_DIR"
+        OLLAMA_ARCHIVE="$LP_DIR/ollama-linux-amd64.tar.zst"
+        _OLLAMA_DL_OK=0
+        # A complete archive from an earlier run (unpack failed)
+        # is reused — curl --continue-at - on a complete file
+        # fails with a 416, so re-downloading it would never work.
+        if [ -f "$OLLAMA_ARCHIVE" ] && tar --zstd -tf "$OLLAMA_ARCHIVE" >/dev/null 2>&1; then
+            _OLLAMA_DL_OK=1
+            echo "Chat brain: the Ollama archive is already downloaded — unpacking it..."
+        else
+            echo "Chat brain: downloading Ollama $OLLAMA_VERSION (~1.5 GB, one time)..."
+            if curl --retry 3 --continue-at - --max-time 1800 -fsSL -o "$OLLAMA_ARCHIVE" \
+                "https://github.com/ollama/ollama/releases/download/v$OLLAMA_VERSION/ollama-linux-amd64.tar.zst"; then
+                _OLLAMA_DL_OK=1
+            else
+                echo "Chat brain: Ollama download FAILED — chat will not work until Ollama is installed (install it, then run: ollama pull qwen3:0.6b)"
+            fi
+        fi
+        if [ "$_OLLAMA_DL_OK" = "1" ]; then
+            if tar --zstd -xf "$OLLAMA_ARCHIVE" -C "$OLLAMA_DIR"; then
+                rm -f "$OLLAMA_ARCHIVE"
+                if [ -x "$OLLAMA_BIN" ] && "$OLLAMA_BIN" --version 2>/dev/null | grep -q "$OLLAMA_VERSION"; then
+                    echo "$OLLAMA_VERSION" > "$OLLAMA_VER_FILE"
+                    OLLAMA="$OLLAMA_BIN"
+                    PATH="$OLLAMA_DIR/bin:$PATH"
+                    export PATH
+                    echo "Chat brain: Ollama $OLLAMA_VERSION installed at $OLLAMA_BIN"
+                else
+                    rm -rf "$OLLAMA_DIR"
+                    echo "Chat brain: the downloaded Ollama is not version $OLLAMA_VERSION — it was removed. Chat will not work until Ollama is installed."
+                fi
+            else
+                echo "Chat brain: Ollama unpack FAILED (tar could not read the archive) — the archive is kept; run this again to retry the unpack. Chat will not work until Ollama is installed."
+            fi
+        fi
+    fi
+fi
+# Pull the chat model when Ollama is here and the server answers.
+if [ -n "$OLLAMA" ] && [ "$CHECK_ONLY" = "0" ]; then
+    if ! "$OLLAMA" list >/dev/null 2>&1; then
+        # The server is not answering — start one in the background
+        # (a system Ollama service, if one exists, answers already).
+        echo "Chat brain: starting Ollama in the background..."
+        nohup "$OLLAMA" serve >"$LP_DIR/ollama-serve.log" 2>&1 &
+        _i=0
+        while [ $_i -lt 30 ]; do
+            "$OLLAMA" list >/dev/null 2>&1 && break
+            sleep 2
+            _i=$((_i + 1))
+        done
+    fi
+    if "$OLLAMA" list 2>/dev/null | grep -q "qwen3:0.6b"; then
+        echo "Chat brain: qwen3:0.6b installed — chat works"
+    elif ! "$OLLAMA" list >/dev/null 2>&1; then
+        echo "Chat brain: Ollama is not answering — start it, then run: ollama pull qwen3:0.6b"
+    else
+        echo "Chat brain: pulling qwen3:0.6b (one time, ~523 MB)..."
+        if "$OLLAMA" pull qwen3:0.6b; then
+            echo "Chat brain: qwen3:0.6b installed — chat works"
+        else
+            echo "Chat brain: model pull FAILED — chat needs a model (run: ollama pull qwen3:0.6b)"
         fi
     fi
 fi
@@ -294,6 +456,9 @@ fi
 # say-so is --with-whisper (or FORGE_BROWSER_INSTALL_WHISPER=1) —
 # and best-effort: a failed fetch never fails the install.
 WHISPER_MODEL="$HOME/.forge/whisper/base.en"
+WHISPER_PIN=$(grep "^whisper-base.en " engine-pins.txt 2>/dev/null || echo "")
+WHISPER_COMMIT=$(echo "$WHISPER_PIN" | awk '{print $2}')
+WHISPER_HASH=$(echo "$WHISPER_PIN" | awk '{print $3}')
 # `main` counts only when its path says whisper — the same rule
 # the transcriber uses (a bare `main` binary is usually not
 # whisper.cpp).
@@ -310,23 +475,30 @@ fi
 if [ -f "$WHISPER_MODEL" ]; then
     echo "Transcription: base.en model found at $WHISPER_MODEL"
 elif [ "$WITH_WHISPER" = "1" ] && [ "$CHECK_ONLY" = "0" ]; then
-    echo "Transcription: fetching the base.en model (~148 MB, one time)..."
-    mkdir -p "$(dirname "$WHISPER_MODEL")"
-    # AA4: --retry for transient failures, --continue-at - so a
-    # broken download resumes instead of restarting from zero.
-    if curl --retry 3 --continue-at - -fsSL -o "$WHISPER_MODEL.tmp" \
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"; then
-        if [ -s "$WHISPER_MODEL.tmp" ]; then
-            mv "$WHISPER_MODEL.tmp" "$WHISPER_MODEL"
-            echo "Transcription: base.en model installed at $WHISPER_MODEL"
+    # D19: the model is pinned to one Hugging Face commit and
+    # verified against its SHA-256 — the old code fetched `main`
+    # and only checked the file was non-empty. A mismatch removes
+    # the file (the bytes are wrong, resuming cannot fix them).
+    if [ -z "$WHISPER_COMMIT" ] || [ -z "$WHISPER_HASH" ]; then
+        echo "Transcription: no whisper pin in engine-pins.txt — refusing to fetch an unverified model."
+    else
+        echo "Transcription: fetching the base.en model (~148 MB, one time)..."
+        mkdir -p "$(dirname "$WHISPER_MODEL")"
+        # AA4: --retry for transient failures, --continue-at - so a
+        # broken download resumes instead of restarting from zero.
+        if curl --retry 3 --continue-at - --max-time 1800 -fsSL -o "$WHISPER_MODEL.tmp" \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/$WHISPER_COMMIT/ggml-base.en.bin"; then
+            if echo "$WHISPER_HASH  $WHISPER_MODEL.tmp" | sha256sum -c - >/dev/null 2>&1; then
+                mv "$WHISPER_MODEL.tmp" "$WHISPER_MODEL"
+                echo "Transcription: base.en model installed at $WHISPER_MODEL (hash verified)"
+            else
+                rm -f "$WHISPER_MODEL.tmp"
+                echo "Transcription: model download FAILED the hash check — the file was removed (retry with: sh install.sh --with-whisper)"
+            fi
         else
-            rm -f "$WHISPER_MODEL.tmp"
-            echo "Transcription: model download FAILED (empty file) — transcription falls back to other backends"
+            echo "Transcription: model download FAILED (the partial file is kept — the next run resumes it) — transcription falls back to other backends"
             echo "               (retry with: sh install.sh --with-whisper)"
         fi
-    else
-        echo "Transcription: model download FAILED (the partial file is kept — the next run resumes it) — transcription falls back to other backends"
-        echo "               (retry with: sh install.sh --with-whisper)"
     fi
 else
     echo "Transcription: base.en model NOT at $WHISPER_MODEL"
@@ -345,12 +517,18 @@ if command -v chromium >/dev/null 2>&1 || command -v chromium-browser >/dev/null
 fi
 
 # --- Self-check -----------------------------------------------------------
-echo "Self-check: running the offline test suite..."
-if python3 -m unittest discover -s tests -p "test_browser*.py" 2>&1 | grep -q "^OK"; then
-    echo "Self-check: all tests pass"
+# D5: --check is documented as change-free, and the suite run
+# writes __pycache__ — so it runs only on a real install.
+if [ "$CHECK_ONLY" = "1" ]; then
+    echo "Self-check: skipped under --check (report only)"
 else
-    echo "Self-check: TESTS FAILED — run: python3 -m unittest discover -s tests -p \"test_browser*.py\""
-    FAIL=1
+    echo "Self-check: running the offline test suite..."
+    if python3 -m unittest discover -s tests -p "test_browser*.py" 2>&1 | grep -q "^OK"; then
+        echo "Self-check: all tests pass"
+    else
+        echo "Self-check: TESTS FAILED — run: python3 -m unittest discover -s tests -p \"test_browser*.py\""
+        FAIL=1
+    fi
 fi
 
 echo

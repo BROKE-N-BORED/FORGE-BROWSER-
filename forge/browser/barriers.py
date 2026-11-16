@@ -212,7 +212,7 @@ def scroll_page(session, steps=3):
     session._evaluate("window.scrollTo(0, 0); true")
 
 
-def handle_page(session, url, scroll=False, vault=None):
+def handle_page(session, url, scroll=False, vault=None, allow_local=False):
     """Navigate, clear what clears, and report what remains.
 
     Returns {url, consent_dismissed, barriers, needs_human,
@@ -222,9 +222,16 @@ def handle_page(session, url, scroll=False, vault=None):
     re-detected after the click. A login barrier is filled (never
     submitted) when the vault has an entry for the site: pass an
     opened Vault as vault= (Y2). CAPTCHAs are never cleared here:
-    they need the person, once, in a visible window.
+    they need the person, once, in a visible window. Local
+    addresses are refused by the navigate fence (G-S9) unless
+    allow_local is passed.
     """
-    session.navigate(url)
+    if allow_local:
+        session.navigate(url, allow_local=True)
+    else:
+        # Plain call (not allow_local=False): a session stub need
+        # only implement navigate(url); False is the default.
+        session.navigate(url)
     if scroll:
         scroll_page(session)
     clicked = dismiss_consent(session)

@@ -27,6 +27,7 @@ as context (the window passes the current tab's text).
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -83,12 +84,64 @@ _CHAT_PREFERENCE = (
     ("qwen3", "1.7b"),
 )
 
-MAX_BRAIN_BYTES = int(4.5 * 1024 ** 3)  # size guide for an auto pick
-                                        # (G6): over ~4.5 GB, a brain
-                                        # swaps on an 8 GB machine
 PROMPT_TOKEN_BUDGET = 7000  # of the 8192 ctx (G5); the rest is
                             # headroom for the reply
 CHARS_PER_TOKEN = 4         # rough estimate for the budget
+
+# A streaming brain call that goes this long without a new token
+# is treated as stalled, not waited on forever (G-C3). The
+# non-streaming call already waits at most 240 s for the reply.
+STREAM_STALL_SECONDS = 240
+
+
+def total_ram_bytes():
+    """Total RAM in bytes, measured from /proc/meminfo — 8 GiB
+    when it cannot be read (non-Linux, or a locked-down /proc)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 8 * 1024 ** 3
+
+
+def free_ram_bytes():
+    """RAM free to use (MemAvailable) in bytes — the total when it
+    cannot be read."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return total_ram_bytes()
+
+
+def brain_size_guide(total=None):
+    """The size guide for an auto brain pick, in bytes (B5): about
+    55% of the machine's total RAM, rounded up to the nearest half
+    GB — on an 8 GB machine that is 4.5 GB, the old hardcoded
+    guide. Silent: nothing for the user to set."""
+    if total is None:
+        total = total_ram_bytes()
+    half_gb = 512 * 1024 ** 2
+    return max(2 * half_gb,
+               math.ceil(total * 0.55 / half_gb) * half_gb)
+
+
+def _format_gb(size_bytes):
+    """A byte count as "4.5 GB" / "1 GB" for the pick note."""
+    gib = size_bytes / 1024 ** 3
+    text = f"{gib:.1f}".rstrip("0").rstrip(".")
+    return f"{text} GB"
+
+
+# The guide, sized from this machine's RAM at import (B5) — the
+# live pick re-measures it (see pick_chat_model_with_reason).
+MAX_BRAIN_BYTES = brain_size_guide()
 
 _PREFERRED = ("qwen", "llama", "gemma", "phi", "mistral", "minicpm",
               "deepseek", "smol", "tinyllama")
@@ -205,6 +258,16 @@ def pick_chat_model_with_reason(models=None, sizes=None,
         models = [d["name"] for d in details]
         if sizes is None:
             sizes = {d["name"]: d["size"] for d in details}
+        # B5, live pick: the guide is re-measured at pick time, and
+        # under load (under 1 GB free) it drops to 1 GB, so a fresh
+        # pick does not swap a loaded machine. An explicit
+        # models/sizes call keeps the startup guide, so it stays a
+        # pure function of its arguments.
+        guide = brain_size_guide()
+        if free_ram_bytes() < 1024 ** 3:
+            guide = min(guide, 1024 ** 3)
+    else:
+        guide = MAX_BRAIN_BYTES
     sizes = sizes or {}
     note = ""
     from .seats import load_seats
@@ -223,15 +286,19 @@ def pick_chat_model_with_reason(models=None, sizes=None,
                     "is not installed — using auto")
     # Size-aware auto pick: skip models over the guide.
     oversize = [m for m in models
-                if sizes.get(m) and sizes[m] > MAX_BRAIN_BYTES]
+                if sizes.get(m) and sizes[m] > guide]
     candidates = [m for m in models if m not in oversize]
     if not candidates and models:
         # Every model is over the guide — take the smallest rather
-        # than no brain at all, and say so.
-        candidates = [min(models, key=lambda m: sizes.get(m) or 0)]
+        # than no brain at all, and say so. G-C30: models with an
+        # unknown size sort last, not as 0 — the old key picked an
+        # unknown-size model ahead of every real size.
+        candidates = [min(
+            models, key=lambda m: (0, sizes[m]) if sizes.get(m) else (1, 0))]
         if not note:
-            note = ("every model is over the 4.5 GB size guide — using "
-                    f"the smallest ({candidates[0]}); it may swap")
+            note = (f"every model is over the {_format_gb(guide)} size "
+                    f"guide, using the smallest ({candidates[0]}); "
+                    "it may swap")
     lowered = [(name, name.lower()) for name in candidates]
     for parts in _CHAT_PREFERENCE:
         for name, low in lowered:
@@ -505,7 +572,16 @@ def _run_research(topic):
 # --- the session ---------------------------------------------------
 
 class ChatSession:
-    def __init__(self, model=None):
+    def __init__(self, model=None, on_log=None):
+        # on_log(kind, text): B10 — the window passes the debug log
+        # here, so a failure caught inside a turn (a search action
+        # that fails, the model handed the failure as a RESULT)
+        # still lands in the log's Errors section. The turn itself
+        # "succeeds" around a failed action, so the window's
+        # turn-failure log would never see it. kind is "action"
+        # or "error". None (the CLI, the brief builder) means no
+        # logging — the hook is optional, never required.
+        self._on_log = on_log
         if model is not None:
             self.model = model
             self.pick_reason = "given"
@@ -545,6 +621,16 @@ class ChatSession:
         call already in flight finishes first — Stop lands between
         steps, never mid-word."""
         self._stop_requested = True
+
+    def _log(self, kind, text):
+        """One line to the debug log via the hook (B10). Logging
+        never breaks a turn, so a failure here is silent."""
+        if self._on_log is None:
+            return
+        try:
+            self._on_log(kind, text)
+        except Exception:
+            pass
 
     def _get_embed_cache(self):
         """The session's embedding cache (R6), created on first use
@@ -596,9 +682,27 @@ class ChatSession:
                     text = (data.get("message") or {}).get("content", "")
                 else:
                     parts = []
+                    # G-C3: a stalled stream ends. A timeout on one
+                    # read is retried — the server may just be slow
+                    # between tokens — but STREAM_STALL_SECONDS
+                    # with no new token raises instead of hanging
+                    # the turn forever (only cancel() broke it out
+                    # before). The check runs every time round the
+                    # loop, not just on a timeout, so a server
+                    # dribbling blank lines cannot hold the turn
+                    # open either; only a line with content resets
+                    # the clock.
+                    last_token = time.monotonic()
                     while True:
                         if self._stop_requested:
                             break
+                        if (time.monotonic() - last_token
+                                > STREAM_STALL_SECONDS):
+                            raise BrowserError(
+                                f"The chat brain ({self.model}) "
+                                "stopped answering mid-reply, no "
+                                "new words for "
+                                f"{STREAM_STALL_SECONDS} seconds")
                         try:
                             line = response.readline()
                         except socket.timeout:
@@ -608,6 +712,11 @@ class ChatSession:
                         line = line.strip()
                         if not line:
                             continue
+                        # Only a line with content resets the stall
+                        # clock (G-C3): blank keepalive lines are
+                        # not tokens, so they must not hold a dead
+                        # stream open forever.
+                        last_token = time.monotonic()
                         try:
                             data = json.loads(line.decode("utf-8"))
                         except ValueError:
@@ -617,6 +726,8 @@ class ChatSession:
                             parts.append(content)
                             on_chunk(content)
                     text = "".join(parts)
+        except BrowserError:
+            raise
         except Exception as exc:
             raise BrowserError(
                 f"The chat brain ({self.model}) did not answer: {exc}") from exc
@@ -1059,6 +1170,11 @@ class ChatSession:
                 else:
                     result = f"Unknown action type: {kind}"
             except Exception as exc:
+                # B10: the turn carries on around a failed action
+                # (the model gets the failure as a RESULT), so the
+                # failure is logged here — the window's
+                # turn-failure log would never see it.
+                self._log("error", f"Chat action {kind} failed: {exc}")
                 result = f"That action failed: {exc}"
             finally:
                 if on_step_done is not None:
@@ -1073,4 +1189,9 @@ class ChatSession:
         self.history.append({"role": "user", "content": user_text})
         if answer:
             self.history.append({"role": "assistant", "content": answer})
+        # G-P7: the history is trimmed to the cap after every turn —
+        # it used to grow for the session's life (HISTORY_CAP only
+        # sliced for the prompt, despite its "messages kept"
+        # comment), so a long session carried every turn in RAM.
+        del self.history[:-HISTORY_CAP]
         return answer, open_requests

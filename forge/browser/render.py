@@ -22,14 +22,15 @@ def render(url, engine="auto", max_chars=12000, offset=0, timeout=25,
         raise BrowserError(f"render only takes http(s) pages — refused {url!r}")
     check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
-        return session.page(url, max_chars=max_chars, offset=offset)
+        return session.page(url, max_chars=max_chars, offset=offset,
+                            allow_local=allow_local)
 
 
 def snapshot(url, engine="auto", timeout=25, allow_local=False):
     """The page's accessibility snapshot plus its numbered elements."""
     check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
-        session.navigate(url)
+        session.navigate(url, allow_local=allow_local)
         return {
             "url": url,
             "engine": session.engine_name,
@@ -43,5 +44,5 @@ def screenshot(url, path, engine="auto", timeout=25, allow_local=False):
     """Save a PNG screenshot of ``url`` to ``path``; returns the path."""
     check_fetch_url(url, allow_local=allow_local)
     with BrowserSession.start(engine=engine, timeout=timeout) as session:
-        session.navigate(url)
+        session.navigate(url, allow_local=allow_local)
         return session.screenshot(path)

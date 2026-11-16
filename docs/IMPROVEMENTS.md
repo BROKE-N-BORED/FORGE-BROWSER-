@@ -4,6 +4,10 @@
 GitHub: BROKE-N-BORED/FORGE-BROWSER-) · **Status:** suggestions for Joshua to
 pick from, one at a time. Nothing here is built until he names it.
 
+**Note (2026-11-15):** all 22 items below were built 2026-11-11 — this file is
+the original proposal, kept as the record of what was suggested and why. See
+`TASK-LIST.md` for the build status of each item.
+
 **The machine every suggestion is fitted to:** Ryzen 3 3250U (2 cores /
 4 threads, AVX2 only), 8 GB RAM total, CPU-only, spinning HDD, Linux Mint.
 **The rules:** $0, no API keys, no accounts, local models first, one model
@@ -102,8 +106,9 @@ they're defects and risks in what already exists, not new features.
    the window itself. Never one giant prompt. *Size: M.*
 8. **Tidy titles + tab grouping** — messy page titles renamed by the fast
    seat; tabs grouped by topic using embeddings; history grouped the same
-   way into resumable "journeys" (Edge/Firefox pattern — Firefox does the
-   grouping on-device with a 57 MB model; ours is even cheaper). *Size: M.*
+   way into resumable "journeys" (the tab-grouping pattern other browsers
+   use — one does the grouping on-device with a 57 MB model; ours is even
+   cheaper). *Size: M.*
 
 ### C. Doing features (scoped hard, on purpose)
 
@@ -115,8 +120,9 @@ they're defects and risks in what already exists, not new features.
 10. **Plan → Run → Interrupt.** For multi-step asks, the brain shows its
     step plan first; the person approves; each step runs visibly in a marked
     tab; a Stop button actually stops it. Confirm-before-anything-that-
-    submits (purchase, post, send). This is the Fellou/Chrome safety shape,
-    and it's the only honest way to grow the current 3-action cap. *Size: L.*
+    submits (purchase, post, send). This is the plan-approval safety shape
+    other agent browsers use, and it's the only honest way to grow the
+    current 3-action cap. *Size: L.*
 11. **Research as a background job.** The research runner already works;
     give it a progress line and let it run while browsing continues (strictly
     sequential — see the do-not-build list for parallel agents). Expect
@@ -140,7 +146,7 @@ they're defects and risks in what already exists, not new features.
 ### F. The window itself
 
 14. **A model picker in the chat dock** — brain seat, fast seat, vision seat
-    dropdowns fed by `ollama list`, instead of env vars. Plus Firefox-style
+    dropdowns fed by `ollama list`, instead of env vars. Plus browser-style
     **AI controls**: per-feature on/off and one master AI kill-switch. *Size: S.*
 15. **Morning brief card.** On first launch of the day (or on demand): a card
     on the start page summarizing yesterday's browsing from the local memory
@@ -199,10 +205,11 @@ Ollama library (live): ollama.com/library/qwen3.5 · /qwen3 · /qwen2.5 ·
 /gemma3 · /gemma4 · /minicpm-v · nomic-embed-text page · phi4-mini page.
 Landscape: Perplexity Comet (shila.so, geotoolbox.ai) · Dia
 (supasidebar.com) · Opera Neon (press.opera.com, operaneon.com) ·
-Arc (crows-eye.com) · ChatGPT Atlas shutdown (shila.so) · Fellou
-(smartsight.in) · Chrome Auto Browse (blog.google) · Disco GenTabs
-(blog.google) · Edge Copilot changes (neowin.net) · Firefox on-device AI
-(techwalla.com) · Brave Leo BYOM (aimultiple.com, agenticindex.io).
+Arc (crows-eye.com) · ChatGPT Atlas shutdown (shila.so) · agent
+browser (smartsight.in) · Auto Browse (vendor blog) · GenTabs
+(vendor blog) · browser assistant changes (tech press) ·
+on-device AI (tech press) · Brave Leo BYOM (aimultiple.com,
+agenticindex.io).
 Models/hardware: WikiChip Ryzen 3 3250U specs · localaimaster tool-calling
 survey · cliodeck Ollama-tools research · dogkeeper886/ollama37 issue #366
 (DeepSeek templates) · anchorterminal Qwen3-4B-Instruct-2507 ·

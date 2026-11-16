@@ -87,6 +87,15 @@ _TYPE_EXTENSIONS = {
 # length, not its character count.
 _MAX_NAME_BYTES = 255
 
+# G-P9: a /ToUnicode CMap may name at most this many codes — one
+# bfrange can span the whole 16-bit space, and ranges stack.
+_MAX_CMAP_ENTRIES = 65536
+
+# G-P10: the most characters of pretty-printed JSON fetch_any
+# keeps as text. The dump is streamed and stopped at the limit
+# (see _pretty_json_prefix) instead of built whole and sliced.
+_MAX_JSON_TEXT_CHARS = 200000
+
 
 @dataclass
 class FileResult:
@@ -280,6 +289,25 @@ def _kind_for(content_type, final_url):
     return _EXT_KIND.get(ext, "binary")
 
 
+def _pretty_json_prefix(text, limit):
+    """Pretty-print JSON, keeping at most `limit` characters — the
+    same text `json.dumps(json.loads(text), indent=2)[:limit]`
+    used to return, but streamed: iterencode yields the dump in
+    pieces and stops at the limit, so a 32 MB input never builds
+    a whole indented string (potentially far larger) just to keep
+    200 KB (G-P10). Raises json.JSONDecodeError on bad input,
+    like json.loads."""
+    parsed = json.loads(text)
+    parts = []
+    total = 0
+    for chunk in json.JSONEncoder(indent=2).iterencode(parsed):
+        parts.append(chunk)
+        total += len(chunk)
+        if total >= limit:
+            break
+    return "".join(parts)[:limit]
+
+
 def _csv_to_markdown(text):
     rows = list(csv.reader(io.StringIO(text)))
     if not rows:
@@ -303,6 +331,21 @@ def _csv_to_markdown(text):
     return "\n".join(lines)
 
 
+def _pdf_streams(body):
+    """Yield each content stream of a PDF, decompressed, ONE at a
+    time (G-P8). The old code decompressed every stream into a
+    list before reading any text, so a 32 MB PDF could hold
+    hundreds of MB of streams at once; a generator holds one.
+    The CMap pass and the text pass each re-scan the body, so
+    the CMap is still known before the text that uses it."""
+    for match in re.finditer(rb"stream\r?\n(.*?)endstream", body, re.DOTALL):
+        raw = match.group(1)
+        try:
+            yield zlib.decompress(raw)
+        except zlib.error:
+            yield raw
+
+
 def extract_pdf_text(body):
     """Best-effort text from a PDF using only the standard library.
 
@@ -314,23 +357,15 @@ def extract_pdf_text(body):
     no extractable text layer (scans) — the caller reports that
     plainly.
     """
-    streams = []
-    for match in re.finditer(rb"stream\r?\n(.*?)endstream", body, re.DOTALL):
-        raw = match.group(1)
-        try:
-            data = zlib.decompress(raw)
-        except zlib.error:
-            data = raw
-        streams.append(data)
     cid_map, code_len = {}, 0
-    for data in streams:
+    for data in _pdf_streams(body):
         if b"begincmap" in data:
             found_map, found_len = _parse_tounicode_cmap(data)
             if found_map:
                 cid_map.update(found_map)
                 code_len = code_len or found_len
     chunks = []
-    for data in streams:
+    for data in _pdf_streams(body):
         if b"Tj" not in data and b"TJ" not in data:
             continue
         text_parts = []
@@ -351,7 +386,14 @@ def extract_pdf_text(body):
 
 
 def _cmap_unicode(hex_bytes):
-    raw = bytes.fromhex(hex_bytes.decode())
+    """A CMap hex value as text, or None when the hex is malformed
+    (G-C19: an odd-length hex used to raise ValueError out of
+    bytes.fromhex and kill whole-PDF extraction — one bad entry
+    now just skips its mapping)."""
+    try:
+        raw = bytes.fromhex(hex_bytes.decode())
+    except ValueError:
+        return None
     if len(raw) >= 2 and len(raw) % 2 == 0:
         try:
             return raw.decode("utf-16-be")
@@ -361,7 +403,13 @@ def _cmap_unicode(hex_bytes):
 
 
 def _parse_tounicode_cmap(data):
-    """Parse a /ToUnicode CMap stream -> ({code: text}, code byte length)."""
+    """Parse a /ToUnicode CMap stream -> ({code: text}, code byte length).
+
+    G-P9: the mapping is capped at _MAX_CMAP_ENTRIES — one
+    bfrange can name 65,536 codes, and a hostile CMap can name
+    range after range, so expansion stops at the cap instead of
+    growing the dict without bound.
+    """
     mapping = {}
     code_len = 0
 
@@ -372,23 +420,42 @@ def _parse_tounicode_cmap(data):
 
     for block in re.finditer(rb"beginbfchar(.*?)endbfchar", data, re.DOTALL):
         for src, dst in re.findall(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", block.group(1)):
+            if len(mapping) >= _MAX_CMAP_ENTRIES:
+                return mapping, code_len
             note_code(src)
-            mapping[int(src, 16)] = _cmap_unicode(dst)
+            text = _cmap_unicode(dst)
+            if text is None:
+                continue  # G-C19: malformed entry, skip it
+            mapping[int(src, 16)] = text
     for block in re.finditer(rb"beginbfrange(.*?)endbfrange", data, re.DOTALL):
         body = block.group(1)
         for lo, hi, dst in re.findall(
                 rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", body):
             note_code(lo)
-            start = int(_cmap_unicode(dst).encode("utf-16-be").hex() or "0", 16) \
-                if len(bytes.fromhex(dst.decode())) >= 2 else int(dst, 16)
+            try:
+                dst_raw = bytes.fromhex(dst.decode())
+            except ValueError:
+                continue  # G-C19: malformed entry, skip the range
+            if len(dst_raw) >= 2:
+                start = int(_cmap_unicode(dst).encode("utf-16-be").hex()
+                            or "0", 16)
+            else:
+                start = int(dst, 16)
             for offset, code in enumerate(range(int(lo, 16), int(hi, 16) + 1)):
+                if len(mapping) >= _MAX_CMAP_ENTRIES:
+                    return mapping, code_len
                 mapping[code] = chr(start + offset)
         for lo, hi, dsts in re.findall(
                 rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[(.*?)\]", body, re.DOTALL):
             note_code(lo)
             for offset, dst in enumerate(
                     re.findall(rb"<([0-9A-Fa-f]+)>", dsts)):
-                mapping[int(lo, 16) + offset] = _cmap_unicode(dst)
+                if len(mapping) >= _MAX_CMAP_ENTRIES:
+                    return mapping, code_len
+                text = _cmap_unicode(dst)
+                if text is None:
+                    continue  # G-C19: malformed entry, skip it
+                mapping[int(lo, 16) + offset] = text
     return mapping, code_len
 
 
@@ -524,7 +591,7 @@ def fetch_any(url, timeout=30, describe=True, transcribe=True,
             text = decode_body(body, headers)
             if content_type == "application/json" or final_url.split("?")[0].endswith(".json"):
                 try:
-                    result.text = json.dumps(json.loads(text), indent=2)[:200000]
+                    result.text = _pretty_json_prefix(text, _MAX_JSON_TEXT_CHARS)
                 except json.JSONDecodeError:
                     result.text = text
             elif content_type == "text/csv" or final_url.split("?")[0].endswith(".csv"):

@@ -601,13 +601,16 @@ class _FileHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
         if self.path == "/declared-big.bin":
-            # Headers first, body 1.5 s later: a client that refuses
+            # Headers first, body 5 s later: a client that refuses
             # from Content-Length alone never waits for the body.
+            # The gap is 5 s against the test's 3 s bound (D3):
+            # under load a fast refusal has taken 1.59 s, so the
+            # old 1.5 s delay / 1.0 s bound overlapped and flaked.
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", "5000")
             self.end_headers()
-            time.sleep(1.5)
+            time.sleep(5)
             try:
                 self.wfile.write(b"x" * 5000)
             except (BrokenPipeError, ConnectionResetError):
@@ -1041,7 +1044,10 @@ class DownloadCapTests(unittest.TestCase):
         started = time.monotonic()
         with self.assertRaises(BrowserError) as caught:
             http_get(self.base + "/declared-big.bin", max_bytes=1024, allow_local=True)
-        self.assertLess(time.monotonic() - started, 1.0)
+        # 3 s, not 1 s (D3): the body arrives at 5 s, so a client
+        # that waits for it still fails this bound, while a fast
+        # refusal under load (seen at 1.59 s) still passes it.
+        self.assertLess(time.monotonic() - started, 3.0)
         self.assertIn("5000", str(caught.exception))
         self.assertIn("1024", str(caught.exception))
 
@@ -2126,7 +2132,7 @@ class WebUITests(unittest.TestCase):
                     self.assertIn("Clear history?", ask)
                     self.assertEqual(len(titles_module.load_history()), 1)
                     done = urllib.request.urlopen(
-                        server.home_url + "history-clear?confirm=1",
+                        server.home_url + "history-clear?confirm=1&token=" + server.token,
                         timeout=5).read().decode()
                     self.assertIn("History cleared", done)
                     self.assertEqual(titles_module.load_history(), [])
@@ -2292,7 +2298,7 @@ class WebUITests(unittest.TestCase):
                     server = webui.LocalPageServer().start()
                     try:
                         body = urllib.request.urlopen(
-                            server.home_url + "brief-refresh",
+                            server.home_url + "brief-refresh?token=" + server.token,
                             timeout=5).read().decode()
                         self.assertIn("Rebuilding the brief", body)
                         self.assertIn("Reload", body)
@@ -2312,7 +2318,7 @@ class WebUITests(unittest.TestCase):
                 server = webui.LocalPageServer().start()
                 try:
                     body = urllib.request.urlopen(
-                        server.home_url + "brief-refresh",
+                        server.home_url + "brief-refresh?token=" + server.token,
                         timeout=5).read().decode()
                     self.assertIn("AI is off", body)
                 finally:
@@ -3161,8 +3167,12 @@ class HowtoWebTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env):
                 server = webui.LocalPageServer().start()
                 try:
+                    # 30 s, not 5 s (D3): under heavy load the
+                    # server thread can take far longer than 5 s
+                    # to answer, and the test checks the page
+                    # content, not the response time.
                     body = urllib.request.urlopen(
-                        server.home_url, timeout=5).read().decode()
+                        server.home_url, timeout=30).read().decode()
                 finally:
                     server.stop()
         self.assertIn('href="/howto"', body)
@@ -3249,14 +3259,15 @@ class DocFixTests(unittest.TestCase):
                       "window's", text)
 
     def test_changelog_makes_no_v03_release_claim(self):
-        # The 0.3 section itself must make no release claim. (The
-        # 0.9 section names the claim while recording its
-        # correction — so the assertion is scoped to the 0.3
-        # section, not the whole file.)
-        from forge.browser.whatsnew import read_changelog_section
-        section = " ".join(read_changelog_section("0.3"))
-        self.assertNotIn("GitHub Release v0.3", section)
-        self.assertIn("shipped together as GitHub Release v0.7", section)
+        # The changelog must make no v0.3 release claim anywhere
+        # (D4: the 0.9 section used to name the claim while
+        # recording its correction, which forced this assertion
+        # to scope to the 0.3 section — the wording is fixed now,
+        # so the whole file is checked). The 0.3 section still
+        # says the versions shipped together as v0.7.
+        text = self._read("CHANGELOG.md")
+        self.assertNotIn("GitHub Release v0.3", text)
+        self.assertIn("shipped together as GitHub Release v0.7", text)
 
 
 class CliCheckVersionHistoryTests(unittest.TestCase):

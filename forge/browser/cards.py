@@ -31,6 +31,42 @@ PAGE_CAP = 6000
 # for the reply.
 FINAL_PROMPT_CHARS = 24000
 
+# How deep cards may nest inside each other (G-C14): a card
+# calling a card calling a card. The cap stops a self-referential
+# card from recursing forever; the plan already presents nested
+# steps as "Run the X workflow card", so the runner now does what
+# the plan promises instead of reporting "Unknown action type".
+MAX_CARD_DEPTH = 3
+
+# G-P23: the parsed card list is cached, keyed on the card dirs
+# + every card file's mtime/size — the chat turn used to re-read
+# and re-parse every card file from disk per turn. A changed,
+# added, or removed card file misses the cache at once.
+_cards_cache = {"key": None, "cards": None}
+
+
+def _cards_cache_key():
+    """The cache key for list_cards: the two card dirs plus each
+    .md file's mtime + size."""
+    key = []
+    for folder in (builtin_cards_dir(), cards_dir()):
+        key.append(folder)
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for filename in names:
+            if not filename.endswith(".md"):
+                continue
+            path = os.path.join(folder, filename)
+            try:
+                stat = os.stat(path)
+            except OSError:
+                continue
+            key.append((path, stat.st_mtime_ns, stat.st_size))
+    return tuple(key)
+
+
 # O10: the scaffold a new card starts from.
 CARD_SCAFFOLD = """# {name}
 
@@ -112,7 +148,11 @@ def list_cards():
     """All cards, built-in first, then the person's own (which win
     on a name clash). Returns [Card] sorted by name. A card whose
     file exists but fails to parse is listed with its error set
-    (O1) — a broken card is reported, never silently skipped."""
+    (O1) — a broken card is reported, never silently skipped.
+    The parsed list is cached while no card file changes (G-P23)."""
+    key = _cards_cache_key()
+    if _cards_cache["key"] == key and _cards_cache["cards"] is not None:
+        return list(_cards_cache["cards"])
     found = {}
     for folder in (builtin_cards_dir(), cards_dir()):
         try:
@@ -132,7 +172,9 @@ def list_cards():
                                    error=str(exc))
             except OSError:
                 continue
-    return [found[name] for name in sorted(found)]
+    cards = [found[name] for name in sorted(found)]
+    _cards_cache.update({"key": key, "cards": cards})
+    return list(cards)
 
 
 def load_card(name):
@@ -201,7 +243,7 @@ def _budget_prompt(prompt, results):
 
 def run_card(session, name, question="", page_text=None,
              on_action=None, on_chunk=None, on_progress=None,
-             on_step_done=None):
+             on_step_done=None, _depth=0):
     """Run a card: its actions in order, then one brain call on the
     prompt + results. Returns (answer, opens) — opens are the URLs
     the card's open actions fetched, so the window can show them
@@ -209,7 +251,9 @@ def run_card(session, name, question="", page_text=None,
     card returns ("Stopped.", opens so far). on_progress(text)
     reports each step as it starts. on_step_done(kind, seconds)
     (V4) reports each step's duration when it finishes, plus the
-    final brain call as ("thinking", seconds)."""
+    final brain call as ("thinking", seconds). A card step may
+    run another card (G-C14) — nested runs answer with their own
+    final brain call, up to MAX_CARD_DEPTH deep."""
     from .chat import _run_open, _run_research, _run_search, visible_text
     from .retrieve import page_context
 
@@ -254,6 +298,23 @@ def run_card(session, name, question="", page_text=None,
                 result = (summarize_page(session, page_text,
                                          map_session=map_session)
                           if page_text else "No page text is available.")
+            elif kind == "card":
+                # G-C14: a nested card runs as its own workflow and
+                # its answer becomes this step's result. The depth
+                # cap stops a self-referential card from recursing
+                # forever.
+                nested = str(action.get("name", ""))
+                if _depth >= MAX_CARD_DEPTH:
+                    result = ("That card nests too deep. Cards run "
+                              f"at most {MAX_CARD_DEPTH} deep.")
+                else:
+                    nested_answer, nested_opens = run_card(
+                        session, nested, question=question,
+                        page_text=page_text, on_action=on_action,
+                        on_chunk=on_chunk, on_progress=on_progress,
+                        on_step_done=on_step_done, _depth=_depth + 1)
+                    opens.extend(nested_opens)
+                    result = nested_answer
             else:
                 result = f"Unknown action type: {kind}"
         except Exception as exc:

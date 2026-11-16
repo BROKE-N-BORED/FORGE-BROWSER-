@@ -104,11 +104,24 @@ def build(tree, out_path, executables_set):
     return len(files), len(dirs), os.path.getsize(out_path)
 
 
+def _relpath(filename):
+    """The tree-relative path of a zip entry (the TOP/ prefix
+    stripped) — the same key build() matches the manifest
+    against."""
+    prefix = TOP + "/"
+    if filename.startswith(prefix):
+        return filename[len(prefix):]
+    return filename
+
+
 def verify(out_path, executables_set):
     """Reopen the zip and prove every entry carries the mode it
     should — the build fails loudly if an executable would
-    extract without its exec bit. Same check as the Release
-    builder's verify, basename against the manifest."""
+    extract without its exec bit. Matches by full relative path
+    against the manifest, the same match build() uses (D7: the
+    old basename match expected 0755 for a nested file sharing a
+    manifest basename, which build() had stored 0644 — a zip
+    build() just made failed its own verification)."""
     with zipfile.ZipFile(out_path) as zf:
         for info in zf.infolist():
             mode = info.external_attr >> 16
@@ -117,7 +130,7 @@ def verify(out_path, executables_set):
                                  f"is {info.create_system}, not 3 (Unix)")
             if info.is_dir():
                 expect = 0o40755
-            elif info.filename.split("/")[-1] in executables_set:
+            elif _relpath(info.filename) in executables_set:
                 expect = 0o100755
             else:
                 expect = 0o100644

@@ -700,21 +700,22 @@ class FencePinningTests(unittest.TestCase):
         return calls
 
     def test_connection_goes_to_checked_address_despite_flip(self):
-        # The flip: the first two resolutions (the up-front fence
-        # check, then the pin at open time) answer the public
-        # address; any later resolution would answer 127.0.0.1.
-        # The fetch must connect to the checked public address —
-        # and must never make that third resolution at all.
+        # G-P3: the fence resolves once and the checked address
+        # passes through as the pin. The one resolution answers
+        # the public address; any second resolution would answer
+        # 127.0.0.1 — but there is no second resolution, so the
+        # flip can never steer the connection. The fetch must
+        # connect to the checked public address.
         from forge.browser._http import http_get
         calls = self._install_fakes(
-            lambda host, n: ([self._PUBLIC] if n <= 2
+            lambda host, n: ([self._PUBLIC] if n <= 1
                              else ["127.0.0.1"]),
             [b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
              b"Content-Length: 5\r\n\r\nhello"])
         _final, _headers, body = http_get("http://flipping.example/")
         self.assertEqual(body, b"hello")
         self.assertEqual(self.targets, [(self._PUBLIC, 80)])
-        self.assertEqual(calls["n"], 2)
+        self.assertEqual(calls["n"], 1)
 
     def test_redirect_hop_is_pinned_to_its_own_answer(self):
         # Each hop pins to its own checked answer: the first host

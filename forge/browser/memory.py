@@ -14,24 +14,77 @@ Search is by embedding similarity when a model is answering,
 keyword overlap when it is not.
 """
 
+import atexit
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from urllib.parse import urlparse
 
-_MEMORY_LIMIT = 200
+from .errors import BrowserError
+from .retrieve import _cosine
+
+# Caps on what the stores keep (B15): named constants, so the
+# windows that show the data can disclose them. The old private
+# names stay as aliases.
+MEMORY_LIMIT = 200
+_MEMORY_LIMIT = MEMORY_LIMIT
 _SIMILARITY_FLOOR = 0.5
 _MIN_FORGET_NEEDLE = 3  # a shorter text needle never matches (R2)
-_EMBED_CACHE_LIMIT = 1500  # cached vectors kept on disk (R4)
+EMBED_CACHE_LIMIT = 1500  # cached vectors kept on disk (R4)
+_EMBED_CACHE_LIMIT = EMBED_CACHE_LIMIT
+# Page-memory save delay (G-P14): rapid navigations coalesce into
+# one disk write; any read flushes first, so readers never wait.
+_PAGE_SAVE_DELAY = 2.0
+# Embed-cache journal lines before a full rewrite (G-P15).
+_EMBED_JOURNAL_COMPACT = 200
 
 # URL fragments that mark a page sensitive: no memory context there.
 SENSITIVE_PATTERNS = (
     "bank", "paypal", "stripe", "login", "signin", "sign-in", "account",
     "checkout", "password", "health", "medical", "patient", "tax", "irs",
     "wallet", "payment", "billing",
+)
+# G-S2: well-known sensitive hosts — a bank or clinic on a neutral
+# domain has no keyword in its URL, so keyword matching alone
+# records it as full text. A starter list, matched as the host or
+# a parent domain (mail.chase.com matches chase.com); extend it
+# as new ones are found. Government sites are covered by suffix
+# (.gov/.mil) instead of by name.
+SENSITIVE_HOSTS = (
+    # Banks and payments
+    "chase.com", "bankofamerica.com", "wellsfargo.com", "citi.com",
+    "citibank.com", "usbank.com", "capitalone.com", "americanexpress.com",
+    "discover.com", "pnc.com", "td.com", "citizensbank.com",
+    "fifththird.com", "huntington.com", "regions.com", "key.com",
+    "ally.com", "marcus.com", "sofi.com", "paypal.com", "venmo.com",
+    "cash.app", "zellepay.com",
+    # Health and insurance
+    "kaiserpermanente.org", "anthem.com", "unitedhealthcare.com",
+    "aetna.com", "cigna.com", "humana.com", "bcbs.com",
+    # Government services
+    "medicare.gov", "medicaid.gov", "healthcare.gov", "ssa.gov",
+    "va.gov", "irs.gov",
+)
+SENSITIVE_HOST_SUFFIXES = (".gov", ".mil")
+# G-S2: phrases in a page's visible text that mark it sensitive
+# even when the URL is neutral — an account or checkout page on
+# any domain. Over-flagging is safe here: it only means the page
+# is not kept for recall.
+_SENSITIVE_TEXT_PATTERNS = (
+    "account balance", "available balance", "routing number",
+    "account number", "credit card", "debit card", "card number",
+    "checkout", "place your order", "payment method",
+    "billing address", "order summary", "order total",
+    "patient portal", "medical record", "health record",
+    "prescription", "lab results", "test results",
+    "social security", "one-time code", "verification code",
+    "tax return", "sign in to your account",
 )
 _STOPWORDS = {"the", "a", "an", "is", "it", "i", "my", "to", "of", "and",
               "in", "on", "for", "me", "you", "do", "does", "what", "how"}
@@ -53,7 +106,107 @@ _SENSITIVE_RE = re.compile(
 
 
 def is_sensitive_url(url):
-    return bool(_SENSITIVE_RE.search((url or "").lower()))
+    low = (url or "").lower()
+    if _SENSITIVE_RE.search(low):
+        return True
+    # G-S2: a sensitive host on a neutral URL — a known bank,
+    # health, or government domain, or any .gov/.mil site.
+    host = _site_host(low)
+    if not host:
+        return False
+    if host.endswith(SENSITIVE_HOST_SUFFIXES):
+        return True
+    return any(host == listed or host.endswith("." + listed)
+               for listed in SENSITIVE_HOSTS)
+
+
+def is_sensitive_text(text):
+    """Does this page's visible text look like an account,
+    checkout, or health page (G-S2)? Only the first 4,000
+    characters are read — enough for the page's own framing,
+    cheap on every navigation."""
+    if not text:
+        return False
+    sample = text[:4000].lower()
+    return any(phrase in sample for phrase in _SENSITIVE_TEXT_PATTERNS)
+
+
+# ----------------------------------------------------------------------
+# Store plumbing: locking (G-C17) and private writes (G-S7).
+# ----------------------------------------------------------------------
+
+_stores_lock = threading.RLock()  # one in-process writer per store
+_thread_state = threading.local()  # paths this thread already flocks
+
+
+def _secure_store_dir(path):
+    """Make the store's folder, 0700 when it is ours to set: a
+    folder we just created, or the ~/.forge folder itself (G-S7).
+    Other existing folders are left alone — a store path under a
+    shared directory must not change that directory's mode."""
+    folder = os.path.dirname(os.path.abspath(path))
+    if not folder:
+        return
+    created = not os.path.isdir(folder)
+    os.makedirs(folder, exist_ok=True)
+    home_forge = os.path.join(os.path.expanduser("~"), ".forge")
+    if created or folder == home_forge or folder.startswith(home_forge + os.sep):
+        try:
+            os.chmod(folder, 0o700)
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def _store_lock(path):
+    """One writer at a time for a store file (G-C17): the
+    in-process lock plus an flock on a sidecar lock file, the same
+    pattern as seats._locked_update — the window, the CLI, and the
+    per-navigation remember thread can no longer interleave
+    load-modify-save and lose entries. Re-entrant in one thread:
+    a nested lock on a path this thread already holds skips the
+    flock (a second flock on another fd would block forever)."""
+    with _stores_lock:
+        held = getattr(_thread_state, "flocks", None)
+        if held is None:
+            held = _thread_state.flocks = {}
+        if path in held:
+            yield
+            return
+        try:
+            _secure_store_dir(path)
+            handle = open(path + ".lock", "w", encoding="utf-8")
+        except OSError:
+            # No lock file possible — the thread lock above still
+            # guards in-process races.
+            yield
+            return
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            held[path] = handle
+            try:
+                yield
+            finally:
+                del held[path]
+        finally:
+            handle.close()
+
+
+def _write_json_atomic(path, payload, indent=None):
+    """Write JSON to path atomically (tmp + replace), 0600, in a
+    0700 folder (G-S7) — these files hold personal facts and full
+    page text, like the vault. Raises OSError when the write
+    fails; the caller decides whether that is fatal (B15: the
+    facts store reports it, the recall stores stay silent)."""
+    _secure_store_dir(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=indent)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
 
 
 # ----------------------------------------------------------------------
@@ -71,12 +224,31 @@ def memory_sites_path():
     return os.path.join(os.path.expanduser("~"), ".forge", "memory-sites.json")
 
 
+# G-P18: the per-site list is re-read from disk on every call
+# (per tab, per page load, per chat turn) — cache it, keyed on
+# the file's mtime + size, so a changed file is re-read at once.
+_sites_cache = {"path": None, "key": None, "data": None}
+
+
 def _load_sites():
+    path = memory_sites_path()
     try:
-        with open(memory_sites_path(), encoding="utf-8") as handle:
+        stat = os.stat(path)
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if (key is not None and _sites_cache["path"] == path
+            and _sites_cache["key"] == key
+            and _sites_cache["data"] is not None):
+        data = _sites_cache["data"]
+        return {"blocked": list(data["blocked"]),
+                "allowed": list(data["allowed"])}
+    sites = {"blocked": [], "allowed": []}
+    try:
+        with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
         if isinstance(data, dict):
-            return {
+            sites = {
                 "blocked": [h for h in data.get("blocked", [])
                             if isinstance(h, str) and h],
                 "allowed": [h for h in data.get("allowed", [])
@@ -84,21 +256,21 @@ def _load_sites():
             }
     except (OSError, ValueError):
         pass
-    return {"blocked": [], "allowed": []}
+    _sites_cache.update({"path": path, "key": key,
+                         "data": {"blocked": list(sites["blocked"]),
+                                  "allowed": list(sites["allowed"])}})
+    return sites
 
 
 def _save_sites(sites):
     try:
-        path = memory_sites_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"blocked": sorted(set(sites["blocked"])),
-                       "allowed": sorted(set(sites["allowed"]))},
-                      handle, indent=2)
-        os.replace(tmp, path)  # atomic: a crash never leaves half a file (R10)
+        _write_json_atomic(
+            memory_sites_path(),
+            {"blocked": sorted(set(sites["blocked"])),
+             "allowed": sorted(set(sites["allowed"]))}, indent=2)
     except OSError:
         pass
+    _sites_cache.update({"path": None, "key": None, "data": None})
 
 
 def _site_host(value):
@@ -142,11 +314,12 @@ def block_site_memory(host_or_url):
     host = _site_host(host_or_url)
     if not host:
         return ""
-    sites = _load_sites()
-    sites["allowed"] = [h for h in sites["allowed"] if h != host]
-    if host not in sites["blocked"]:
-        sites["blocked"].append(host)
-    _save_sites(sites)
+    with _store_lock(memory_sites_path()):
+        sites = _load_sites()
+        sites["allowed"] = [h for h in sites["allowed"] if h != host]
+        if host not in sites["blocked"]:
+            sites["blocked"].append(host)
+        _save_sites(sites)
     return host
 
 
@@ -156,11 +329,12 @@ def allow_site_memory(host_or_url):
     host = _site_host(host_or_url)
     if not host:
         return ""
-    sites = _load_sites()
-    sites["blocked"] = [h for h in sites["blocked"] if h != host]
-    if host not in sites["allowed"]:
-        sites["allowed"].append(host)
-    _save_sites(sites)
+    with _store_lock(memory_sites_path()):
+        sites = _load_sites()
+        sites["blocked"] = [h for h in sites["blocked"] if h != host]
+        if host not in sites["allowed"]:
+            sites["allowed"].append(host)
+        _save_sites(sites)
     return host
 
 
@@ -170,10 +344,11 @@ def clear_site_memory(host_or_url):
     host = _site_host(host_or_url)
     if not host:
         return ""
-    sites = _load_sites()
-    sites["blocked"] = [h for h in sites["blocked"] if h != host]
-    sites["allowed"] = [h for h in sites["allowed"] if h != host]
-    _save_sites(sites)
+    with _store_lock(memory_sites_path()):
+        sites = _load_sites()
+        sites["blocked"] = [h for h in sites["blocked"] if h != host]
+        sites["allowed"] = [h for h in sites["allowed"] if h != host]
+        _save_sites(sites)
     return host
 
 
@@ -188,18 +363,18 @@ def _load():
 
 
 def _save(entries):
+    """Write the facts store. Raises BrowserError when the disk
+    write fails (B15) — remember() used to report success while
+    the write silently failed, so the fact was never kept."""
     try:
-        path = memory_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            # R1: keep the NEWEST 200 — entries are stored in
-            # insertion order, so slicing from the front dropped
-            # the fact just remembered. R10: atomic write.
-            json.dump({"entries": entries[-_MEMORY_LIMIT:]}, handle, indent=2)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+        # R1: keep the NEWEST 200 — entries are stored in
+        # insertion order, so slicing from the front dropped
+        # the fact just remembered. R10: atomic write.
+        _write_json_atomic(memory_path(),
+                           {"entries": entries[-MEMORY_LIMIT:]}, indent=2)
+    except OSError as exc:
+        raise BrowserError(
+            f"could not save what was remembered ({exc})") from exc
 
 
 def list_entries():
@@ -209,20 +384,23 @@ def list_entries():
 
 def remember(text, source="chat"):
     """Store a fact. Returns the entry (the existing one when the
-    same text is already remembered)."""
+    same text is already remembered). Raises BrowserError when the
+    disk write fails (B15) — a lost write is reported, not
+    silently called a success."""
     text = (text or "").strip()
     if not text:
         return None
-    entries = _load()
-    normalized = " ".join(text.lower().split())
-    for entry in entries:
-        if " ".join(entry["text"].lower().split()) == normalized:
-            return entry
-    entry = {"id": uuid.uuid4().hex[:8], "text": text,
-             "source": source, "at": time.time()}
-    entries.append(entry)
-    _save(entries)
-    return entry
+    with _store_lock(memory_path()):
+        entries = _load()
+        normalized = " ".join(text.lower().split())
+        for entry in entries:
+            if " ".join(entry["text"].lower().split()) == normalized:
+                return entry
+        entry = {"id": uuid.uuid4().hex[:8], "text": text,
+                 "source": source, "at": time.time()}
+        entries.append(entry)
+        _save(entries)
+        return entry
 
 
 def forget(text_or_id):
@@ -234,29 +412,25 @@ def forget(text_or_id):
     needle = (text_or_id or "").strip()
     if not needle:
         return 0
-    entries = _load()
-    kept = []
-    removed = 0
-    for entry in entries:
-        if entry.get("id") == needle:
-            removed += 1
-        elif (len(needle) >= _MIN_FORGET_NEEDLE
-                and needle.lower() in entry["text"].lower()):
-            removed += 1
-        else:
-            kept.append(entry)
-    if removed:
-        _save(kept)
-    return removed
+    with _store_lock(memory_path()):
+        entries = _load()
+        kept = []
+        removed = 0
+        for entry in entries:
+            if entry.get("id") == needle:
+                removed += 1
+            elif (len(needle) >= _MIN_FORGET_NEEDLE
+                    and needle.lower() in entry["text"].lower()):
+                removed += 1
+            else:
+                kept.append(entry)
+        if removed:
+            _save(kept)
+        return removed
 
 
-def _cosine(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+# _cosine lives in retrieve.py (G-C33) and is imported above —
+# this module, retrieve.py, and titles.py each had their own copy.
 
 
 # ----------------------------------------------------------------------
@@ -280,11 +454,29 @@ def embed_cache_path():
 class EmbedCache:
     """Persistent embedding cache. Created cheaply (the file loads
     lazily, on first use); vectors_for embeds only what is
-    missing and saves when it added anything."""
+    missing and saves when it added anything.
+
+    Vectors are keyed by model AND text (G-C18): the on-disk file
+    holds one section per model name, so stale vectors from a
+    replaced embeddings model are never reused. A legacy cache
+    file (bare text hashes, no model) is dropped on load — its
+    vectors belong to an unknown model.
+
+    New vectors are appended to a journal file (G-P15), one JSON
+    line each, instead of re-writing the whole cache (up to 1500
+    vectors) on every call that adds entries. The journal is the
+    persistence — a fresh cache on the same path reads base +
+    journal — and a full rewrite happens only when the journal
+    grows past _EMBED_JOURNAL_COMPACT lines."""
 
     def __init__(self, path=None):
         self.path = path or embed_cache_path()
         self._data = None
+        self._journal_lines = 0
+
+    @property
+    def _journal_path(self):
+        return self.path + ".journal"
 
     def _load(self):
         if self._data is not None:
@@ -293,50 +485,112 @@ class EmbedCache:
         try:
             with open(self.path, encoding="utf-8") as handle:
                 data = json.load(handle)
-            if isinstance(data, dict):
-                for key, vector in data.items():
-                    if isinstance(key, str) and isinstance(vector, list):
-                        self._data[key] = [float(v) for v in vector]
         except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict):
+            for model, section in data.items():
+                # A section is model -> {hash: vector}. A bare
+                # list value is a legacy flat entry (hash ->
+                # vector, no model) — dropped, not trusted.
+                if isinstance(model, str) and isinstance(section, dict):
+                    kept = {}
+                    for key, vector in section.items():
+                        if isinstance(key, str) and isinstance(vector, list):
+                            try:
+                                kept[key] = [float(v) for v in vector]
+                            except (TypeError, ValueError):
+                                continue
+                    if kept:
+                        self._data[model] = kept
+        try:
+            with open(self._journal_path, encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                        model = entry["m"]
+                        key = entry["k"]
+                        vector = [float(v) for v in entry["v"]]
+                    except (ValueError, KeyError, TypeError):
+                        continue  # a torn last line costs a re-embed
+                    self._journal_lines += 1
+                    self._data.setdefault(model, {})[key] = vector
+        except OSError:
             pass
         return self._data
 
     def _save(self):
         data = self._data or {}
-        if len(data) > _EMBED_CACHE_LIMIT:
-            # Keep the newest entries (dicts keep insertion order).
-            data = dict(list(data.items())[-_EMBED_CACHE_LIMIT:])
-            self._data = data
+        trimmed = {}
+        for model, section in data.items():
+            if len(section) > EMBED_CACHE_LIMIT:
+                # Keep the newest entries (dicts keep insertion order).
+                section = dict(list(section.items())[-EMBED_CACHE_LIMIT:])
+            trimmed[model] = section
+        self._data = trimmed
         try:
-            parent = os.path.dirname(self.path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump({key: [round(v, 4) for v in vector]
-                           for key, vector in data.items()}, handle)
-            os.replace(tmp, self.path)
+            _write_json_atomic(self.path, {model: {key: [round(v, 4) for v in vector]
+                                                   for key, vector in section.items()}
+                                           for model, section in trimmed.items()})
+        except OSError:
+            return
+        try:
+            os.unlink(self._journal_path)
+        except OSError:
+            pass
+        self._journal_lines = 0
+
+    def _append_journal(self, model, added):
+        """Append new (hash, vector) pairs to the journal, so a
+        fresh cache sees them without a full rewrite (G-P15)."""
+        if not added:
+            return
+        try:
+            # The folder may not exist yet on a fresh install — the
+            # old _save made it, and without it this append fails
+            # silently and the vectors are never persisted.
+            _secure_store_dir(self._journal_path)
+            with open(self._journal_path, "a", encoding="utf-8") as handle:
+                for key, vector in added:
+                    handle.write(json.dumps(
+                        {"m": model, "k": key,
+                         "v": [round(v, 4) for v in vector]}) + "\n")
+                    self._journal_lines += 1
+            try:
+                os.chmod(self._journal_path, 0o600)
+            except OSError:
+                pass
         except OSError:
             pass
 
-    def vectors_for(self, texts, embed_fn):
+    def vectors_for(self, texts, embed_fn, model=None):
         """Vectors for texts, in order — cached ones reused, missing
         ones embedded in one call and saved. Raises whatever
-        embed_fn raises when nothing is answering."""
+        embed_fn raises when nothing is answering. model names the
+        embeddings model the vectors belong to (G-C18); the default
+        is the configured embed model, which is what embed_texts
+        uses when no model is named."""
+        if model is None:
+            from .retrieve import embed_model
+            model = embed_model()
         data = self._load()
+        section = data.setdefault(model, {})
         keys = [hashlib.sha256(t.encode("utf-8")).hexdigest()
                 for t in texts]
-        missing = [t for t, key in zip(texts, keys) if key not in data]
+        missing = [t for t, key in zip(texts, keys) if key not in section]
         if missing:
             vectors = embed_fn(missing)
             if len(vectors) != len(missing):
                 raise ValueError(
                     "the embeddings model answered oddly (wrong count)")
+            added = []
             for text, vector in zip(missing, vectors):
-                data[hashlib.sha256(text.encode("utf-8")).hexdigest()] = (
-                    list(vector))
-            self._save()
-        return [data[key] for key in keys]
+                key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                section[key] = list(vector)
+                added.append((key, list(vector)))
+            self._append_journal(model, added)
+            if self._journal_lines >= _EMBED_JOURNAL_COMPACT:
+                self._save()
+        return [section[key] for key in keys]
 
 
 def _words(text):
@@ -402,8 +656,10 @@ def export_memory(path):
 # in the EmbedCache sidecar (R4) — never in this file.
 # ----------------------------------------------------------------------
 
-_PAGE_MEMORY_LIMIT = 100
-_PAGE_CHUNKS_LIMIT = 24  # R5: was 12 — a long page kept only its head
+PAGE_MEMORY_LIMIT = 100
+_PAGE_MEMORY_LIMIT = PAGE_MEMORY_LIMIT
+PAGE_CHUNKS_LIMIT = 24  # R5: was 12 — a long page kept only its head
+_PAGE_CHUNKS_LIMIT = PAGE_CHUNKS_LIMIT
 _EMBED_BATCH = 200
 
 
@@ -414,7 +670,55 @@ def page_memory_path():
     return os.path.join(os.path.expanduser("~"), ".forge", "page-memory.json")
 
 
+# G-P14: pending page saves, per store path — remember_page
+# records the new list here and a timer writes it a moment
+# later, so rapid navigations coalesce into one disk write
+# instead of rewriting megabytes of JSON per page. Any read
+# flushes first (see _load_pages), so readers never see stale
+# data and a direct file read after any list/search call finds
+# the write already done. A clean exit flushes too (atexit).
+_pages_pending = {}  # path -> {"pages": [...], "timer": Timer|None}
+_pages_pending_lock = threading.Lock()
+
+
+def _flush_pages(path):
+    """Write one path's pending pages now. Skips the write when
+    the folder is gone (a test's temp dir cleaned up before the
+    timer fired) instead of recreating it. Holds the store lock
+    across pop + write, so a concurrent remember_page builds on
+    either the pending list or the flushed file — never on a
+    file the flush has popped but not yet written."""
+    with _store_lock(path):
+        with _pages_pending_lock:
+            pending = _pages_pending.pop(path, None)
+        if pending is None:
+            return
+        if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            return
+        _save_pages(pending["pages"], path=path)
+
+
+def _flush_all_pages():
+    """Write every pending page list (clean exit)."""
+    with _pages_pending_lock:
+        paths = list(_pages_pending)
+    for path in paths:
+        _flush_pages(path)
+
+
+atexit.register(_flush_all_pages)
+
+
+def flush_page_memory():
+    """Write any pending page saves now (tests and shutdown paths
+    that need the file on disk at once)."""
+    _flush_all_pages()
+
+
 def _load_pages():
+    # A pending save lands first, so this read — and any direct
+    # file read after it — sees the latest pages.
+    _flush_pages(page_memory_path())
     try:
         with open(page_memory_path(), encoding="utf-8") as handle:
             data = json.load(handle)
@@ -425,14 +729,26 @@ def _load_pages():
         return []
 
 
-def _save_pages(pages):
+def _load_pages_merged():
+    """Pages from disk plus any pending save, without flushing —
+    remember_page's view of the store, so a burst of navigations
+    does not pay a full write per page."""
+    with _pages_pending_lock:
+        pending = _pages_pending.get(page_memory_path())
+        if pending is not None:
+            return [dict(p, chunks=list(p["chunks"]))
+                    for p in pending["pages"]]
+    return _load_pages()
+
+
+def _save_pages(pages, path=None):
+    """Write the page store. path is the store file to write —
+    _flush_pages passes the pending path, so a flush never lands
+    in a different home's file when the home moved between the
+    remember and the flush (G-P14)."""
     try:
-        path = page_memory_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"pages": pages[:_PAGE_MEMORY_LIMIT]}, handle)
-        os.replace(tmp, path)  # atomic (R10)
+        _write_json_atomic(path or page_memory_path(),
+                           {"pages": pages[:PAGE_MEMORY_LIMIT]})
     except OSError:
         pass
 
@@ -440,7 +756,10 @@ def _save_pages(pages):
 def remember_page(url, title, text):
     """Keep a visited page's chunks for later recall. Returns True
     when stored. Silently skips sensitive pages, local pages, and
-    pages too thin to be worth remembering."""
+    pages too thin to be worth remembering. The disk write is
+    coalesced (G-P14): the page is kept at once and the file
+    written a moment later, or on the next read — a crash inside
+    that window loses the page, not the facts store."""
     from .retrieve import chunk_text
 
     url = (url or "").strip()
@@ -449,15 +768,28 @@ def remember_page(url, title, text):
         return False  # about:blank, data:, and other non-web pages
     if not site_memory_allowed(url) or url.startswith("http://127.0.0.1"):
         return False
+    if is_sensitive_text(text):
+        return False  # G-S2: an account/checkout page on any domain
     if len(text) < 200:
         return False
-    chunks = chunk_text(text)[:_PAGE_CHUNKS_LIMIT]
+    chunks = chunk_text(text)[:PAGE_CHUNKS_LIMIT]
     if not chunks:
         return False
-    pages = [p for p in _load_pages() if p.get("url") != url]
-    pages.insert(0, {"url": url, "title": (title or url).strip(),
-                     "at": time.time(), "chunks": chunks})
-    _save_pages(pages)
+    with _store_lock(page_memory_path()):
+        pages = [p for p in _load_pages_merged() if p.get("url") != url]
+        pages.insert(0, {"url": url, "title": (title or url).strip(),
+                         "at": time.time(), "chunks": chunks})
+        pages = pages[:PAGE_MEMORY_LIMIT]
+        with _pages_pending_lock:
+            old = _pages_pending.get(page_memory_path())
+            if old is not None and old.get("timer") is not None:
+                old["timer"].cancel()
+            path = page_memory_path()
+            timer = threading.Timer(_PAGE_SAVE_DELAY, _flush_pages,
+                                    args=[path])
+            timer.daemon = True
+            _pages_pending[path] = {"pages": pages, "timer": timer}
+            timer.start()
     return True
 
 
@@ -489,7 +821,7 @@ def search_pages(query, top_k=3, embed_fn=None, embed_cache=None):
     embed_cache, R4, so a recall embeds only the query + new or
     changed chunks); keyword overlap otherwise (R3). [] when
     nothing matches."""
-    from .retrieve import embed_texts
+    from .retrieve import cosine_scores, embed_texts
 
     embed = embed_fn or embed_texts
     pages = _load_pages()
@@ -509,8 +841,10 @@ def search_pages(query, top_k=3, embed_fn=None, embed_cache=None):
     except Exception:
         return _search_pages_keywords(query, pages, top_k)
     best = {}
-    for (page, chunk), vector in zip(flat, vectors):
-        score = _cosine(query_vector, vector)
+    # G-P16: one cosine call scores every chunk with the query
+    # norm computed once — the old loop recomputed it per chunk.
+    for (page, chunk), score in zip(
+            flat, cosine_scores(query_vector, vectors)):
         if score < _SIMILARITY_FLOOR:
             continue
         current = best.get(page["url"])
@@ -529,20 +863,21 @@ def forget_page(url_or_title):
     needle = (url_or_title or "").strip()
     if not needle:
         return 0
-    pages = _load_pages()
-    kept = []
-    removed = 0
-    for page in pages:
-        if page.get("url", "").lower() == needle.lower():
-            removed += 1
-        elif (len(needle) >= _MIN_FORGET_NEEDLE
-                and needle.lower() in (page.get("title") or "").lower()):
-            removed += 1
-        else:
-            kept.append(page)
-    if removed:
-        _save_pages(kept)
-    return removed
+    with _store_lock(page_memory_path()):
+        pages = _load_pages()
+        kept = []
+        removed = 0
+        for page in pages:
+            if page.get("url", "").lower() == needle.lower():
+                removed += 1
+            elif (len(needle) >= _MIN_FORGET_NEEDLE
+                    and needle.lower() in (page.get("title") or "").lower()):
+                removed += 1
+            else:
+                kept.append(page)
+        if removed:
+            _save_pages(kept)
+        return removed
 
 
 def list_pages():

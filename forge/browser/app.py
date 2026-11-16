@@ -29,7 +29,62 @@ from .chat import format_duration, step_words
 from .errors import BrowserError
 from .preview import dwell_ms
 
-_TAGLINE = "Forge Browser: no accounts, no API keys, nothing tracked."
+# B9: the honest line — nothing leaves the machine, but visits
+# and page text ARE kept locally (history.json, page-memory.json).
+# The old "nothing tracked" was false.
+_TAGLINE = "Forge Browser: no accounts, no API keys. Nothing leaves this machine."
+
+# G-P20: finished download records kept in memory — older ones
+# are pruned, so the dict stops growing for the app's life.
+_DOWNLOADS_KEEP = 50
+
+# G-UX2/G-UX12: closed tabs remembered for reopening.
+_CLOSED_TABS_KEEP = 10
+
+# G-UX9: the chat log on screen and on disk is capped.
+_CHAT_LOG_BLOCKS = 1000
+_CHAT_HISTORY_MAX_BYTES = 200_000
+
+# G-UX5: the small chat model "Get a chat model" pulls — the
+# smallest entry in the brain's preference order, so auto-pick
+# finds it as soon as it lands.
+_SMALL_CHAT_MODEL = "qwen3:1.7b"
+
+# G-UX4 (extension): the chat dock's width — a sane default under
+# half the window, a floor that stays usable, and the size the
+# person picks persists across restarts (QSettings).
+_CHAT_DOCK_DEFAULT_WIDTH = 360
+_CHAT_DOCK_MIN_WIDTH = 240
+
+# B2: the window's ember identity (U15), kept cheap — flat colors
+# only, no blur, no gradients, no layout thrash on a 2-core PC.
+# Tab text color is deliberately NOT set here: the group colors
+# (N12) paint tab text through the palette, and a stylesheet
+# color would override them.
+EMBER_STYLESHEET = """
+QMainWindow, QDockWidget, QDialog { background: #14161a; color: #e8e4da; }
+QToolBar { background: #1a1d22; border: none; spacing: 4px; }
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QListWidget {
+  background: #171b22; color: #e8e4da; border: 1px solid #2c313a;
+  border-radius: 6px; }
+QPushButton { background: #23272f; color: #e8e4da;
+  border: 1px solid #3a3f48; border-radius: 6px; padding: 4px 10px; }
+QPushButton:hover { border-color: #ffb347; }
+QPushButton:pressed { background: #2c313a; }
+QPushButton:disabled { color: #6e6a60; }
+QTabWidget::pane { border: none; background: #14161a; }
+QTabBar::tab { background: #1a1d22; padding: 6px 12px; border: none; }
+QTabBar::tab:selected { background: #23272f; }
+QMenuBar, QMenu { background: #1a1d22; color: #e8e4da; }
+QMenu::item:selected { background: #2c313a; }
+QStatusBar { background: #1a1d22; color: #9a958a; }
+QStatusBar::item { border: none; }
+QDockWidget::title { background: #1a1d22; color: #e8e4da; padding: 4px; }
+QLabel, QCheckBox, QToolButton { color: #e8e4da; }
+QProgressBar { background: #171b22; border: 1px solid #2c313a;
+  border-radius: 4px; color: #e8e4da; }
+QProgressBar::chunk { background: #ffb347; }
+"""
 
 # N7: tab titles — raw and tidy alike — are capped at this many
 # characters on display, so five long words can't make a wide tab.
@@ -125,6 +180,186 @@ def _human_size(size):
     return f"{size:.1f} GB"
 
 
+def _total_ram_mb():
+    """Total RAM in MB from /proc/meminfo, or None elsewhere."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _read_mem_mb():
+    """(used_mb, total_mb) from /proc/meminfo, or None elsewhere
+    (B6: the live readout's RAM figures)."""
+    try:
+        total = available = None
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1]) // 1024
+                elif line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) // 1024
+                if total is not None and available is not None:
+                    break
+        if total is None:
+            return None
+        return (total - (available or 0), total)
+    except (OSError, ValueError):
+        return None
+
+
+def live_stats_text(used_mb=None, total_mb=None, speed=None, turns=0):
+    """The live readout line (B6): RAM in use, model speed, turn
+    count. Only the known parts show."""
+    parts = []
+    if used_mb is not None and total_mb:
+        parts.append(f"RAM {used_mb / 1024:.1f}/{total_mb / 1024:.1f} GB")
+    if speed:
+        parts.append(f"{speed:.1f} tok/s")
+    parts.append(f"{turns} turn" if turns == 1 else f"{turns} turns")
+    return " · ".join(parts)
+
+
+# B7: what a model is for, from its name.
+_VISION_NAME_PARTS = ("llava", "moondream", "bakllava", "qwen2-vl",
+                      "qwen-vl", "minicpm-v", "vision", "llama-vision")
+
+
+def model_role(name):
+    """One plain phrase for what a model does (B7)."""
+    low = (name or "").lower()
+    if "embed" in low:
+        return "finds matching text"
+    if any(part in low for part in _VISION_NAME_PARTS):
+        return "reads pictures"
+    return "chat model (answers and drives the browser)"
+
+
+def model_fit_note(name, size_bytes, total_ram_mb=None):
+    """'fits this PC' / 'too big for this PC' (B7): a model fits
+    when it leaves 2 GB for the system and the browser. '' when
+    the size or the RAM is unknown."""
+    if not size_bytes:
+        return ""
+    total = (total_ram_mb if total_ram_mb is not None
+             else _total_ram_mb())
+    if not total:
+        return ""
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb <= total - 2048:
+        return "fits this PC"
+    return "too big for this PC"
+
+
+def model_blurb(name, size_bytes=None, total_ram_mb=None):
+    """One plain line about a model (B7): what it does, its size,
+    and whether it fits this PC."""
+    parts = [model_role(name)]
+    if size_bytes:
+        parts.append(_human_size(size_bytes))
+    fit = model_fit_note(name, size_bytes, total_ram_mb)
+    if fit:
+        parts.append(fit)
+    return f"{name}: " + ", ".join(parts)
+
+
+def validate_service_url(text):
+    """(ok, is_remote, problem) for an Ollama/SearXNG address
+    (G-S3). Empty means 'not set' and is fine. A set address must
+    be an http(s) URL with a host; a host that is not loopback is
+    remote — saving it needs the person's explicit say-so, since
+    it sends prompts, page text, and memory off this machine."""
+    text = (text or "").strip()
+    if not text:
+        return (True, False, "")
+    if any(ch.isspace() for ch in text):
+        return (False, False, "The address must not contain spaces.")
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in ("http", "https"):
+        return (False, False,
+                "The address must start with http:// or https://.")
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return (False, False, "The address needs a host name.")
+    if not re.fullmatch(r"[a-z0-9.\-:\[\]%_]+", host):
+        return (False, False,
+                "The address has a host name with characters "
+                "a host name cannot have.")
+    if host == "localhost" or host.startswith("127.") or host == "::1":
+        return (True, False, "")
+    return (True, True, "")
+
+
+def chat_history_path():
+    """Where the chat log persists (G-UX9)."""
+    override = os.environ.get("FORGE_BROWSER_CHAT_HISTORY_PATH", "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".forge",
+                        "chat-history.txt")
+
+
+def save_chat_history(text):
+    """Persist the chat log's plain text (G-UX9), capped — the
+    newest lines survive, the oldest drop off."""
+    try:
+        if len(text) > _CHAT_HISTORY_MAX_BYTES:
+            text = text[-_CHAT_HISTORY_MAX_BYTES:]
+        path = chat_history_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError:
+        pass
+
+
+def load_chat_history():
+    """The persisted chat log's plain text (G-UX9), '' when none."""
+    try:
+        with open(chat_history_path(), encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def send_tabs_payload(views, texts, current_view, agent_ids):
+    """The tabs payload for a send (G-C21): each live view's title,
+    URL, and collected text — the text keyed by view identity
+    (id(view)), not by position, so a tab closed or reordered
+    while the text was being read keeps its own text."""
+    tabs = []
+    for view in views:
+        if view is None:
+            tabs.append({"title": "", "url": "", "text": "",
+                         "current": False, "agent": False})
+            continue
+        tabs.append({"title": view.title(),
+                     "url": view.url().toString(),
+                     "text": texts.get(id(view), ""),
+                     "current": view is current_view,
+                     "agent": id(view) in agent_ids})
+    return tabs
+
+
+def load_failed_html(url):
+    """The friendly page for a failed load (G-UX6): plain words,
+    no ERR_NAME_NOT_RESOLVED."""
+    shown = html.escape(url or "that address")
+    return ("<!doctype html><html><head><meta charset=\"utf-8\">"
+            "<title>Could not reach this page</title><style>"
+            "body{font-family:sans-serif;margin:48px;"
+            "background:#101216;color:#e8e4da}</style></head><body>"
+            "<h1>Could not reach this page</h1>"
+            f"<p>Forge Browser could not open {shown}.</p>"
+            "<p>Check the address, or check your connection, "
+            "then try again.</p>"
+            "</body></html>")
+
+
 _DEBUG_LOG = None
 
 
@@ -144,6 +379,34 @@ def get_debug_log():
         _DEBUG_LOG.register_dependency("PySide6")
         _DEBUG_LOG.register_dependency("PySide6-WebEngine")
     return _DEBUG_LOG
+
+
+def _log_action(text):
+    """One line per user action in the debug log (B10, U12).
+    Logging never breaks the window, so a failure here is silent."""
+    try:
+        get_debug_log().action(text)
+    except Exception:
+        pass
+
+
+def _log_error(text):
+    """One line per caught failure in the debug log (B10, U12)."""
+    try:
+        get_debug_log().error(text)
+    except Exception:
+        pass
+
+
+def _chat_log(kind, text):
+    """The debug-log hook the chat session calls (B10): action
+    failures caught inside a turn land here, because the turn
+    carries on around them and the window's turn-failure log
+    would never see them."""
+    if kind == "error":
+        _log_error(text)
+    else:
+        _log_action(text)
 
 
 def app_icon_path():
@@ -260,10 +523,14 @@ def create_window(server, profile, start_url=None):
         tidy_done = QtCore.Signal(object, str, str)  # view, url, tidy title
         preview_ready = QtCore.Signal(str, str)  # url, preview text
         compare_refresh_done = QtCore.Signal(object, str)  # view, new table HTML
+        download_retry_progress = QtCore.Signal(int, int, int)  # key, got, total
+        download_retry_done = QtCore.Signal(int, bool, str)  # key, ok, final/error
 
         def __init__(self):
             super().__init__()
             self.setWindowTitle("Forge Browser")
+            # B2: the window's ember identity (U15).
+            self.setStyleSheet(EMBER_STYLESHEET)
             # B4: the window carries the shipped icon (taskbar,
             # window switcher) — resolved from the app root first,
             # the installed icons dir as fallback.
@@ -324,18 +591,35 @@ def create_window(server, profile, start_url=None):
             self._preview_timer.timeout.connect(self._fetch_link_preview)
             self.tidy_done.connect(self._apply_tidy_title)
             self.preview_ready.connect(self._display_preview)
+            self.download_retry_progress.connect(
+                self._on_download_retry_progress)
+            self.download_retry_done.connect(self._on_download_retry_done)
             self._downloads = {}  # id(download) -> record dict
             self._downloads_dialog = None
             self._vault = None  # the vault, once unlocked this session
-            self._vault_declined = False  # the person said no to unlocking
+            self._vault_hint_shown = False  # the unlock hint showed once
             self._autofill_asked = set()  # hosts already asked about
             self._autofill_done = set()  # hosts already filled
             self._refresh_ai_controls = None  # set by _attach_chat
+            self._turn_count = 0  # chat turns finished (B6 readout)
+            self._chat_dock = None  # set by _attach_chat (G-UX4)
+            self._view_menu = None  # set by _build_menu (G-UX4)
+            self._closed_tabs = []  # URLs of closed tabs (G-UX2/G-UX12)
+            # B3: one modal dialog at a time (U18) — a second
+            # request waits in line instead of stacking.
+            self._dialog_active = False
+            self._dialog_queue = []
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.setTabsClosable(True)
             self.tabs.setMovable(True)
             self.tabs.tabCloseRequested.connect(self._close_tab)
             self.tabs.currentChanged.connect(lambda _: self._sync_address())
+            # G-UX12: right-click a tab for Close, Close Others,
+            # Duplicate, Reopen Closed Tab.
+            self.tabs.tabBar().setContextMenuPolicy(
+                QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+            self.tabs.tabBar().customContextMenuRequested.connect(
+                self._on_tab_context_menu)
             # Tabs above, find bar below (hidden until Ctrl+F).
             central = QtWidgets.QWidget()
             central_layout = QtWidgets.QVBoxLayout(central)
@@ -389,7 +673,7 @@ def create_window(server, profile, start_url=None):
                 QtCore.QUrl(server.home_url)))
             self.address = QtWidgets.QLineEdit()
             self.address.setPlaceholderText(
-                "Type an address, or words to search. Forge Browser searches keyless")
+                "Type an address, or words to search")
             self.address.returnPressed.connect(self._go)
             bar.addWidget(self.address)
             bar.addAction("＋ Tab", lambda: self.new_tab())
@@ -398,6 +682,17 @@ def create_window(server, profile, start_url=None):
             self._build_menu()
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl+F"), self,
                             self._show_find)
+            # G-UX2: the standard browser shortcuts.
+            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+L"), self,
+                            self._focus_address)
+            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self,
+                            lambda: self._view() and self._view().reload())
+            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Tab"), self,
+                            self._next_tab)
+            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+Tab"), self,
+                            self._prev_tab)
+            QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+T"), self,
+                            self._reopen_closed_tab)
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl+="), self,
                             self._zoom_in)
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl++"), self,
@@ -407,6 +702,16 @@ def create_window(server, profile, start_url=None):
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl+0"), self,
                             self._zoom_reset)
             self.statusBar().showMessage(_TAGLINE)
+            # B1: the load progress bar — hidden until a page loads.
+            self._load_progress = QtWidgets.QProgressBar()
+            self._load_progress.setObjectName("load_progress")
+            self._load_progress.setMaximumWidth(140)
+            self._load_progress.setVisible(False)
+            self.statusBar().addPermanentWidget(self._load_progress)
+            # B6: the live readout — RAM, model speed, turn count.
+            self._live_label = QtWidgets.QLabel(live_stats_text())
+            self._live_label.setObjectName("live_stats")
+            self.statusBar().addPermanentWidget(self._live_label)
             # Last session's tabs reopen, unless a start URL was given.
             if start_url is not None:
                 self.new_tab(start_url)
@@ -425,6 +730,14 @@ def create_window(server, profile, start_url=None):
             settings = QtCore.QSettings("ForgeBrowser", "Forge Browser")
             settings.setValue("window/geometry", self.saveGeometry())
             settings.setValue("window/state", self.saveState())
+            # G-UX4: the chat dock's size and visibility persist too
+            # — restoreState cannot carry them, because the dock is
+            # created after restoreState runs.
+            if self._chat_dock is not None:
+                settings.setValue("chat_dock/width",
+                                  self._chat_dock.width())
+                settings.setValue("chat_dock/visible",
+                                  self._chat_dock.isVisible())
             # And the open tabs, so they reopen next launch.
             from .session import save_session
             tabs = []
@@ -435,6 +748,151 @@ def create_window(server, profile, start_url=None):
                                  "title": view.title()})
             save_session(tabs, self.tabs.currentIndex())
             super().closeEvent(event)
+
+        # --- one dialog at a time (B3, U18) -------------------------
+        def _run_dialog(self, make, queue=True):
+            """Run a modal dialog now, or queue it behind the one
+            already open. make() builds and exec()s the dialog and
+            returns its result. When a dialog is already up and
+            queue is True, the request waits in line and make()
+            runs when the open one closes (the caller gets None
+            at once); when queue is False the caller gets None
+            and nothing is shown — for questions, where a stale
+            answer later would be wrong. A queued request says
+            so honestly in the status bar."""
+            if self._dialog_active:
+                if queue:
+                    self._dialog_queue.append(make)
+                    self.statusBar().showMessage(
+                        "A message is waiting behind the open dialog.",
+                        4000)
+                return None
+            self._dialog_active = True
+            try:
+                return make()
+            finally:
+                self._dialog_active = False
+                if self._dialog_queue:
+                    nxt = self._dialog_queue.pop(0)
+                    QtCore.QTimer.singleShot(
+                        0, lambda: self._run_dialog(nxt))
+
+        def _show_message(self, kind, title, text):
+            """An information/warning dialog through the queue."""
+
+            def make():
+                if kind == "warning":
+                    QtWidgets.QMessageBox.warning(self, title, text)
+                else:
+                    QtWidgets.QMessageBox.information(self, title, text)
+
+            self._run_dialog(make)
+
+        def _ask_yes_no(self, title, text):
+            """A Yes/No question, default No (U23), through the
+            queue. A question that arrives while another dialog
+            is up is answered No at once — the person never sees
+            a stale question later."""
+            def make():
+                box = QtWidgets.QMessageBox(self)
+                box.setWindowTitle(title)
+                box.setText(text)
+                box.setStandardButtons(
+                    QtWidgets.QMessageBox.StandardButton.Yes |
+                    QtWidgets.QMessageBox.StandardButton.No)
+                box.setDefaultButton(
+                    QtWidgets.QMessageBox.StandardButton.No)
+                return (box.exec()
+                        == QtWidgets.QMessageBox.StandardButton.Yes)
+
+            return self._run_dialog(make, queue=False) is True
+
+        # --- live readout (B6) --------------------------------------
+        def _update_live_stats(self):
+            """Refresh the status bar's live readout: RAM in use,
+            the last turn's model speed, turns finished."""
+            mem = _read_mem_mb()
+            session = getattr(self, "_chat_session", None)
+            speed = getattr(session, "last_speed", None) \
+                if session is not None else None
+            used, total = mem if mem else (None, None)
+            self._live_label.setText(live_stats_text(
+                used, total, speed, getattr(self, "_turn_count", 0)))
+
+        # --- tab shortcuts (G-UX2) ----------------------------------
+        def _focus_address(self):
+            self.address.setFocus()
+            self.address.selectAll()
+
+        def _next_tab(self):
+            count = self.tabs.count()
+            if count > 1:
+                self.tabs.setCurrentIndex(
+                    (self.tabs.currentIndex() + 1) % count)
+
+        def _prev_tab(self):
+            count = self.tabs.count()
+            if count > 1:
+                self.tabs.setCurrentIndex(
+                    (self.tabs.currentIndex() - 1) % count)
+
+        def _reopen_closed_tab(self):
+            if self._closed_tabs:
+                self.new_tab(self._closed_tabs.pop())
+
+        # --- tab context menu (G-UX12) ------------------------------
+        def _on_tab_context_menu(self, pos):
+            bar = self.tabs.tabBar()
+            index = bar.tabAt(pos)
+            if index < 0:
+                return
+            menu = QtWidgets.QMenu(self)
+            menu.addAction("Close", lambda: self._close_tab(index))
+            menu.addAction("Close Others",
+                           lambda: self._close_other_tabs(index))
+            menu.addAction("Duplicate",
+                           lambda: self._duplicate_tab(index))
+            reopen = menu.addAction("Reopen Closed Tab",
+                                    self._reopen_closed_tab)
+            reopen.setEnabled(bool(self._closed_tabs))
+            menu.exec(bar.mapToGlobal(pos))
+
+        def _close_other_tabs(self, keep):
+            for i in range(self.tabs.count() - 1, -1, -1):
+                if i != keep and self.tabs.count() > 1:
+                    self._close_tab(i)
+
+        def _duplicate_tab(self, index):
+            view = self.tabs.widget(index)
+            if view is not None:
+                self.new_tab(view.url().toString())
+
+        # --- chat dock size (G-UX4) ---------------------------------
+        def _restore_chat_dock(self):
+            """Put the chat dock back where the person left it:
+            the saved width (clamped to half the window) and
+            visibility. Runs once, just after the window shows —
+            resizeDocks needs a laid-out window."""
+            dock = self._chat_dock
+            if dock is None:
+                return
+            settings = QtCore.QSettings("ForgeBrowser", "Forge Browser")
+            saved = settings.value("chat_dock/width", None)
+            try:
+                width = int(saved) if saved is not None else None
+            except (TypeError, ValueError):
+                width = None
+            if width is None:
+                width = _CHAT_DOCK_DEFAULT_WIDTH
+            width = max(_CHAT_DOCK_MIN_WIDTH,
+                        min(width, max(_CHAT_DOCK_MIN_WIDTH,
+                                       self.width() // 2)))
+            self.resizeDocks([dock], [width],
+                             QtCore.Qt.Orientation.Horizontal)
+            visible = settings.value("chat_dock/visible", None)
+            if visible is not None and str(visible).lower() in (
+                    "false", "0", "no"):
+                dock.hide()
 
         def _view(self):
             return self.tabs.currentWidget()
@@ -447,8 +905,15 @@ def create_window(server, profile, start_url=None):
             view.titleChanged.connect(lambda t: self._set_tab_title(view, t))
             view.page().linkHovered.connect(
                 lambda url, view=view: self._on_link_hovered(view, url))
+            # B1: load progress shows in the status bar; G-UX6:
+            # the ok flag reaches _on_load_finished.
+            view.loadStarted.connect(
+                lambda view=view: self._on_load_started(view))
+            view.loadProgress.connect(
+                lambda progress, view=view:
+                    self._on_load_progress(view, progress))
             view.loadFinished.connect(
-                lambda *a, view=view: self._on_load_finished(view))
+                lambda ok, view=view: self._on_load_finished(view, ok))
             index = self.tabs.addTab(view, "New Tab")
             if agent:
                 self._agent_tab_ids.add(id(view))
@@ -459,7 +924,12 @@ def create_window(server, profile, start_url=None):
                 self.tabs.setCurrentIndex(index)
             self._sync_tab_numbers()
             if html is not None:
-                view.setHtml(html)
+                # G-S4: agent-made HTML (compare table, research
+                # report) gets rel="noopener" on its links before
+                # it reaches the view — a clicked link must not
+                # get a window.opener back into the local page.
+                from .webui import _with_noopener
+                view.setHtml(_with_noopener(html))
             else:
                 view.load(QtCore.QUrl(url or server.home_url))
             return view
@@ -551,16 +1021,23 @@ def create_window(server, profile, start_url=None):
         def _fast_seat_session(self):
             """The fast seat (for tidy titles and the summarize map
             step), or the brain when no fast seat is picked (same
-            model, no extra swap)."""
+            model, no extra swap). G-C20: background jobs get their
+            OWN session, never the turn session — sharing it raced
+            on _turn_tokens, _turn_seconds, last_speed, and
+            _retrieve_last. A second ChatSession for the same model
+            is cheap: it is only a client, not a model load."""
             from .chat import ChatSession
             from .seats import pick_fast_model
             fast = pick_fast_model()
             session = getattr(self, "_chat_session", None)
-            if not fast or session is None or fast == session.model:
-                return session
+            model = fast
+            if not model:
+                model = session.model if session is not None else None
+            if not model:
+                return None
             cached = getattr(self, "_fast_session", None)
-            if cached is None or cached.model != fast:
-                cached = ChatSession(model=fast)
+            if cached is None or cached.model != model:
+                cached = ChatSession(model=model)
                 self._fast_session = cached
             return cached
 
@@ -583,8 +1060,29 @@ def create_window(server, profile, start_url=None):
                 self.tabs.setTabText(
                     index, self._agent_mark(view) + tidy[:_TAB_TITLE_CHARS])
 
-        def _on_load_finished(self, view):
+        def _on_load_started(self, view):
+            # B1: the progress bar appears while the current tab
+            # loads (U16: always show activity).
+            if view is self._view():
+                self._load_progress.setValue(0)
+                self._load_progress.setVisible(True)
+
+        def _on_load_progress(self, view, progress):
+            if view is self._view():
+                self._load_progress.setValue(progress)
+
+        def _on_load_finished(self, view, ok=True):
             self._sync_address()
+            if view is self._view():
+                self._load_progress.setVisible(False)
+            if not ok:
+                # G-UX6: a failed load gets a friendly page, not
+                # Qt's technical error page — and no history
+                # entry for a page never seen.
+                url = view.url().toString()
+                _log_error(f"Page failed to load: {url}")
+                view.setHtml(load_failed_html(url))
+                return
             from .titles import record_visit
             url = view.url().toString()
             title = view.title()
@@ -609,12 +1107,25 @@ def create_window(server, profile, start_url=None):
                 "document.body ? document.body.innerText : ''", got_page)
 
         def _close_tab(self, index):
+            widget = self.tabs.widget(index)
+            if widget is not None:
+                # G-UX2: a closed tab can come back (Ctrl+Shift+T).
+                url = widget.url().toString()
+                if url:
+                    self._closed_tabs.append(url)
+                    del self._closed_tabs[:-_CLOSED_TABS_KEEP]
             if self.tabs.count() > 1:
-                widget = self.tabs.widget(index)
                 self._agent_tab_ids.discard(id(widget))
                 self.tabs.removeTab(index)
                 widget.deleteLater()
                 self._sync_tab_numbers()
+            else:
+                # G-UX11: closing the last tab opens a fresh
+                # start-page tab instead of silently doing nothing.
+                self._agent_tab_ids.discard(id(widget))
+                self.tabs.removeTab(index)
+                widget.deleteLater()
+                self.new_tab(server.home_url)
 
         def _sync_address(self):
             view = self._view()
@@ -630,7 +1141,11 @@ def create_window(server, profile, start_url=None):
                     return
                 # Forge Browser's own local pages aren't addresses
                 # the person typed — keep the bar clean on those.
-                self.address.setText("" if url.startswith("http://127.0.0.1") else url)
+                # An empty URL (a setHtml page, like the failed-load
+                # page) leaves the bar as it was.
+                if url:
+                    self.address.setText(
+                        "" if url.startswith("http://127.0.0.1") else url)
             # A navigation ends any hover — the link is gone.
             self._preview_url = ""
             self._preview_timer.stop()
@@ -799,10 +1314,24 @@ def create_window(server, profile, start_url=None):
                          "text": texts.get(id(v), "")} for v in views]
 
                 def work():
-                    new_rows, dropped = compare_tabs(session, tabs, fields)
-                    set_last_comparison(new_rows, fields)
-                    page = compare_table_html(new_rows, fields,
-                                              dropped=dropped)
+                    # G-C5: a refresh failure used to die silently
+                    # in this thread, leaving "Refreshing…" stuck
+                    # forever and the view in _refreshing_views,
+                    # so later refreshes were ignored too.
+                    try:
+                        new_rows, dropped = compare_tabs(session, tabs,
+                                                         fields)
+                        set_last_comparison(new_rows, fields)
+                        page = compare_table_html(new_rows, fields,
+                                                  dropped=dropped)
+                    except Exception as exc:
+                        _log_error(
+                            f"Comparison refresh failed: {exc}")
+                        page = note_page(
+                            "Could not refresh the comparison: "
+                            f"{exc}")
+                    finally:
+                        self._refreshing_views.discard(id(view))
                     self.compare_refresh_done.emit(view, page)
 
                 threading.Thread(target=work, daemon=True).start()
@@ -823,8 +1352,11 @@ def create_window(server, profile, start_url=None):
             kind, target = resolve_address(self.address.text())
             if kind == "search":
                 target = server.search_url(target)
+                _log_action(f"Searched for: {self.address.text()}")
             elif target == "/":
                 target = server.home_url
+            else:
+                _log_action(f"Opened: {target}")
             view = self._view()
             if view is not None:
                 # P6: typed in the address bar by hand — the tab is
@@ -834,8 +1366,8 @@ def create_window(server, profile, start_url=None):
                 view.load(QtCore.QUrl(target))
 
         # --- menu bar (E8) -----------------------------------------
-        def _menu_action(self, menu, text, slot, shortcut=None):
-            action = QtGui.QAction(text, self)
+        def _menu_action(self, menu, text, slot, shortcut=None, parent=None):
+            action = QtGui.QAction(text, parent or self)
             if shortcut:
                 action.setShortcut(QtGui.QKeySequence(shortcut))
             action.triggered.connect(slot)
@@ -850,6 +1382,8 @@ def create_window(server, profile, start_url=None):
             self._menu_action(
                 file_menu, "Close Tab",
                 lambda: self._close_tab(self.tabs.currentIndex()), "Ctrl+W")
+            self._menu_action(file_menu, "Reopen Closed Tab",
+                              self._reopen_closed_tab, "Ctrl+Shift+T")
             file_menu.addSeparator()
             self._menu_action(file_menu, "Downloads",
                               self._open_downloads_dialog)
@@ -859,16 +1393,36 @@ def create_window(server, profile, start_url=None):
             self._menu_action(edit_menu, "Find in Page",
                               self._show_find, "Ctrl+F")
             view_menu = bar.addMenu("&View")
+            self._view_menu = view_menu  # G-UX4: the Chat toggle joins here
             self._menu_action(view_menu, "Zoom In", self._zoom_in, "Ctrl+=")
             self._menu_action(view_menu, "Zoom Out", self._zoom_out, "Ctrl+-")
             self._menu_action(view_menu, "Reset Zoom", self._zoom_reset,
                               "Ctrl+0")
+            # G-UX1: history gets a menu of its own.
+            history_menu = bar.addMenu("&History")
+            self._menu_action(history_menu, "Show All History",
+                              self._open_history_window, "Ctrl+H")
+            self._menu_action(history_menu, "Clear History…",
+                              self._clear_history_native)
             self._bookmarks_menu = bar.addMenu("&Bookmarks")
             self._bookmarks_menu.aboutToShow.connect(
                 self._rebuild_bookmarks_menu)
+            # G-UX3: the Ctrl+D action is created once, here — the
+            # old code built it on every menu open, so Ctrl+D was
+            # dead until the menu opened and duplicated after.
+            self._bookmark_action = QtGui.QAction("Bookmark This Page",
+                                                  self)
+            self._bookmark_action.setShortcut(
+                QtGui.QKeySequence("Ctrl+D"))
+            self._bookmark_action.triggered.connect(
+                self._bookmark_current)
             tools_menu = bar.addMenu("&Tools")
             self._menu_action(tools_menu, "Downloads",
                               self._open_downloads_dialog)
+            self._menu_action(tools_menu, "Vault…",
+                              self._open_vault_window)
+            self._menu_action(tools_menu, "Research Reports…",
+                              self._open_research_window)
             self._menu_action(tools_menu, "Settings…", self._open_settings)
             help_menu = bar.addMenu("&Help")
             self._menu_action(help_menu, "How to Use…",
@@ -877,6 +1431,23 @@ def create_window(server, profile, start_url=None):
                               self._show_debug_report)
             self._menu_action(help_menu, "About Forge Browser",
                               self._show_about)
+
+        def _clear_history_native(self):
+            """G-UX1: clear history from the menu — a destructive
+            action, so it confirms first, default No (U23)."""
+            from .titles import clear_history, load_history
+            count = len(load_history())
+            if not count:
+                self.statusBar().showMessage(
+                    "History is already empty.", 3000)
+                return
+            if self._ask_yes_no(
+                    "Clear history?",
+                    f"This deletes all {count} recorded visits. "
+                    "It cannot be undone.\n\nClear history?"):
+                clear_history()
+                _log_action("Cleared history")
+                self.statusBar().showMessage("History cleared.", 3000)
 
         def _show_howto(self):
             """U22: the manual as an index window — sections from
@@ -916,24 +1487,29 @@ def create_window(server, profile, start_url=None):
             try:
                 path = get_debug_log().generate_report()
             except Exception as exc:  # noqa: BLE001 — report it plainly
-                QtWidgets.QMessageBox.warning(
-                    self, "Debug Report",
+                self._show_message(
+                    "warning", "Debug Report",
                     f"Could not write the debug report: {exc}")
                 return
-            QtWidgets.QMessageBox.information(
-                self, "Debug Report",
+            self._show_message(
+                "info", "Debug Report",
                 f"Debug report written to:\n{path}\n\nIt holds the "
                 "recent actions, any errors, and the log tail. "
                 "Nothing in it carries passwords or keys.")
 
         def _show_about(self):
             from . import __version__
-            QtWidgets.QMessageBox.about(
-                self, "About Forge Browser",
-                f"Forge Browser {__version__}\n\nYour browser. "
-                "No accounts, no API keys, nothing tracked.\n\n"
-                "A local AI model drives the browsing: search, pages, "
-                "and research, all on this machine.")
+
+            def make():
+                QtWidgets.QMessageBox.about(
+                    self, "About Forge Browser",
+                    f"Forge Browser {__version__}\n\nYour browser. "
+                    "No accounts, no API keys. Nothing leaves this "
+                    "machine.\n\n"
+                    "A local AI model drives the browsing: search, pages, "
+                    "and research, all on this machine.")
+
+            self._run_dialog(make)
 
         # --- find in page (E4) --------------------------------------
         def _show_find(self):
@@ -969,9 +1545,17 @@ def create_window(server, profile, start_url=None):
             # older versions handed it a plain bool. Both are read.
             if isinstance(result, bool):
                 found = result
-            else:
-                found = result.numberOfMatches() > 0
-            self._find_label.setText("" if found else "No matches")
+                self._find_label.setText("" if found else "No matches")
+                return
+            # G-UX14: the match count, not just found/not found.
+            total = result.numberOfMatches()
+            if total <= 0:
+                self._find_label.setText("No matches")
+                return
+            active = result.activeMatch()
+            if active < 1:
+                active = 1
+            self._find_label.setText(f"{active} of {total} matches")
 
         # --- zoom (E5) ----------------------------------------------
         def _zoom_in(self):
@@ -999,7 +1583,8 @@ def create_window(server, profile, start_url=None):
 
         # --- bookmarks (E6) -----------------------------------------
         def _bookmark_current(self):
-            from .bookmarks import add_bookmark
+            from .bookmarks import (add_bookmark, is_bookmarked,
+                                    remove_bookmark)
             view = self._view()
             if view is None:
                 return
@@ -1008,7 +1593,15 @@ def create_window(server, profile, start_url=None):
                 self.statusBar().showMessage(
                     "This page can't be bookmarked.", 3000)
                 return
+            # G-UX16: the star toggles — bookmarked already means
+            # unbookmark.
+            if is_bookmarked(url):
+                remove_bookmark(url)
+                _log_action(f"Removed bookmark: {url}")
+                self.statusBar().showMessage("Removed the bookmark.", 3000)
+                return
             add_bookmark(url, view.title() or url)
+            _log_action(f"Bookmarked: {url}")
             self.statusBar().showMessage(
                 f"Bookmarked: {view.title() or url}", 3000)
 
@@ -1016,19 +1609,23 @@ def create_window(server, profile, start_url=None):
             from .bookmarks import list_bookmarks
             menu = self._bookmarks_menu
             menu.clear()
-            self._menu_action(menu, "Bookmark This Page",
-                              self._bookmark_current, "Ctrl+D")
+            # G-UX3: the same Ctrl+D action every time (created
+            # once in _build_menu), and the per-bookmark actions
+            # are parented to the menu, so clear() deletes them
+            # instead of leaking another live shortcut per open.
+            menu.addAction(self._bookmark_action)
             menu.addSeparator()
             marks = list_bookmarks()[:15]
             for mark in marks:
                 title = (mark.get("title") or mark["url"])[:40]
                 self._menu_action(
                     menu, title,
-                    lambda url=mark["url"]: self.new_tab(url))
+                    lambda url=mark["url"]: self.new_tab(url),
+                    parent=menu)
             if marks:
                 menu.addSeparator()
             self._menu_action(menu, "All Bookmarks…",
-                              self._open_bookmarks_dialog)
+                              self._open_bookmarks_dialog, parent=menu)
 
         def _open_bookmarks_dialog(self):
             from .bookmarks import list_bookmarks, remove_bookmark
@@ -1064,16 +1661,164 @@ def create_window(server, profile, start_url=None):
             def remove_selected():
                 item = listing.currentItem()
                 if item is not None:
-                    remove_bookmark(
-                        item.data(QtCore.Qt.ItemDataRole.UserRole))
+                    # A2: a destructive remove confirms first,
+                    # default No (U23).
+                    url = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                    if self._ask_yes_no(
+                            "Remove bookmark?",
+                            f"Remove this bookmark?\n\n{url}"):
+                        remove_bookmark(url)
+                        _log_action(f"Removed bookmark: {url}")
+                        refresh()
+
+            def rename_selected():
+                # G-UX16: rename in place — remove + re-add under
+                # the new title (the entry moves to the top of the
+                # list, newest first).
+                from .bookmarks import add_bookmark
+                item = listing.currentItem()
+                if item is None:
+                    return
+                url = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                current = item.text().rsplit(": ", 1)[0]
+                title, ok = QtWidgets.QInputDialog.getText(
+                    dialog, "Rename bookmark", "Title:", text=current)
+                if ok and title.strip():
+                    remove_bookmark(url)
+                    add_bookmark(url, title.strip())
                     refresh()
 
             open_btn.clicked.connect(open_selected)
             remove_btn.clicked.connect(remove_selected)
+            rename_btn = QtWidgets.QPushButton("Rename")
+            rename_btn.setObjectName("bookmarks_rename")
+            rename_btn.clicked.connect(rename_selected)
             close_btn.clicked.connect(dialog.reject)
             listing.itemDoubleClicked.connect(lambda item: open_selected())
             buttons.addWidget(open_btn)
+            buttons.addWidget(rename_btn)
             buttons.addWidget(remove_btn)
+            buttons.addStretch(1)
+            buttons.addWidget(close_btn)
+            layout.addLayout(buttons)
+            dialog.exec()
+
+        # --- history + research windows (B12) -----------------------
+        def _open_history_window(self):
+            """B12: history as a native window, like the Memory
+            dialog — search, open, clear. The /history page stays
+            for the start page's link."""
+            from .titles import (_HISTORY_LIMIT, clear_history,
+                                 load_history)
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("History")
+            dialog.setObjectName("history_dialog")
+            dialog.setMinimumSize(560, 360)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            search = QtWidgets.QLineEdit()
+            search.setObjectName("history_search")
+            search.setPlaceholderText("Search history")
+            layout.addWidget(search)
+            listing = QtWidgets.QListWidget()
+            listing.setObjectName("history_list")
+            layout.addWidget(listing)
+            cap = QtWidgets.QLabel(
+                f"History keeps the newest {_HISTORY_LIMIT} visits. "
+                "Older visits drop off.")
+            cap.setWordWrap(True)
+            layout.addWidget(cap)
+
+            def refresh():
+                needle = search.text().strip().lower()
+                listing.clear()
+                for entry in load_history():
+                    if not isinstance(entry, dict):
+                        continue
+                    url = entry.get("url")
+                    if not url:
+                        continue
+                    title = entry.get("title") or url
+                    if needle and needle not in title.lower() \
+                            and needle not in url.lower():
+                        continue
+                    item = QtWidgets.QListWidgetItem(f"{title}: {url}")
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, url)
+                    listing.addItem(item)
+
+            search.textChanged.connect(refresh)
+            refresh()
+            buttons = QtWidgets.QHBoxLayout()
+            open_btn = QtWidgets.QPushButton("Open")
+            clear_btn = QtWidgets.QPushButton("Clear History…")
+            close_btn = QtWidgets.QPushButton("Close")
+
+            def open_selected():
+                item = listing.currentItem()
+                if item is not None:
+                    self.new_tab(
+                        item.data(QtCore.Qt.ItemDataRole.UserRole))
+                    dialog.accept()
+
+            def clear_all():
+                if self._ask_yes_no(
+                        "Clear history?",
+                        "This deletes all recorded visits. "
+                        "It cannot be undone.\n\nClear history?"):
+                    clear_history()
+                    _log_action("Cleared history")
+                    refresh()
+
+            open_btn.clicked.connect(open_selected)
+            clear_btn.clicked.connect(clear_all)
+            close_btn.clicked.connect(dialog.reject)
+            listing.itemDoubleClicked.connect(lambda item: open_selected())
+            buttons.addWidget(open_btn)
+            buttons.addWidget(clear_btn)
+            buttons.addStretch(1)
+            buttons.addWidget(close_btn)
+            layout.addLayout(buttons)
+            dialog.exec()
+
+        def _open_research_window(self):
+            """B12: research reports as a native window — the list,
+            one click to open a report in a tab."""
+            from .research import list_reports
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Research Reports")
+            dialog.setObjectName("research_dialog")
+            dialog.setMinimumSize(560, 360)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            listing = QtWidgets.QListWidget()
+            listing.setObjectName("research_list")
+            layout.addWidget(listing)
+            for report in list_reports():
+                item = QtWidgets.QListWidgetItem(report["topic"])
+                item.setData(QtCore.Qt.ItemDataRole.UserRole,
+                             report["name"])
+                listing.addItem(item)
+            if not list_reports():
+                listing.addItem(
+                    "No research reports saved yet. Ask the browser "
+                    "to research something and the report lands here.")
+                listing.item(0).setFlags(
+                    QtCore.Qt.ItemFlag.NoItemFlags)
+            buttons = QtWidgets.QHBoxLayout()
+            open_btn = QtWidgets.QPushButton("Open")
+            close_btn = QtWidgets.QPushButton("Close")
+
+            def open_selected():
+                item = listing.currentItem()
+                if item is None:
+                    return
+                name = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if name:
+                    self.new_tab(server.home_url + "research/" + name)
+                    dialog.accept()
+
+            open_btn.clicked.connect(open_selected)
+            close_btn.clicked.connect(dialog.reject)
+            listing.itemDoubleClicked.connect(lambda item: open_selected())
+            buttons.addWidget(open_btn)
             buttons.addStretch(1)
             buttons.addWidget(close_btn)
             layout.addLayout(buttons)
@@ -1095,7 +1840,13 @@ def create_window(server, profile, start_url=None):
             record = {"download": download, "name": name,
                       "tmp": os.path.join(folder, tmp_name),
                       "folder": folder, "final": None,
-                      "status": "downloading"}
+                      "status": "downloading",
+                      # G-UX10: the URL + the partial file are what
+                      # a retry resumes from; "error" is why a
+                      # failure failed (G-UX13).
+                      "url": download.url().toString(),
+                      "error": "",
+                      "retry_received": 0, "retry_total": 0}
             self._downloads[id(download)] = record
             download.receivedBytesChanged.connect(
                 self._refresh_downloads_list)
@@ -1104,6 +1855,7 @@ def create_window(server, profile, start_url=None):
             download.stateChanged.connect(
                 lambda state, key=id(download):
                     self._on_download_state(key, state))
+            _log_action(f"Started downloading: {name}")
             self.statusBar().showMessage(f"Downloading {name}…", 5000)
             self._refresh_downloads_list()
 
@@ -1115,7 +1867,18 @@ def create_window(server, profile, start_url=None):
             if record["status"] == "cancelled":
                 return f"{name}: Cancelled"
             if record["status"] == "failed":
-                return f"{name}: Failed"
+                error = record.get("error", "")
+                return (f"{name}: Failed ({error})" if error
+                        else f"{name}: Failed")
+            if record["status"] == "retrying":
+                received = record.get("retry_received", 0)
+                total = record.get("retry_total", 0)
+                if total > 0:
+                    pct = int(received * 100 / total)
+                    return (f"{name}: Retrying… {pct}% "
+                            f"({_human_size(received)} of "
+                            f"{_human_size(total)})")
+                return f"{name}: Retrying… {_human_size(received)}"
             received = download.receivedBytes()
             total = download.totalBytes()
             if total > 0:
@@ -1125,12 +1888,78 @@ def create_window(server, profile, start_url=None):
             return f"{name}: {_human_size(received)}"
 
         def _refresh_downloads_list(self):
+            # G-UX7: rows update in place instead of clearing and
+            # rebuilding, so the selection survives a progress
+            # tick and Cancel stays usable during a download.
             listing = getattr(self, "_downloads_list", None)
             if listing is None:
                 return
-            listing.clear()
-            for record in self._downloads.values():
-                listing.addItem(self._download_line(record))
+            selected_key = None
+            current = listing.currentItem()
+            if current is not None:
+                selected_key = current.data(
+                    QtCore.Qt.ItemDataRole.UserRole)
+            existing = {}
+            for row in range(listing.count()):
+                item = listing.item(row)
+                existing[item.data(QtCore.Qt.ItemDataRole.UserRole)] = item
+            for key, record in self._downloads.items():
+                line = self._download_line(record)
+                if key in existing:
+                    if existing[key].text() != line:
+                        existing[key].setText(line)
+                else:
+                    item = QtWidgets.QListWidgetItem(line)
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole, key)
+                    listing.addItem(item)
+            for row in range(listing.count() - 1, -1, -1):
+                item = listing.item(row)
+                if item.data(QtCore.Qt.ItemDataRole.UserRole) \
+                        not in self._downloads:
+                    listing.takeItem(row)
+            if selected_key is not None:
+                for row in range(listing.count()):
+                    item = listing.item(row)
+                    if item.data(QtCore.Qt.ItemDataRole.UserRole) \
+                            == selected_key:
+                        listing.setCurrentRow(row)
+                        break
+            self._update_download_buttons()
+
+        def _update_download_buttons(self):
+            """Enable the downloads dialog's per-file buttons for
+            the selected record (G-UX10/G-UX13)."""
+            listing = getattr(self, "_downloads_list", None)
+            buttons = getattr(self, "_download_buttons", None)
+            if listing is None or buttons is None:
+                return
+            record = None
+            item = listing.currentItem()
+            if item is not None:
+                record = self._downloads.get(
+                    item.data(QtCore.Qt.ItemDataRole.UserRole))
+            status = record["status"] if record else None
+            buttons["open"].setEnabled(
+                record is not None and status == "done"
+                and bool(record.get("final")))
+            buttons["show"].setEnabled(
+                record is not None and status == "done"
+                and bool(record.get("final")))
+            buttons["retry"].setEnabled(
+                record is not None and status == "failed"
+                and bool(record.get("url")))
+            buttons["cancel"].setEnabled(status == "downloading")
+
+        def _prune_downloads(self):
+            """G-P20: finished records past the keep count drop
+            out, so the dict stops growing for the app's life.
+            Active downloads are never pruned."""
+            finished = [key for key, record in self._downloads.items()
+                        if record["status"] in ("done", "cancelled",
+                                                "failed")]
+            if len(finished) > _DOWNLOADS_KEEP:
+                for key in finished[:len(finished) - _DOWNLOADS_KEEP]:
+                    del self._downloads[key]
 
         def _remove_download_tmp(self, record):
             try:
@@ -1149,11 +1978,21 @@ def create_window(server, profile, start_url=None):
                     record["final"] = keep_download(
                         record["tmp"], record["name"], record["folder"])
                     record["status"] = "done"
+                    _log_action(
+                        f"Downloaded: {record['name']} to "
+                        f"{record['final']}")
                     self.statusBar().showMessage(
                         f"Downloaded {record['name']} to {record['final']}",
                         8000)
-                except OSError as exc:
+                except (OSError, BrowserError) as exc:
+                    # G-C4: keep_download's failure path raises
+                    # BrowserError, not OSError — the old handler
+                    # let it escape the slot and left the record
+                    # stuck at "downloading" forever.
                     record["status"] = "failed"
+                    record["error"] = str(exc)
+                    _log_error(
+                        f"Could not save {record['name']}: {exc}")
                     self._remove_download_tmp(record)
                     self.statusBar().showMessage(
                         f"Could not save {record['name']}: {exc}", 8000)
@@ -1161,15 +2000,79 @@ def create_window(server, profile, start_url=None):
                 record["status"] = "cancelled"
                 self._remove_download_tmp(record)
             elif state == states.DownloadInterrupted:
+                # G-UX10: the partial file is KEPT, so Retry can
+                # resume it instead of starting over.
                 record["status"] = "failed"
-                self._remove_download_tmp(record)
+                record["error"] = "the connection dropped"
+                _log_error(f"Download failed: {record['name']}")
                 self.statusBar().showMessage(
                     f"Download failed: {record['name']}", 8000)
+            self._prune_downloads()
             self._refresh_downloads_list()
+
+        def _on_download_retry_progress(self, key, received, total):
+            record = self._downloads.get(key)
+            if record is None:
+                return
+            record["retry_received"] = received
+            record["retry_total"] = total
+            self._refresh_downloads_list()
+
+        def _on_download_retry_done(self, key, ok, detail):
+            record = self._downloads.get(key)
+            if record is None:
+                return
+            if ok:
+                record["final"] = detail
+                record["status"] = "done"
+                _log_action(f"Downloaded (retried): {record['name']}")
+                self.statusBar().showMessage(
+                    f"Downloaded {record['name']} to {detail}", 8000)
+            else:
+                record["status"] = "failed"
+                record["error"] = detail
+                _log_error(
+                    f"Download retry failed: {record['name']}: {detail}")
+                self.statusBar().showMessage(
+                    f"Retry failed: {record['name']}", 8000)
+            self._refresh_downloads_list()
+
+        def _retry_download(self, key):
+            """G-UX10: resume a failed download from its partial
+            file, through the engine room's resumable fetch
+            (Range requests). The browser's cookies do not travel
+            with it, so a login-gated download may still fail —
+            the error says so plainly."""
+            record = self._downloads.get(key)
+            if record is None or record["status"] != "failed" \
+                    or not record.get("url"):
+                return
+            record["status"] = "retrying"
+            record["retry_received"] = 0
+            record["retry_total"] = 0
+            self._refresh_downloads_list()
+
+            def work_retry():
+                from ._http import http_get_to_file
+                from .files import keep_download
+                try:
+                    _final, _headers, _size = http_get_to_file(
+                        record["url"], record["tmp"], resume=True,
+                        on_progress=lambda got, total:
+                            self.download_retry_progress.emit(
+                                key, got, total or 0))
+                    final = keep_download(record["tmp"], record["name"],
+                                          record["folder"])
+                    self.download_retry_done.emit(key, True, final)
+                except Exception as exc:
+                    self.download_retry_done.emit(key, False, str(exc))
+
+            threading.Thread(target=work_retry, daemon=True).start()
 
         def _on_downloads_dialog_closed(self, *args):
             self._downloads_dialog = None
             self._downloads_list = None
+            self._download_buttons = None
 
         def _open_downloads_dialog(self):
             if self._downloads_dialog is not None:
@@ -1191,24 +2094,69 @@ def create_window(server, profile, start_url=None):
             self._downloads_list = listing
             buttons = QtWidgets.QHBoxLayout()
             folder_btn = QtWidgets.QPushButton("Open download folder")
+            open_btn = QtWidgets.QPushButton("Open")
+            open_btn.setObjectName("downloads_open")
+            show_btn = QtWidgets.QPushButton("Show in folder")
+            show_btn.setObjectName("downloads_show")
+            retry_btn = QtWidgets.QPushButton("Retry")
+            retry_btn.setObjectName("downloads_retry")
             cancel_btn = QtWidgets.QPushButton("Cancel download")
+            cancel_btn.setObjectName("downloads_cancel")
             close_btn = QtWidgets.QPushButton("Close")
+            self._download_buttons = {"open": open_btn, "show": show_btn,
+                                      "retry": retry_btn,
+                                      "cancel": cancel_btn}
+
+            def selected_record():
+                item = listing.currentItem()
+                if item is None:
+                    return None
+                return self._downloads.get(
+                    item.data(QtCore.Qt.ItemDataRole.UserRole))
 
             def open_folder():
                 from .files import download_dir
                 QtGui.QDesktopServices.openUrl(
                     QtCore.QUrl.fromLocalFile(download_dir()))
 
+            def open_selected():
+                # G-UX13: open the finished file itself.
+                record = selected_record()
+                if record is not None and record.get("final"):
+                    QtGui.QDesktopServices.openUrl(
+                        QtCore.QUrl.fromLocalFile(record["final"]))
+
+            def show_selected():
+                # G-UX13: show the finished file in its folder.
+                record = selected_record()
+                if record is not None and record.get("final"):
+                    QtGui.QDesktopServices.openUrl(
+                        QtCore.QUrl.fromLocalFile(
+                            os.path.dirname(record["final"])))
+
+            def retry_selected():
+                item = listing.currentItem()
+                if item is not None:
+                    self._retry_download(
+                        item.data(QtCore.Qt.ItemDataRole.UserRole))
+
             def cancel_selected():
-                row = listing.currentRow()
-                records = list(self._downloads.values())
-                if 0 <= row < len(records):
-                    records[row]["download"].cancel()
+                record = selected_record()
+                if record is not None:
+                    record["download"].cancel()
 
             folder_btn.clicked.connect(open_folder)
+            open_btn.clicked.connect(open_selected)
+            show_btn.clicked.connect(show_selected)
+            retry_btn.clicked.connect(retry_selected)
             cancel_btn.clicked.connect(cancel_selected)
             close_btn.clicked.connect(dialog.close)
+            listing.currentItemChanged.connect(
+                lambda *a: self._update_download_buttons())
             buttons.addWidget(folder_btn)
+            buttons.addWidget(open_btn)
+            buttons.addWidget(show_btn)
+            buttons.addWidget(retry_btn)
             buttons.addWidget(cancel_btn)
             buttons.addStretch(1)
             buttons.addWidget(close_btn)
@@ -1246,55 +2194,59 @@ def create_window(server, profile, start_url=None):
                     self._on_login_form_found(view, url, host, result))
 
         def _on_login_form_found(self, view, url, host, result):
-            if result != "login":
+            # G-UX15: password-only forms get the offer too.
+            if result not in ("login", "password-only"):
                 return
             if host in self._autofill_asked or host in self._autofill_done:
                 return
-            self._autofill_asked.add(host)
-            from .vault import Vault, default_vault_path, find_entry_for_url
+            from .vault import default_vault_path, find_entry_for_url
             if not os.path.exists(default_vault_path()):
                 return  # no vault, nothing to fill
             if self._vault is None:
-                if self._vault_declined:
-                    return
-                self._vault = self._unlock_vault()
-                if self._vault is None:
-                    self._vault_declined = True
-                    return
+                # B4: the vault unlocks only from the Vault window
+                # (Tools menu) — autofill never prompts for the
+                # passphrase mid-browse. The host is NOT marked
+                # asked, so unlocking later still offers the fill.
+                if not self._vault_hint_shown:
+                    self._vault_hint_shown = True
+                    self.statusBar().showMessage(
+                        "A login is saved for this site. Unlock the "
+                        "vault from Tools, then reload to fill it.",
+                        8000)
+                return
+            self._autofill_asked.add(host)
             found = find_entry_for_url(self._vault, url)
             if found is None:
                 return  # no saved login for this site
             site, entry = found
-            answer = QtWidgets.QMessageBox.question(
-                self, "Fill login?",
-                f"Fill the saved login for {site}?\n\n"
-                f"Username: {entry.get('username', '')}\n"
-                "The password is filled in but never shown.",
-                QtWidgets.QMessageBox.StandardButton.Yes |
-                QtWidgets.QMessageBox.StandardButton.No)
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            if result == "password-only":
+                question = (f"Fill the saved password for {site}?\n\n"
+                            "The password is filled in but never shown.")
+            else:
+                question = (f"Fill the saved login for {site}?\n\n"
+                            f"Username: {entry.get('username', '')}\n"
+                            "The password is filled in but never shown.")
+            if not self._ask_yes_no("Fill login?", question):
                 return
-            self._fill_login(view, entry.get("username", ""),
-                             entry.get("password", ""))
+            # G-S10: the page may have navigated during the
+            # dialogs — re-verify the tab still shows the entry's
+            # site immediately before filling.
+            current_host = (urllib.parse.urlparse(
+                view.url().toString()).hostname or "").lower()
+            if current_host != host.lower():
+                self.statusBar().showMessage(
+                    "The page changed before the login could be "
+                    "filled.", 5000)
+                return
+            self._fill_login(
+                view,
+                entry.get("username", "") if result == "login" else "",
+                entry.get("password", ""))
             self._autofill_done.add(host)
+            _log_action(f"Filled the saved login for {site}")
             self.statusBar().showMessage(
                 f"Filled the saved login for {site}. Check it and sign in.",
                 8000)
-
-        def _unlock_vault(self):
-            from .vault import Vault, default_vault_path
-            passphrase, ok = QtWidgets.QInputDialog.getText(
-                self, "Vault",
-                "Vault passphrase (to check for a saved login):",
-                QtWidgets.QLineEdit.EchoMode.Password)
-            if not ok or not passphrase:
-                return None
-            try:
-                return Vault.open(default_vault_path(), passphrase)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(
-                    self, "Vault", str(exc))
-                return None
 
         def _fill_login(self, view, username, password):
             # Values are set through the native setter with input +
@@ -1320,6 +2272,204 @@ def create_window(server, profile, start_url=None):
                 f" setVal(pw, {json.dumps(password)});"
                 " return 'filled'; })()")
             view.page().runJavaScript(script)
+
+        # --- vault window (B4, U1) ----------------------------------
+        def _open_vault_window(self):
+            """The vault in the window at last: unlock/lock, list,
+            add, delete. This is the one place that asks for the
+            passphrase — autofill never prompts mid-browse."""
+            from .vault import Vault, default_vault_path
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Vault")
+            dialog.setObjectName("vault_dialog")
+            dialog.setMinimumSize(520, 360)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            status = QtWidgets.QLabel("")
+            status.setObjectName("vault_status")
+            status.setWordWrap(True)
+            layout.addWidget(status)
+            stack = QtWidgets.QStackedWidget()
+            layout.addWidget(stack, 1)
+
+            # Page 0: locked — passphrase + Unlock.
+            locked_page = QtWidgets.QWidget()
+            locked_layout = QtWidgets.QVBoxLayout(locked_page)
+            locked_layout.addWidget(QtWidgets.QLabel(
+                "The vault is locked. Enter the passphrase to unlock it."))
+            pass_entry = QtWidgets.QLineEdit()
+            pass_entry.setObjectName("vault_passphrase")
+            pass_entry.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            locked_layout.addWidget(pass_entry)
+            unlock_btn = QtWidgets.QPushButton("Unlock")
+            unlock_btn.setObjectName("vault_unlock")
+            locked_layout.addWidget(unlock_btn)
+            locked_layout.addStretch(1)
+            stack.addWidget(locked_page)
+
+            # Page 1: no vault yet — choose a passphrase + Create.
+            create_page = QtWidgets.QWidget()
+            create_layout = QtWidgets.QVBoxLayout(create_page)
+            create_layout.addWidget(QtWidgets.QLabel(
+                "No vault yet. Choose a passphrase (at least 8 "
+                "characters) to create one."))
+            new_pass = QtWidgets.QLineEdit()
+            new_pass.setObjectName("vault_new_passphrase")
+            new_pass.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            create_layout.addWidget(new_pass)
+            confirm_pass = QtWidgets.QLineEdit()
+            confirm_pass.setObjectName("vault_confirm_passphrase")
+            confirm_pass.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+            confirm_pass.setPlaceholderText("Repeat the passphrase")
+            create_layout.addWidget(confirm_pass)
+            create_btn = QtWidgets.QPushButton("Create vault")
+            create_btn.setObjectName("vault_create")
+            create_layout.addWidget(create_btn)
+            create_layout.addStretch(1)
+            stack.addWidget(create_page)
+
+            # Page 2: unlocked — the entries, add/delete/lock.
+            list_page = QtWidgets.QWidget()
+            list_layout = QtWidgets.QVBoxLayout(list_page)
+            listing = QtWidgets.QListWidget()
+            listing.setObjectName("vault_list")
+            list_layout.addWidget(listing)
+            entry_buttons = QtWidgets.QHBoxLayout()
+            add_btn = QtWidgets.QPushButton("Add…")
+            add_btn.setObjectName("vault_add")
+            delete_btn = QtWidgets.QPushButton("Delete")
+            delete_btn.setObjectName("vault_delete")
+            lock_btn = QtWidgets.QPushButton("Lock vault")
+            lock_btn.setObjectName("vault_lock")
+            entry_buttons.addWidget(add_btn)
+            entry_buttons.addWidget(delete_btn)
+            entry_buttons.addStretch(1)
+            entry_buttons.addWidget(lock_btn)
+            list_layout.addLayout(entry_buttons)
+            stack.addWidget(list_page)
+
+            def refresh():
+                if self._vault is not None:
+                    status.setText("Unlocked. Passwords are never shown.")
+                    listing.clear()
+                    for item in self._vault.list_entries():
+                        row = QtWidgets.QListWidgetItem(
+                            f"{item['site']} ({item['username']})")
+                        row.setData(QtCore.Qt.ItemDataRole.UserRole,
+                                    item["site"])
+                        listing.addItem(row)
+                    stack.setCurrentIndex(2)
+                elif os.path.exists(default_vault_path()):
+                    status.setText("The vault is locked.")
+                    stack.setCurrentIndex(0)
+                else:
+                    status.setText("No vault yet.")
+                    stack.setCurrentIndex(1)
+
+            def do_unlock():
+                try:
+                    self._vault = Vault.open(default_vault_path(),
+                                             pass_entry.text())
+                except Exception as exc:
+                    _log_error(f"Vault unlock failed: {exc}")
+                    status.setText(f"Could not unlock the vault: {exc}")
+                    return
+                pass_entry.clear()
+                _log_action("Unlocked the vault")
+                refresh()
+
+            def do_create():
+                first = new_pass.text()
+                second = confirm_pass.text()
+                if len(first) < 8:
+                    status.setText(
+                        "The passphrase needs at least 8 characters.")
+                    return
+                if first != second:
+                    status.setText("The two passphrases do not match.")
+                    return
+                try:
+                    self._vault = Vault.create(default_vault_path(), first)
+                except Exception as exc:
+                    _log_error(f"Vault creation failed: {exc}")
+                    status.setText(f"Could not create the vault: {exc}")
+                    return
+                new_pass.clear()
+                confirm_pass.clear()
+                _log_action("Created the vault")
+                refresh()
+
+            def do_lock():
+                self._vault = None
+                self._autofill_asked.clear()
+                self._autofill_done.clear()
+                _log_action("Locked the vault")
+                refresh()
+
+            def do_add():
+                form = QtWidgets.QDialog(dialog)
+                form.setWindowTitle("Add a login")
+                form_layout = QtWidgets.QVBoxLayout(form)
+                site_entry = QtWidgets.QLineEdit()
+                site_entry.setPlaceholderText("Site (example.org)")
+                user_entry = QtWidgets.QLineEdit()
+                user_entry.setPlaceholderText("Username")
+                pw_entry = QtWidgets.QLineEdit()
+                pw_entry.setPlaceholderText("Password")
+                pw_entry.setEchoMode(
+                    QtWidgets.QLineEdit.EchoMode.Password)
+                notes_entry = QtWidgets.QLineEdit()
+                notes_entry.setPlaceholderText("Notes (optional)")
+                for label, entry in (
+                        ("Site:", site_entry), ("Username:", user_entry),
+                        ("Password:", pw_entry), ("Notes:", notes_entry)):
+                    form_layout.addWidget(QtWidgets.QLabel(label))
+                    form_layout.addWidget(entry)
+                form_buttons = QtWidgets.QHBoxLayout()
+                save_btn = QtWidgets.QPushButton("Save")
+                form_cancel = QtWidgets.QPushButton("Cancel")
+                form_buttons.addStretch(1)
+                form_buttons.addWidget(save_btn)
+                form_buttons.addWidget(form_cancel)
+                form_layout.addLayout(form_buttons)
+
+                def save_entry():
+                    site = site_entry.text().strip()
+                    if not site:
+                        return
+                    self._vault.set(site, user_entry.text().strip(),
+                                    pw_entry.text(), notes_entry.text())
+                    _log_action(f"Added a vault entry for {site}")
+                    form.accept()
+
+                save_btn.clicked.connect(save_entry)
+                form_cancel.clicked.connect(form.reject)
+                if form.exec():
+                    refresh()
+
+            def do_delete():
+                item = listing.currentItem()
+                if item is None:
+                    return
+                site = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                if self._ask_yes_no(
+                        "Delete login?",
+                        f"Delete the saved login for {site}?\n\n"
+                        "It cannot be undone."):
+                    self._vault.delete(site)
+                    _log_action(f"Deleted a vault entry for {site}")
+                    refresh()
+
+            unlock_btn.clicked.connect(do_unlock)
+            pass_entry.returnPressed.connect(do_unlock)
+            create_btn.clicked.connect(do_create)
+            lock_btn.clicked.connect(do_lock)
+            add_btn.clicked.connect(do_add)
+            delete_btn.clicked.connect(do_delete)
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(dialog.accept)
+            layout.addWidget(close_btn)
+            refresh()
+            dialog.exec()
 
         # --- settings (E9) ------------------------------------------
         def _open_settings(self):
@@ -1356,10 +2506,17 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         research_done = QtCore.Signal(object, object, object)  # report, sources, error
         brief_done = QtCore.Signal(str)  # U9: a background brief build's text
         brain_checked = QtCore.Signal(bool, str)  # answer-check: answers?, model
+        brain_ready = QtCore.Signal(object, object)  # G-P1: session, models
+        brain_fix_done = QtCore.Signal()  # G-UX5: Start Ollama / Get model done
 
     signals = Signals()
-    session = ChatSession()  # picks the brain, with reason + state
-    window._chat_session = session  # tab titles tidy against this brain
+    # G-P1: the brain pick is NOT made here anymore — ChatSession()
+    # blocks on Ollama (up to 5 s) and used to freeze the launch
+    # with no window on screen. The window paints first with a
+    # "checking…" header; the pick runs on a background thread and
+    # lands through brain_ready.
+    session = None
+    window._chat_session = None
     brain_health = {"checked": False, "answers": None}
     retrieval_state = {"models": []}  # fill_seat_combos keeps this fresh
 
@@ -1370,6 +2527,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         different lines — the fix is different (G9). Plus the
         retrieval line (I1): on when nomic-embed-text is
         installed, off with the fix otherwise."""
+        if session is None:
+            return "Checking for a brain…"
         if session.brain_state == "ollama-down":
             text = ("Brain: none. Ollama is not running. Start Ollama, "
                     "then ↻. Browsing still works.")
@@ -1400,6 +2559,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     def _check_brain_in_background():
         # G7: prove the picked model answers, off the GUI thread.
+        if session is None:
+            return
         model = session.model
         if not model:
             return
@@ -1410,17 +2571,39 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
         threading.Thread(target=work_check, daemon=True).start()
 
+    def _start_brain_pick(refresh=False):
+        """G-P1: pick the brain (and read the model list) off the
+        GUI thread. refresh=True re-picks the existing session
+        (the ↻ button) instead of making a new one, so turn
+        history survives a refresh."""
+        def work_pick():
+            from .chat import ChatSession, check_ollama
+            if refresh and session is not None:
+                session.repick()
+                picked = session
+            else:
+                # B10: the session's log hook is the debug log —
+                # failures caught inside a turn land in it.
+                picked = ChatSession(on_log=_chat_log)
+            _reachable, details = check_ollama()
+            signals.brain_ready.emit(picked, details)
+
+        threading.Thread(target=work_pick, daemon=True).start()
+
     def _build_brief_in_background():
         # The morning brief builds once a day in the background; the
         # start page shows it on its next load. A failed brain call
         # is not cached, so the next launch retries. T2: the brief
         # is a brain job — it does not build when AI/chat is off.
+        # G-C20: the brief gets its own session — sharing the turn
+        # session raced on its per-turn state.
         from .seats import seats_enabled
         if not seats_enabled("chat"):
             return
         from .brief import build_brief
+        from .chat import ChatSession
         try:
-            build_brief(session)
+            build_brief(ChatSession())
         except Exception:
             pass
 
@@ -1431,11 +2614,39 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     panel = QtWidgets.QWidget()
     layout = QtWidgets.QVBoxLayout(panel)
     header = QtWidgets.QLabel(brain_header_text())
+    header.setObjectName("brain_header")
     header.setWordWrap(True)
     layout.addWidget(header)
+    # G-UX5: the no-brain states get buttons that fix them, not
+    # terminal instructions — Start Ollama, Get a chat model.
+    # apply_ai_state shows the one that fits the state.
+    fix_row = QtWidgets.QHBoxLayout()
+    start_ollama_btn = QtWidgets.QPushButton("Start Ollama")
+    start_ollama_btn.setObjectName("start_ollama_button")
+    start_ollama_btn.setVisible(False)
+    get_model_btn = QtWidgets.QPushButton("Get a chat model")
+    get_model_btn.setObjectName("get_model_button")
+    get_model_btn.setVisible(False)
+    fix_row.addWidget(start_ollama_btn)
+    fix_row.addWidget(get_model_btn)
+    fix_row.addStretch(1)
+    layout.addLayout(fix_row)
     log = QtWidgets.QTextEdit()
+    log.setObjectName("chat_log")
     log.setReadOnly(True)
+    # G-UX9: the log is capped — it used to grow for the session.
+    log.document().setMaximumBlockCount(_CHAT_LOG_BLOCKS)
     layout.addWidget(log)
+    # G-UX9: Clear and Export for the chat log.
+    log_row = QtWidgets.QHBoxLayout()
+    clear_chat_btn = QtWidgets.QPushButton("Clear chat")
+    clear_chat_btn.setObjectName("clear_chat_button")
+    export_chat_btn = QtWidgets.QPushButton("Export chat…")
+    export_chat_btn.setObjectName("export_chat_button")
+    log_row.addWidget(clear_chat_btn)
+    log_row.addWidget(export_chat_btn)
+    log_row.addStretch(1)
+    layout.addLayout(log_row)
     # The working line: what this turn is doing, and how long it
     # has taken. It ticks every second while a turn is busy, and
     # says how long the turn took when it ends.
@@ -1458,9 +2669,40 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     stop_research_btn.setEnabled(False)
     progress_row.addWidget(stop_research_btn)
     layout.addLayout(progress_row)
-    row = QtWidgets.QHBoxLayout()
-    entry = QtWidgets.QLineEdit()
-    entry.setPlaceholderText("Ask for a page, a search, a summary… (try @tab2)")
+
+    class _ChatEntry(QtWidgets.QPlainTextEdit):
+        """The chat entry (G-UX9): multi-line, Enter sends,
+        Shift+Enter adds a line. text()/setText() match the old
+        QLineEdit's call sites."""
+        send_requested = QtCore.Signal()
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setPlaceholderText(
+                "Ask for a page, a search, a summary… (try @tab2)")
+            self.setFixedHeight(64)
+
+        def keyPressEvent(self, event):
+            if event.key() in (QtCore.Qt.Key.Key_Return,
+                               QtCore.Qt.Key.Key_Enter) \
+                    and not (event.modifiers()
+                             & QtCore.Qt.KeyboardModifier.ShiftModifier):
+                self.send_requested.emit()
+                return
+            super().keyPressEvent(event)
+
+        def text(self):
+            return self.toPlainText()
+
+        def setText(self, text):
+            self.setPlainText(text)
+
+    entry = _ChatEntry()
+    entry.setObjectName("chat_entry")
+    layout.addWidget(entry)
+    # G-UX4 (extension): the buttons sit 2x2, not 1x4 — four
+    # buttons in a row pinned the dock's minimum width past 400.
+    button_grid = QtWidgets.QGridLayout()
     send = QtWidgets.QPushButton("Send")
     summarize_btn = QtWidgets.QPushButton("Summarize")
     mic_btn = QtWidgets.QPushButton("🎤 Hold to talk")
@@ -1468,12 +2710,11 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     stop_btn = QtWidgets.QPushButton("Stop")
     stop_btn.setObjectName("stop_button")
     stop_btn.setEnabled(False)
-    row.addWidget(entry)
-    row.addWidget(send)
-    row.addWidget(summarize_btn)
-    row.addWidget(mic_btn)
-    row.addWidget(stop_btn)
-    layout.addLayout(row)
+    button_grid.addWidget(send, 0, 0)
+    button_grid.addWidget(summarize_btn, 0, 1)
+    button_grid.addWidget(mic_btn, 1, 0)
+    button_grid.addWidget(stop_btn, 1, 1)
+    layout.addLayout(button_grid)
     # K11: summary length — a short summary is 2-3 sentences.
     short_row = QtWidgets.QHBoxLayout()
     short_box = QtWidgets.QCheckBox("Short summary")
@@ -1507,7 +2748,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     layout.addLayout(memory_row)
 
     def show_memory_view():
-        from .memory import (forget, forget_page, list_entries, list_pages)
+        from .memory import (_MEMORY_LIMIT, _PAGE_MEMORY_LIMIT,
+                             allow_site_memory, block_site_memory,
+                             clear_site_memory, forget, forget_page,
+                             list_entries, list_pages, list_site_memory)
         dialog = QtWidgets.QDialog(window)
         dialog.setWindowTitle("Memory")
         dialog.setObjectName("memory_dialog")
@@ -1516,6 +2760,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         facts_list.setObjectName("memory_facts")
         pages_list = QtWidgets.QListWidget()
         pages_list.setObjectName("memory_pages")
+        sites_list = QtWidgets.QListWidget()
+        sites_list.setObjectName("memory_sites")
 
         def refresh():
             facts_list.clear()
@@ -1529,17 +2775,108 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                     f"{page['title']}: {page['url']}")
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, page["url"])
                 pages_list.addItem(item)
+            sites_list.clear()
+            sites = list_site_memory()
+            for host in sites.get("blocked", []):
+                item = QtWidgets.QListWidgetItem(
+                    f"Never remembered: {host}")
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, host)
+                sites_list.addItem(item)
+            for host in sites.get("allowed", []):
+                item = QtWidgets.QListWidgetItem(
+                    f"Always remembered: {host}")
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, host)
+                sites_list.addItem(item)
 
         def forget_fact():
             item = facts_list.currentItem()
             if item is not None:
-                forget(item.data(QtCore.Qt.ItemDataRole.UserRole))
-                refresh()
+                # A2: a destructive forget confirms first, default
+                # No (U23).
+                if window._ask_yes_no(
+                        "Forget this fact?",
+                        "Forget this fact?\n\n"
+                        f"{item.text()}\n\nIt cannot be undone."):
+                    try:
+                        forget(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                    except (BrowserError, OSError) as exc:
+                        # B15: the stores raise when the disk write
+                        # fails — the person gets a plain message,
+                        # not a traceback on stderr from a Qt slot.
+                        _log_error(f"Could not forget a fact: {exc}")
+                        window._show_message(
+                            "warning", "Could not forget that",
+                            "That fact is still remembered. The save "
+                            "did not work, so nothing was changed. "
+                            "Try again.")
+                        return
+                    _log_action("Forgot a fact")
+                    refresh()
 
         def remove_page():
             item = pages_list.currentItem()
             if item is not None:
-                forget_page(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                # A2: a destructive remove confirms first, default
+                # No (U23).
+                if window._ask_yes_no(
+                        "Remove this page?",
+                        "Remove this stored page?\n\n"
+                        f"{item.text()}\n\nIt cannot be undone."):
+                    try:
+                        forget_page(
+                            item.data(QtCore.Qt.ItemDataRole.UserRole))
+                    except (BrowserError, OSError) as exc:
+                        # B15: the stores raise when the disk write
+                        # fails — the person gets a plain message,
+                        # not a traceback on stderr from a Qt slot.
+                        _log_error(f"Could not remove a page: {exc}")
+                        window._show_message(
+                            "warning", "Could not remove that page",
+                            "That page is still stored. The save "
+                            "did not work, so nothing was changed. "
+                            "Try again.")
+                        return
+                    _log_action("Removed a stored page")
+                    refresh()
+
+        def block_site():
+            host, ok = QtWidgets.QInputDialog.getText(
+                dialog, "Never remember a site",
+                "Site to never remember (example.org):")
+            if ok and host.strip():
+                try:
+                    blocked = block_site_memory(host.strip())
+                except (BrowserError, OSError) as exc:
+                    # B15: the stores raise when the disk write
+                    # fails — the person gets a plain message,
+                    # not a traceback on stderr from a Qt slot.
+                    _log_error(f"Could not block memory: {exc}")
+                    window._show_message(
+                        "warning", "Could not block that site",
+                        "That site is not blocked yet. The save "
+                        "did not work, so nothing was changed. "
+                        "Try again.")
+                    return
+                if blocked:
+                    _log_action(f"Blocked memory for {blocked}")
+                refresh()
+
+        def unblock_site():
+            item = sites_list.currentItem()
+            if item is not None:
+                try:
+                    clear_site_memory(
+                        item.data(QtCore.Qt.ItemDataRole.UserRole))
+                except (BrowserError, OSError) as exc:
+                    # B15: same guard as block_site.
+                    _log_error(f"Could not remove a site rule: {exc}")
+                    window._show_message(
+                        "warning", "Could not remove that rule",
+                        "That site rule is still there. The save "
+                        "did not work, so nothing was changed. "
+                        "Try again.")
+                    return
+                _log_action("Removed a site memory rule")
                 refresh()
 
         vbox.addWidget(QtWidgets.QLabel("Remembered facts:"))
@@ -1554,17 +2891,56 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         remove_btn.setObjectName("memory_remove_button")
         remove_btn.clicked.connect(remove_page)
         vbox.addWidget(remove_btn)
+        # B15: the caps are disclosed where the data is shown.
+        caps = QtWidgets.QLabel(
+            f"Keeps the newest {_MEMORY_LIMIT} facts and "
+            f"{_PAGE_MEMORY_LIMIT} pages.")
+        caps.setWordWrap(True)
+        vbox.addWidget(caps)
+        # G-UX18: the per-site memory controls, in the window.
+        vbox.addWidget(QtWidgets.QLabel(
+            "Sites with their own memory rule:"))
+        vbox.addWidget(sites_list)
+        site_row = QtWidgets.QHBoxLayout()
+        block_btn = QtWidgets.QPushButton("Never remember a site…")
+        block_btn.setObjectName("memory_block_button")
+        block_btn.clicked.connect(block_site)
+        unblock_btn = QtWidgets.QPushButton("Remove selected rule")
+        unblock_btn.setObjectName("memory_unblock_button")
+        unblock_btn.clicked.connect(unblock_site)
+        site_row.addWidget(block_btn)
+        site_row.addWidget(unblock_btn)
+        site_row.addStretch(1)
+        vbox.addLayout(site_row)
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(dialog.accept)
         vbox.addWidget(close_btn)
         refresh()
-        dialog.resize(560, 480)
+        dialog.resize(560, 560)
         dialog.exec()
 
     memory_btn.clicked.connect(show_memory_view)
     dock.setWidget(panel)
-    dock.setMinimumWidth(320)
+    # G-UX4 (extension): the dock is freely resizable by dragging
+    # its border — the old 320 minimum is now 240, and nothing in
+    # the panel pins the width (buttons and toggles sit 2x2).
+    dock.setMinimumWidth(_CHAT_DOCK_MIN_WIDTH)
     window.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+    window._chat_dock = dock
+    # G-UX4: View → Chat Dock re-shows a closed dock — and tracks
+    # it, so the check follows the X button too.
+    if window._view_menu is not None:
+        chat_action = QtGui.QAction("Chat Dock", window)
+        chat_action.setObjectName("view_chat_dock")
+        chat_action.setCheckable(True)
+        chat_action.setChecked(True)
+        chat_action.triggered.connect(
+            lambda checked: dock.setVisible(checked))
+        dock.visibilityChanged.connect(chat_action.setChecked)
+        window._view_menu.addAction(chat_action)
+    # G-UX4 (extension): the dock comes back at the size it was
+    # left at — restored once the window has shown and laid out.
+    QtCore.QTimer.singleShot(0, window._restore_chat_dock)
 
     state = {"busy": False, "live": False}
     # V2: "waited" is the plan-gate time accumulated this turn
@@ -1613,6 +2989,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # Q1: Stop research is live only while a job runs.
         from .research import research_job_running
         stop_research_btn.setEnabled(research_job_running() is not None)
+        # B6: the live readout ticks with the same timer.
+        window._update_live_stats()
 
     def on_stop_research():
         from .research import cancel_research_job
@@ -1631,24 +3009,64 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # Three seat dropdowns fed by `ollama list`, plus Firefox-style
     # toggles: one master AI kill-switch and one per feature. Picks
     # live in ~/.forge/seats.json and apply at once.
+    # B13: the seats and toggles sit under one collapsible
+    # "Models and AI" header, so the dock is not one long column.
     from .chat import check_ollama, pick_chat_model_with_reason
     from .seats import load_seats, set_feature, set_seat
 
-    seat_row = QtWidgets.QHBoxLayout()
+    models_toggle = QtWidgets.QToolButton()
+    models_toggle.setObjectName("models_toggle")
+    models_toggle.setText("Models and AI")
+    models_toggle.setCheckable(True)
+    models_toggle.setChecked(True)
+    models_toggle.setToolButtonStyle(
+        QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    models_toggle.setArrowType(QtCore.Qt.ArrowType.DownArrow)
+    layout.addWidget(models_toggle)
+    models_box = QtWidgets.QWidget()
+    models_box.setObjectName("models_box")
+    models_layout = QtWidgets.QVBoxLayout(models_box)
+    models_layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(models_box)
+
+    def on_models_toggled(on):
+        models_box.setVisible(on)
+        models_toggle.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if on
+            else QtCore.Qt.ArrowType.RightArrow)
+
+    models_toggle.toggled.connect(on_models_toggled)
+
+    # B8: each seat says what it is for, under its combo.
+    _SEAT_DESCRIPTIONS = {
+        "brain": "Brain: answers questions and drives the browser.",
+        "fast": "Fast: quick jobs, short titles and fast summaries.",
+        "vision": "Vision: reads pictures and describes images.",
+    }
+    seat_grid = QtWidgets.QGridLayout()
     combos = {}
-    for label, key in (("Brain", "brain"), ("Fast", "fast"), ("Vision", "vision")):
-        seat_row.addWidget(QtWidgets.QLabel(label))
+    desc_labels = {}
+    for row, (label, key) in enumerate(
+            (("Brain", "brain"), ("Fast", "fast"), ("Vision", "vision"))):
+        seat_grid.addWidget(QtWidgets.QLabel(label), row * 2, 0)
         combo = QtWidgets.QComboBox()
         combo.setObjectName(f"{key}_combo")
         combos[key] = combo
-        seat_row.addWidget(combo)
+        seat_grid.addWidget(combo, row * 2, 1)
+        desc = QtWidgets.QLabel(_SEAT_DESCRIPTIONS[key])
+        desc.setObjectName(f"{key}_desc")
+        desc.setWordWrap(True)
+        desc_labels[key] = desc
+        seat_grid.addWidget(desc, row * 2 + 1, 0, 1, 2)
     refresh_btn = QtWidgets.QPushButton("↻")
     refresh_btn.setObjectName("refresh_seats")
     refresh_btn.setToolTip("Re-read the models Ollama has installed")
-    seat_row.addWidget(refresh_btn)
-    layout.addLayout(seat_row)
+    seat_grid.addWidget(refresh_btn, 0, 2)
+    models_layout.addLayout(seat_grid)
 
-    toggle_row = QtWidgets.QHBoxLayout()
+    # G-UX4 (extension): the toggles sit 2x2, not 1x4 — four
+    # checkboxes in a row pinned the dock's minimum width.
+    toggle_grid = QtWidgets.QGridLayout()
     ai_toggle = QtWidgets.QCheckBox("AI")
     ai_toggle.setObjectName("ai_toggle")
     # T11: each toggle says what it covers — no guessing.
@@ -1668,14 +3086,17 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     memory_toggle.setToolTip(
         "Remembered facts offered as context, and pages recorded "
         "for later recall.")
-    for box in (ai_toggle, chat_toggle, tidy_toggle, memory_toggle):
-        toggle_row.addWidget(box)
-    layout.addLayout(toggle_row)
+    toggle_grid.addWidget(ai_toggle, 0, 0)
+    toggle_grid.addWidget(chat_toggle, 0, 1)
+    toggle_grid.addWidget(tidy_toggle, 1, 0)
+    toggle_grid.addWidget(memory_toggle, 1, 1)
+    models_layout.addLayout(toggle_grid)
 
     def apply_ai_state():
         """Header + which controls are live, from the seats file
         and whether a brain is answering. Never re-enables the
-        send controls mid-turn."""
+        send controls mid-turn. The entry stays editable mid-turn
+        (G-UX9) — only Send waits for the turn to finish."""
         seats = load_seats()
         ai_on = seats["ai_enabled"]
         chat_on = seats["features"]["chat"]
@@ -1687,15 +3108,25 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                            "to the browser.")
         else:
             header.setText(brain_header_text())
-        chat_ok = ai_on and chat_on and bool(session.model)
+        chat_ok = (ai_on and chat_on and session is not None
+                   and bool(session.model))
         busy = state["busy"]
-        entry.setEnabled(chat_ok and not busy)
+        entry.setEnabled(ai_on and chat_on)
         send.setEnabled(chat_ok and not busy)
         summarize_btn.setEnabled(chat_ok and not busy)
         mic_btn.setEnabled(chat_ok and not busy
                            and not voice_state["transcribing"])
         run_card_btn.setEnabled(chat_ok and not busy
                                 and cards_combo.count() > 0)
+        # G-UX5: the fix buttons show only for the state they fix.
+        brain_state = (session.brain_state if session is not None
+                       else None)
+        start_ollama_btn.setVisible(
+            ai_on and chat_on and brain_state == "ollama-down")
+        start_ollama_btn.setEnabled(True)
+        get_model_btn.setVisible(
+            ai_on and chat_on and brain_state == "no-models")
+        get_model_btn.setEnabled(True)
         ai_toggle.setChecked(ai_on)
         chat_toggle.setChecked(chat_on)
         tidy_toggle.setChecked(seats["features"]["tidy_titles"])
@@ -1703,7 +3134,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         for box in (chat_toggle, tidy_toggle, memory_toggle):
             box.setEnabled(ai_on)
 
-    def fill_seat_combos():
+    seat_sizes = {}  # name -> bytes, from the last seat fill (B7)
+
+    def fill_seat_combos(details=None):
         # Each item carries the model name as its data; the label
         # shows the size (T8) so a 2 GB model reads differently
         # from an 8 GB one. Embed models are not offered as Brain
@@ -1711,9 +3144,15 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # (T5) instead of hiding behind "(auto)", and a saved
         # embed pick shows as an embed model. The Brain combo's
         # (auto) entry names what auto would pick (T12).
-        _reachable, details = check_ollama()
+        # G-P1: details arrive from the background pick — only
+        # the ↻ path calls check_ollama() itself, via
+        # _start_brain_pick(refresh=True), never directly.
+        if details is None:
+            _reachable, details = check_ollama()
         models = [d["name"] for d in details]
         sizes = {d["name"]: d["size"] for d in details}
+        seat_sizes.clear()
+        seat_sizes.update(sizes)
         retrieval_state["models"] = models  # the header's Retrieval line (I1)
         seats = load_seats()
         auto_pick = None
@@ -1734,6 +3173,12 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 if sizes.get(name):
                     display = f"{name} ({_human_size(sizes[name])})"
                 combo.addItem(display, name)
+                # B7: every model carries its one-line blurb as a
+                # tooltip — what it does, its size, its fit.
+                combo.setItemData(
+                    combo.count() - 1,
+                    model_blurb(name, sizes.get(name)),
+                    QtCore.Qt.ItemDataRole.ToolTipRole)
             pick = seats.get(key)
             if pick and pick not in models:
                 combo.addItem(f"{pick} (not installed)", pick)
@@ -1748,12 +3193,41 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             else:
                 combo.setCurrentIndex(0)
             combo.blockSignals(False)
+        _refresh_seat_descriptions()
+
+    def _refresh_seat_descriptions():
+        """B7+B8: under each seat combo, what the seat is for plus
+        the picked model's one-line blurb."""
+        for key, combo in combos.items():
+            picked = combo.currentData()
+            text = _SEAT_DESCRIPTIONS[key]
+            if picked:
+                text += " " + model_blurb(picked,
+                                          seat_sizes.get(picked))
+            desc_labels[key].setText(text)
+
+    def on_brain_ready(picked, details):
+        """G-P1: the background pick landed — wire the session in,
+        fill the seats, prove the model answers."""
+        nonlocal session
+        session = picked
+        window._chat_session = picked  # tab titles tidy against this brain
+        brain_health["checked"] = False
+        brain_health["answers"] = None
+        fill_seat_combos(details)
+        apply_ai_state()
+        _check_brain_in_background()
+
+    signals.brain_ready.connect(on_brain_ready)
 
     def on_seat_changed(key):
         def handler():
             picked = combos[key].currentData()
             set_seat(key, picked)
+            _refresh_seat_descriptions()
             if key == "brain":
+                if session is None:
+                    return
                 session.repick()
                 brain_health["checked"] = False
                 brain_health["answers"] = None
@@ -1780,18 +3254,15 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # that appeared since launch (Ollama just started) is picked
         # up — the header's own "then ↻" instruction works. Then the
         # answer-check proves the picked model answers (G7).
-        fill_seat_combos()
+        # G-P1: the re-read runs off the GUI thread, like the
+        # launch pick — a down Ollama used to freeze the window.
         fill_cards_combo()
-        session.repick()
-        brain_health["checked"] = False
-        brain_health["answers"] = None
-        apply_ai_state()
-        _check_brain_in_background()
+        _start_brain_pick(refresh=True)
 
     def on_brain_checked(answers, model):
         # Only the current model's result counts — a re-pick since
         # the check started makes it stale.
-        if model != session.model:
+        if session is None or model != session.model:
             return
         brain_health["checked"] = True
         brain_health["answers"] = answers
@@ -1803,7 +3274,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # T7: the kill-switch kills the CURRENT turn too, not just
         # the next one — flipping AI off mid-turn stops the brain.
         set_feature("ai", on)
-        if not on:
+        if not on and session is not None:
             session.cancel()
         apply_ai_state()
 
@@ -1816,10 +3287,106 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         lambda on: (set_feature("tidy_titles", on), apply_ai_state()))
     memory_toggle.toggled.connect(
         lambda on: (set_feature("memory", on), apply_ai_state()))
-    fill_seat_combos()
     fill_cards_combo()
     apply_ai_state()
-    _check_brain_in_background()
+    # G-P1: the brain pick starts in the background — the window
+    # is already painted by the time it lands.
+    _start_brain_pick()
+
+    # --- G-UX5: fix the no-brain states from the dock ------------
+    def on_start_ollama():
+        """Start Ollama in the background, then re-pick the brain."""
+        import shutil
+        import subprocess
+        if shutil.which("ollama") is None:
+            append("Forge Browser",
+                   "Ollama is not installed. Use the Forge Browser "
+                   "installer to add it.")
+            return
+        start_ollama_btn.setEnabled(False)
+        status_label.setText("Starting Ollama…")
+
+        def work_start():
+            try:
+                subprocess.Popen(
+                    ["ollama", "serve"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+            except Exception as exc:
+                signals.notice.emit(f"Could not start Ollama: {exc}")
+                return
+            time.sleep(3)
+            signals.brain_fix_done.emit()
+
+        threading.Thread(target=work_start, daemon=True).start()
+
+    def on_get_model():
+        """Pull a small chat model in the background, then re-pick."""
+        import subprocess
+        get_model_btn.setEnabled(False)
+        status_label.setText(
+            "Getting a chat model… this downloads about 1.4 GB.")
+
+        def work_pull():
+            try:
+                proc = subprocess.run(
+                    ["ollama", "pull", _SMALL_CHAT_MODEL],
+                    capture_output=True, text=True, timeout=1800)
+            except Exception as exc:
+                signals.notice.emit(
+                    f"Could not get a chat model: {exc}")
+                return
+            if proc.returncode == 0:
+                signals.brain_fix_done.emit()
+            else:
+                signals.notice.emit(
+                    "Could not get a chat model. Check the connection "
+                    "and try again.")
+
+        threading.Thread(target=work_pull, daemon=True).start()
+
+    start_ollama_btn.clicked.connect(on_start_ollama)
+    get_model_btn.clicked.connect(on_get_model)
+    signals.brain_fix_done.connect(on_refresh)
+
+    # --- G-UX9: the chat log persists across restarts -------------
+    def _save_chat_log():
+        save_chat_history(log.toPlainText())
+
+    def _load_chat_log():
+        saved = load_chat_history()
+        if saved:
+            log.setPlainText(saved)
+
+    def on_clear_chat():
+        log.clear()
+        try:
+            os.unlink(chat_history_path())
+        except OSError:
+            pass
+        _log_action("Cleared the chat log")
+
+    def on_export_chat():
+        path, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            window, "Export chat", "forge-browser-chat.txt",
+            "Text files (*.txt)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(log.toPlainText())
+        except OSError as exc:
+            window._show_message(
+                "warning", "Export chat",
+                f"Could not write the export: {exc}")
+            return
+        _log_action("Exported the chat log")
+        window.statusBar().showMessage(
+            f"Chat exported to {path}", 5000)
+
+    clear_chat_btn.clicked.connect(on_clear_chat)
+    export_chat_btn.clicked.connect(on_export_chat)
+    _load_chat_log()
 
     # F4: after an update, one line in the log saying what changed.
     from .whatsnew import check_whats_new
@@ -1843,6 +3410,11 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 done += f" {turn['retrieve_note']}"
             status_label.setText(done)
             turn["started"] = None
+        # B6: the turn count feeds the live readout. G-UX9: the
+        # chat log persists at the end of every turn.
+        window._turn_count = getattr(window, "_turn_count", 0) + 1
+        _save_chat_log()
+        window._update_live_stats()
         apply_ai_state()
         entry.setFocus()
 
@@ -1893,6 +3465,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             cursor.insertText(" …(cut off)")
         state["live"] = False
+        _log_error(f"Chat turn failed: {text}")
         append("Forge Browser", f"⚠ {text}")
         finish("failed")
 
@@ -1916,9 +3489,11 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     def on_compare_refresh(view, html):
         # M11: the refreshed table goes back into the same tab.
+        # G-S4: its links get rel="noopener", as in new_tab.
+        from .webui import _with_noopener
         window._refreshing_views.discard(id(view))
         if view is not None and window.tabs.indexOf(view) >= 0:
-            view.setHtml(html)
+            view.setHtml(_with_noopener(html))
 
     window.compare_refresh_done.connect(on_compare_refresh)
 
@@ -1928,9 +3503,12 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             progress_label.setText("Research failed.")
             return
         from .research import report_to_html
+        from .webui import _with_noopener
         # Q2: the report opens behind the current tab — a background
         # job's completion does not yank the person from their page.
-        window.new_tab(html=report_to_html(report), background=True)
+        # G-S4: report links carry rel="noopener".
+        window.new_tab(html=_with_noopener(report_to_html(report)),
+                       background=True)
         append("Forge Browser",
                "Research done. The report opened in a new tab behind this one.")
         progress_label.setText("Research done.")
@@ -1958,48 +3536,57 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             status_label.setText(
                 status_text("waiting for approval", turn["started"]))
         append("Forge Browser", f"Plan: {plan_text}")
-        dialog = QtWidgets.QMessageBox(window)
-        dialog.setWindowTitle("Approve this step?")
-        dialog.setText(f"The browser wants to:\n\n{plan_text}\n\nAllow it?")
-        dialog.setStandardButtons(
-            QtWidgets.QMessageBox.StandardButton.Yes |
-            QtWidgets.QMessageBox.StandardButton.No)
-        dialog.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
-        # P5: a cheap kind can be always-allowed from the dialog, so
-        # the same step stops asking every turn.
-        always_box = None
-        from .seats import ALWAYS_ALLOWABLE_KINDS
-        if state.get("kind") in ALWAYS_ALLOWABLE_KINDS:
-            always_box = QtWidgets.QCheckBox(
-                f"Always allow {state['kind']}")
-            dialog.setCheckBox(always_box)
-        timed_out = {"value": False}
 
-        def on_timeout():
-            # P2: a missed dialog cannot hang the turn forever —
-            # after 5 minutes the plan is denied, not left waiting.
-            timed_out["value"] = True
-            dialog.done(QtWidgets.QMessageBox.StandardButton.No)
+        def make():
+            dialog = QtWidgets.QMessageBox(window)
+            dialog.setWindowTitle("Approve this step?")
+            dialog.setText(f"The browser wants to:\n\n{plan_text}\n\nAllow it?")
+            dialog.setStandardButtons(
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No)
+            dialog.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
+            # P5: a cheap kind can be always-allowed from the dialog, so
+            # the same step stops asking every turn.
+            always_box = None
+            from .seats import ALWAYS_ALLOWABLE_KINDS
+            if state.get("kind") in ALWAYS_ALLOWABLE_KINDS:
+                always_box = QtWidgets.QCheckBox(
+                    f"Always allow {state['kind']}")
+                dialog.setCheckBox(always_box)
+            timed_out = {"value": False}
 
-        timer = QtCore.QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(on_timeout)
-        timer.start(PLAN_TIMEOUT_SECONDS * 1000)
-        answer = dialog.exec()
-        timer.stop()
-        state["approved"] = (
-            answer == QtWidgets.QMessageBox.StandardButton.Yes)
-        if timed_out["value"]:
-            append("Forge Browser",
-                   "Plan timed out after 5 minutes. Treated as no.")
-        elif (state["approved"] and always_box is not None
-                and always_box.isChecked()):
-            from .seats import set_always_allow
-            set_always_allow(state["kind"], True)
-        state["event"].set()
-        # The turn resumes with the worker — the next on_step names
-        # the real step; until then the line says thinking.
-        turn["step"] = "thinking"
+            def on_timeout():
+                # P2: a missed dialog cannot hang the turn forever —
+                # after 5 minutes the plan is denied, not left waiting.
+                timed_out["value"] = True
+                dialog.done(QtWidgets.QMessageBox.StandardButton.No)
+
+            timer = QtCore.QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(on_timeout)
+            timer.start(PLAN_TIMEOUT_SECONDS * 1000)
+            answer = dialog.exec()
+            timer.stop()
+            state["approved"] = (
+                answer == QtWidgets.QMessageBox.StandardButton.Yes)
+            if timed_out["value"]:
+                append("Forge Browser",
+                       "Plan timed out after 5 minutes. Treated as no.")
+            elif (state["approved"] and always_box is not None
+                    and always_box.isChecked()):
+                from .seats import set_always_allow
+                set_always_allow(state["kind"], True)
+            state["event"].set()
+            # The turn resumes with the worker — the next on_step names
+            # the real step; until then the line says thinking.
+            turn["step"] = "thinking"
+
+        # B3: the plan dialog goes through the one-dialog queue —
+        # if another dialog is up, it waits its turn instead of
+        # stacking (the worker's 5-minute backstop still bounds
+        # the wait, and the queued dialog sets the event when the
+        # person answers it).
+        window._run_dialog(make)
 
     signals.plan.connect(on_plan)
 
@@ -2023,7 +3610,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         turn["wait_started"] = None
         return state["approved"]
 
-    stop_btn.clicked.connect(lambda: session.cancel())
+    stop_btn.clicked.connect(
+        lambda: session is not None and session.cancel())
 
     def on_voice_text(text):
         # Transcribed speech lands in the entry for review — the
@@ -2044,8 +3632,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         voice_state["transcribing"] = False
         apply_ai_state()
         if reason == "no-transcriber":
-            message = ("⚠ No transcriber is installed. Install whisper "
-                       "or set FORGE_TRANSCRIBE_CMD.")
+            # G-UX19: point at the GUI installer, not a terminal
+            # command or an env var.
+            message = ("⚠ No transcriber is installed. Use the Forge "
+                       "Browser installer to add voice support.")
         elif reason == "failed":
             message = ("⚠ Transcription failed. The transcriber "
                        "errored on that recording.")
@@ -2194,9 +3784,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         session._retrieve_notice_shown = True
         if reason == "model-missing":
+            # G-UX19: point at the GUI installer, not install.sh.
             signals.notice.emit(
                 "Retrieval is off: nomic-embed-text is not installed. "
-                "Run install.sh to pull it")
+                "Use the Forge Browser installer to add it")
         elif reason == "ollama-down":
             signals.notice.emit(
                 "Ollama is not running. Start Ollama to search long pages")
@@ -2328,7 +3919,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         summarize_btn.setEnabled(False)
         run_card_btn.setEnabled(False)
         stop_btn.setEnabled(True)
-        entry.setEnabled(False)
+        # G-UX9: the entry stays editable while a card runs — only
+        # Send waits for the turn to finish.
         # Clear any earlier stop, or this card ends at once.
         session._stop_requested = False
         question = entry.text().strip()
@@ -2364,7 +3956,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # K1: the Stop button works during a summarize — a long
         # one is no longer unstoppable.
         stop_btn.setEnabled(True)
-        entry.setEnabled(False)
+        # G-UX9: the entry stays editable while a summary runs.
         # Clear any earlier stop, or this summarize ends at once.
         session._stop_requested = False
         # K8: the button follows @tab — summarize the named tab
@@ -2410,15 +4002,25 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         send.setEnabled(False)
         summarize_btn.setEnabled(False)
         stop_btn.setEnabled(True)
-        entry.setEnabled(False)
+        # G-UX9: the entry stays editable while a turn runs.
         entry.clear()
         append("You", text)
+        _log_action("Sent a chat message")
         # J4: the current tab's text is always needed; the rest
         # only when the message names tabs or asks to compare.
         read_all = needs_all_tab_text(text)
         count = window.tabs.count()
         current = window.tabs.currentIndex()
-        texts = [None] * count
+        # G-C21: collected text is keyed by view identity, not by
+        # position — a tab closed or reordered during the 5 s
+        # window used to pair text with the wrong tab.
+        views = [window.tabs.widget(i) for i in range(count)]
+        current_view = (views[current]
+                        if 0 <= current < count else None)
+        queried = [view for view in views
+                   if view is not None
+                   and (view is current_view or read_all)]
+        texts = {}
         started = {"done": False}
 
         def start_work():
@@ -2428,41 +4030,34 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             turn["step"] = "thinking"
             status_label.setText(
                 turn_status_text("thinking", turn["started"]))
-            tabs = []
-            for i in range(count):
-                view = window.tabs.widget(i)
-                tabs.append({"title": view.title() if view is not None else "",
-                             "url": view.url().toString() if view is not None else "",
-                             "text": texts[i] or "",
-                             "current": i == current,
-                             "agent": (view is not None and
-                                       id(view) in window._agent_tab_ids)})
-            page_text = texts[current] if 0 <= current < count else None
-            page_url = tabs[current]["url"] if 0 <= current < count else None
+            live_views = [window.tabs.widget(i)
+                          for i in range(window.tabs.count())]
+            tabs = send_tabs_payload(live_views, texts, current_view,
+                                     window._agent_tab_ids)
+            page_text = (texts.get(id(current_view), "")
+                         if current_view is not None else None)
+            page_url = (current_view.url().toString()
+                        if current_view is not None else None)
             threading.Thread(target=work, args=(text, page_text, tabs, page_url),
                              daemon=True).start()
 
-        def collect(i, page_text):
-            texts[i] = page_text or ""
-            if all(t is not None for t in texts):
+        def collect(view, page_text):
+            texts[id(view)] = page_text or ""
+            if len(texts) == len(queried):
                 start_work()
 
-        if count == 0:
+        if not queried:
             start_work()
             return
-        for i in range(count):
-            view = window.tabs.widget(i)
-            if view is not None and (i == current or read_all):
-                view.page().runJavaScript(
-                    "document.body ? document.body.innerText : ''",
-                    lambda page_text, i=i: collect(i, page_text))
-            else:
-                collect(i, "")
+        for view in queried:
+            view.page().runJavaScript(
+                "document.body ? document.body.innerText : ''",
+                lambda page_text, v=view: collect(v, page_text))
         # A tab that never answers must not hang the send.
         QtCore.QTimer.singleShot(5000, start_work)
 
     send.clicked.connect(do_send)
-    entry.returnPressed.connect(do_send)
+    entry.send_requested.connect(do_send)
     summarize_btn.clicked.connect(do_summarize)
     run_card_btn.clicked.connect(do_card)
     mic_btn.pressed.connect(on_mic_pressed)
@@ -2483,7 +4078,7 @@ def open_settings_dialog(parent, on_applied=None):
     restarts; everything else applies at once."""
     (QtCore, QtGui, QtWidgets, QWebEnginePage, QWebEngineProfile,
      QWebEngineView, QWebEngineDownloadRequest) = _load_qt()
-    from .chat import list_models
+    from .chat import check_ollama
     from .files import download_dir
     from .seats import set_feature, set_seat, load_seats
     from .settings import get_setting, set_setting
@@ -2493,32 +4088,125 @@ def open_settings_dialog(parent, on_applied=None):
     dialog.setWindowTitle("Settings")
     dialog.setMinimumSize(480, 420)
     layout = QtWidgets.QVBoxLayout(dialog)
-    models = list_models()
-    seat_choices = ["(auto)"] + models
     seats = load_seats()
+    # G-P1: the model list arrives from a background thread — the
+    # old list_models() call blocked the dialog from appearing
+    # for up to 5 s with Ollama down. Combos start with "(auto)"
+    # only and fill in when the list lands.
+    model_sizes = {}
+    combos = {}
+    desc_labels = {}
+
+    # B8: each seat says what it is for, under its combo.
+    _SEAT_DESCRIPTIONS = {
+        "brain": "Brain: answers questions and drives the browser.",
+        "fast": "Fast: quick jobs, short titles and fast summaries.",
+        "vision": "Vision: reads pictures and describes images.",
+    }
 
     def seat_row(label, key, object_name):
         row = QtWidgets.QHBoxLayout()
         row.addWidget(QtWidgets.QLabel(label))
         combo = QtWidgets.QComboBox()
         combo.setObjectName(object_name)
-        combo.addItems(seat_choices)
+        combo.addItem("(auto)", None)
         saved = seats.get(key)
-        combo.setCurrentText(saved if saved in seat_choices else "(auto)")
+        if saved:
+            combo.addItem(saved, saved)
+            combo.setCurrentIndex(1)
         row.addWidget(combo, 1)
         layout.addLayout(row)
+        desc = QtWidgets.QLabel(_SEAT_DESCRIPTIONS[key])
+        desc.setWordWrap(True)
+        layout.addWidget(desc)
+        combos[key] = combo
+        desc_labels[key] = desc
         return combo
+
+    def refresh_seat_descriptions():
+        # B7: under each combo, the seat's purpose plus the picked
+        # model's one-line blurb (what it does, its size, its fit).
+        for key, combo in combos.items():
+            picked = combo.currentData()
+            text = _SEAT_DESCRIPTIONS[key]
+            if picked:
+                text += " " + model_blurb(picked,
+                                          model_sizes.get(picked))
+            desc_labels[key].setText(text)
 
     brain_combo = seat_row("Brain model:", "brain", "settings_brain")
     fast_combo = seat_row("Fast model:", "fast", "settings_fast")
     vision_combo = seat_row("Vision model:", "vision", "settings_vision")
+    for combo in combos.values():
+        combo.currentIndexChanged.connect(
+            lambda *a: refresh_seat_descriptions())
+
+    class _SettingsSignals(QtCore.QObject):
+        models_ready = QtCore.Signal(object)  # check_ollama details
+
+    settings_signals = _SettingsSignals(dialog)
+
+    def on_models_ready(details):
+        # Fill the combos with names + sizes, keeping the saved
+        # pick selected (or "(auto)").
+        model_sizes.clear()
+        for item in details:
+            model_sizes[item["name"]] = item["size"]
+        for key, combo in combos.items():
+            saved = seats.get(key)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(auto)", None)
+            for item in details:
+                name = item["name"]
+                if key in ("brain", "fast") and "embed" in name.lower():
+                    continue
+                display = name
+                if item["size"]:
+                    display = f"{name} ({_human_size(item['size'])})"
+                combo.addItem(display, name)
+                combo.setItemData(
+                    combo.count() - 1,
+                    model_blurb(name, item["size"]),
+                    QtCore.Qt.ItemDataRole.ToolTipRole)
+            if saved and saved not in [d["name"] for d in details]:
+                combo.addItem(f"{saved} (not installed)", saved)
+                combo.setCurrentIndex(combo.count() - 1)
+            elif saved:
+                index = combo.findData(saved)
+                combo.setCurrentIndex(index if index >= 0 else 0)
+            else:
+                combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        refresh_seat_descriptions()
+
+    settings_signals.models_ready.connect(on_models_ready)
+
+    def work_models():
+        try:
+            _reachable, details = check_ollama()
+        except Exception:
+            details = []
+        try:
+            settings_signals.models_ready.emit(details)
+        except RuntimeError:
+            pass  # the dialog closed before the list landed
+
+    threading.Thread(target=work_models, daemon=True).start()
 
     feature_boxes = {}
     for key, label in (("ai", "Use the AI (chat, tidy titles, brief)"),
-                       ("chat", "Show the chat dock"),
+                       # G-UX4: the label says what the toggle
+                       # actually toggles — the chat brain and its
+                       # jobs, not the dock's visibility.
+                       ("chat", "Chat and brain jobs"),
                        ("tidy_titles", "Tidy up long tab titles"),
                        ("memory", "Remember facts and pages")):
         box = QtWidgets.QCheckBox(label)
+        if key == "chat":
+            box.setToolTip(
+                "The chat brain, and every brain job: summarize, the "
+                "morning brief, compare, and research.")
         if key == "ai":
             box.setChecked(seats["ai_enabled"])
         else:
@@ -2542,13 +4230,29 @@ def open_settings_dialog(parent, on_applied=None):
     download_row.addWidget(browse_btn)
     layout.addLayout(download_row)
 
+    # B11: the service addresses live behind an Advanced section —
+    # settings that rarely change do not sit in the main list.
+    # (The link-preview dwell control is gone entirely: the 600 ms
+    # default stands, and the setting still reads if one was saved.)
+    advanced_btn = QtWidgets.QPushButton("Advanced…")
+    advanced_btn.setObjectName("settings_advanced")
+    advanced_btn.setCheckable(True)
+    layout.addWidget(advanced_btn)
+    advanced_box = QtWidgets.QWidget()
+    advanced_box.setObjectName("settings_advanced_box")
+    advanced_box.setVisible(False)
+    advanced_layout = QtWidgets.QVBoxLayout(advanced_box)
+    advanced_layout.setContentsMargins(0, 0, 0, 0)
+    layout.addWidget(advanced_box)
+    advanced_btn.toggled.connect(advanced_box.setVisible)
+
     ollama_row = QtWidgets.QHBoxLayout()
     ollama_row.addWidget(QtWidgets.QLabel("Ollama address:"))
     ollama_entry = QtWidgets.QLineEdit()
     ollama_entry.setObjectName("settings_ollama_url")
     ollama_entry.setText(get_setting("ollama_url") or OLLAMA_URL)
     ollama_row.addWidget(ollama_entry, 1)
-    layout.addLayout(ollama_row)
+    advanced_layout.addLayout(ollama_row)
 
     searxng_row = QtWidgets.QHBoxLayout()
     searxng_row.addWidget(QtWidgets.QLabel("SearXNG address:"))
@@ -2557,29 +4261,21 @@ def open_settings_dialog(parent, on_applied=None):
     searxng_entry.setText(get_setting("searxng_url") or "")
     searxng_entry.setPlaceholderText("Leave empty for DuckDuckGo / Bing")
     searxng_row.addWidget(searxng_entry, 1)
-    layout.addLayout(searxng_row)
-
-    # L9: how long to rest on a link before its preview fetches.
-    dwell_row = QtWidgets.QHBoxLayout()
-    dwell_row.addWidget(QtWidgets.QLabel("Link preview dwell (ms):"))
-    dwell_spin = QtWidgets.QSpinBox()
-    dwell_spin.setObjectName("settings_preview_dwell_ms")
-    dwell_spin.setRange(100, 5000)
-    dwell_spin.setSingleStep(100)
-    dwell_spin.setSuffix(" ms")
-    try:
-        dwell_spin.setValue(int(get_setting("preview_dwell_ms") or "600"))
-    except ValueError:
-        dwell_spin.setValue(600)
-    dwell_row.addWidget(dwell_spin)
-    dwell_row.addStretch(1)
-    layout.addLayout(dwell_row)
+    advanced_layout.addLayout(searxng_row)
 
     note = QtWidgets.QLabel(
         "The Ollama and SearXNG addresses take effect when the browser "
         "restarts.")
     note.setWordWrap(True)
-    layout.addWidget(note)
+    advanced_layout.addWidget(note)
+
+    # G-S3: address problems show here, in the dialog — no second
+    # dialog stacked on Settings for a typo.
+    error_label = QtWidgets.QLabel("")
+    error_label.setObjectName("settings_error")
+    error_label.setWordWrap(True)
+    error_label.setStyleSheet("color: #ff8a7a;")
+    layout.addWidget(error_label)
 
     buttons = QtWidgets.QHBoxLayout()
     save_btn = QtWidgets.QPushButton("Save")
@@ -2590,16 +4286,37 @@ def open_settings_dialog(parent, on_applied=None):
     layout.addLayout(buttons)
 
     def save():
+        # G-S3: the addresses are validated at save time. A remote
+        # host needs an explicit yes — it sends prompts, page text,
+        # and memory off this machine.
+        for label, entry in (("Ollama", ollama_entry),
+                             ("SearXNG", searxng_entry)):
+            text = entry.text().strip()
+            ok, remote, problem = validate_service_url(text)
+            if not ok:
+                error_label.setText(f"{label} address: {problem}")
+                return
+            if remote:
+                host = urllib.parse.urlparse(text).hostname or text
+                answer = QtWidgets.QMessageBox.question(
+                    dialog, f"{label} address is not on this machine",
+                    f"The {label} address points at {host}, not this "
+                    "machine.\n\nPrompts, page text, and remembered "
+                    "facts would go to that machine.\n\nSave it anyway?",
+                    QtWidgets.QMessageBox.StandardButton.Yes |
+                    QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No)
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
         for key, combo in (("brain", brain_combo), ("fast", fast_combo),
                            ("vision", vision_combo)):
-            text = combo.currentText()
-            set_seat(key, None if text == "(auto)" else text)
+            picked = combo.currentData()
+            set_seat(key, picked)
         for key, box in feature_boxes.items():
             set_feature(key, box.isChecked())
         set_setting("download_dir", download_entry.text().strip())
         set_setting("ollama_url", ollama_entry.text().strip())
         set_setting("searxng_url", searxng_entry.text().strip())
-        set_setting("preview_dwell_ms", str(dwell_spin.value()))
         if on_applied is not None:
             on_applied()
         dialog.accept()

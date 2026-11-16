@@ -56,7 +56,7 @@ Nothing in v0.2–v0.8 has been verified on his real PC: 237 items `[~]`,
       code-read only so far), installer end-to-end on a fresh Mint box,
       `.desktop` in a real file manager, a real Ollama chat turn
       (sandbox used a stubbed brain only), `install.sh` end to end
-      (~930 MB of downloads, never run here).
+      (~930 MB of downloads, ≈1.2 GB with Ollama present, never run here).
 
 ## D. Kitesurf live build (audit Top 4) — BLOCKED, his PC
 

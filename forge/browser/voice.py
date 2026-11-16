@@ -133,7 +133,15 @@ class Recorder:
             self._proc.wait(timeout=5)
         self._proc = None
         self.started = None
-        if self.path and os.path.getsize(self.path) > 44:
+        # G-C16: the recording file may already be gone (a recorder
+        # that cleans up after itself, or a deleted temp file) —
+        # a missing file means nothing usable was recorded, not a
+        # crash in stop().
+        try:
+            size = os.path.getsize(self.path) if self.path else 0
+        except OSError:
+            size = 0
+        if size > 44:
             # A WAV header alone is 44 bytes; more means real audio.
             return self.path
         if self.path:

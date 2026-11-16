@@ -29,19 +29,41 @@ def settings_path():
                         "browser-settings.json")
 
 
+# G-P18: settings are re-read from disk on every call (per
+# search, per chat turn) — cache the parsed values, keyed on the
+# file's mtime + size, so a changed file is re-read at once.
+# Callers get a copy: save_settings merges into the loaded dict,
+# and must never edit the cached one.
+_settings_cache = {"path": None, "key": None, "data": None}
+
+
 def load_settings():
     """The stored settings over the defaults. Unknown keys are kept
     (a newer version may have written them)."""
+    path = settings_path()
+    try:
+        stat = os.stat(path)
+        key = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = None
+    if (key is not None and _settings_cache["path"] == path
+            and _settings_cache["key"] == key
+            and _settings_cache["data"] is not None):
+        return dict(_settings_cache["data"])
     values = dict(DEFAULTS)
     try:
-        with open(settings_path(), encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             stored = json.load(handle)
     except (OSError, ValueError):
+        _settings_cache.update({"path": path, "key": key,
+                                "data": dict(values)})
         return values
     if isinstance(stored, dict):
-        for key, value in stored.items():
+        for stored_key, value in stored.items():
             if isinstance(value, str):
-                values[key] = value
+                values[stored_key] = value
+    _settings_cache.update({"path": path, "key": key,
+                            "data": dict(values)})
     return values
 
 
@@ -57,6 +79,7 @@ def save_settings(values):
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(merged, handle, indent=2)
     os.replace(tmp, path)
+    _settings_cache.update({"path": None, "key": None, "data": None})
     return merged
 
 

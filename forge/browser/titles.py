@@ -11,6 +11,7 @@ there: fast, no model call on every new tab) and by journey —
 runs of visits split by quiet gaps, resumable from the start page.
 """
 
+import atexit
 import json
 import os
 import queue
@@ -20,13 +21,19 @@ import time
 import zlib
 from urllib.parse import urlparse
 
-from .memory import is_sensitive_url
+from .memory import _write_json_atomic, is_sensitive_text, is_sensitive_url
+from .retrieve import _cosine
 
 TIDY_WORDS = 5
 GROUP_SIMILARITY = 0.75
-_HISTORY_LIMIT = 200
+HISTORY_LIMIT = 200
+_HISTORY_LIMIT = HISTORY_LIMIT
 TIDY_CACHE_LIMIT = 200  # N5: the tidy cache holds this many URLs, FIFO
 JOURNEY_GAP_SECONDS = 30 * 60  # N2: a new journey after 30 quiet minutes
+# G-P21: history saves coalesce like page-memory saves (memory.py)
+# — rapid loadFinished events share one disk write; any read
+# flushes first.
+_HISTORY_SAVE_DELAY = 2.0
 # N12: tab-bar colors, one per group — light enough to read on dark.
 GROUP_COLORS = ("#ffb347", "#7fae7a", "#6ea8d8",
                 "#d87fd0", "#d8c56e", "#7fd0c5")
@@ -108,7 +115,10 @@ class TidyWorker:
             if key not in self._queued:
                 self._queued.add(key)
                 self._queue.put(key)
-            if self._thread is None:
+            # G-C13: a dead worker is restarted — the old check
+            # only started the thread when it was None, so one
+            # failure in _run killed tidying for the session.
+            if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._run,
                                                 daemon=True)
                 self._thread.start()
@@ -128,7 +138,13 @@ class TidyWorker:
                 tidy = self._tidy_fn(url, raw)
             except Exception:
                 continue
-            self._on_done(view, url, tidy)
+            # G-C13: the callback sits inside the try now — one
+            # exception there used to kill the worker thread, and
+            # no tab was ever tidied again.
+            try:
+                self._on_done(view, url, tidy)
+            except Exception:
+                continue
 
 
 def _domain(item):
@@ -143,13 +159,7 @@ def _centroid(vectors):
     return [sum(v[i] for v in vectors) / n for i in range(len(vectors[0]))]
 
 
-def _cosine(a, b):
-    dot = sum(x * y for x, y in zip(a, b))
-    na = sum(x * x for x in a) ** 0.5
-    nb = sum(y * y for y in b) ** 0.5
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+# _cosine lives in retrieve.py (G-C33) and is imported above.
 
 
 def _group_topic_name(items):
@@ -201,18 +211,24 @@ def group_items(items, embed_fn=None):
         except Exception:
             vectors = None
         if vectors and len(vectors) == len(indexed):
-            groups = []  # each: {"items": [(index, item)], "vectors"}
+            # G-P22: each group keeps a running vector sum + count,
+            # so the centroid is a division, not a rebuild from
+            # scratch for every item x group pair (O(n^2*d)).
+            groups = []  # each: {"items": [...], "sum": [...], "n": int}
             for (index, item), vector in zip(indexed, vectors):
                 placed = False
                 for group in groups:
-                    if _cosine(vector, _centroid(group["vectors"])) >= GROUP_SIMILARITY:
+                    centroid = [s / group["n"] for s in group["sum"]]
+                    if _cosine(vector, centroid) >= GROUP_SIMILARITY:
                         group["items"].append((index, item))
-                        group["vectors"].append(vector)
+                        group["sum"] = [s + v for s, v in
+                                        zip(group["sum"], vector)]
+                        group["n"] += 1
                         placed = True
                         break
                 if not placed:
                     groups.append({"items": [(index, item)],
-                                   "vectors": [vector]})
+                                   "sum": list(vector), "n": 1})
             return [{"name": _group_topic_name(
                         [item for _i, item in group["items"]]),
                      "items": [item for _i, item in
@@ -291,21 +307,78 @@ def history_path():
     return os.path.join(os.path.expanduser("~"), ".forge", "history.json")
 
 
-def _save_history(entries):
+def _save_history(entries, path=None):
     """Atomic history write (N10): temp file + rename, so a crash
-    mid-write never leaves a half-written history file."""
-    path = history_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(entries, handle)
-    os.replace(tmp, path)
+    mid-write never leaves a half-written history file. 0600 in a
+    0700 folder (G-S7), like the vault. path is the store file to
+    write — _flush_history passes the pending path, so a flush
+    never lands in a different home's file when the home moved
+    between the visit and the flush (G-P21)."""
+    _write_json_atomic(path or history_path(), entries)
+
+
+# G-P21: pending history saves, per store path — record_visit
+# records the new list here and a timer writes it a moment
+# later, so rapid page loads share one disk write instead of
+# rewriting all 200 entries per loadFinished. Any read flushes
+# first (see load_history). Same shape as memory.py's page
+# coalescing.
+_history_pending = {}  # path -> {"entries": [...], "timer": Timer|None}
+_history_lock = threading.RLock()
+
+
+def _flush_history(path):
+    """Write one path's pending history now. Skips the write when
+    the folder is gone (a test's temp dir cleaned up before the
+    timer fired) instead of recreating it."""
+    with _history_lock:
+        pending = _history_pending.pop(path, None)
+        if pending is None:
+            return
+        if not os.path.isdir(os.path.dirname(os.path.abspath(path))):
+            return
+        try:
+            _save_history(pending["entries"], path=path)
+        except OSError:
+            pass
+
+
+def _flush_all_history():
+    """Write every pending history list (clean exit)."""
+    with _history_lock:
+        paths = list(_history_pending)
+    for path in paths:
+        _flush_history(path)
+
+
+atexit.register(_flush_all_history)
+
+
+def flush_history():
+    """Write any pending history saves now (tests and shutdown
+    paths that need the file on disk at once)."""
+    _flush_all_history()
+
+
+def _load_history_merged():
+    """History from disk plus any pending save, without flushing —
+    record_visit's view of the store, so a burst of loads does
+    not pay a full write per visit."""
+    with _history_lock:
+        pending = _history_pending.get(history_path())
+        if pending is not None:
+            return [dict(e) for e in pending["entries"]]
+    return load_history()
 
 
 def record_visit(url, title):
     """Append a visit (deduped by URL, newest first). Never raises —
     history is a convenience, not a promise. Sensitive URLs (bank,
-    health, login — memory.py's patterns, N3) are never recorded."""
+    health, login — memory.py's patterns, N3) are never recorded,
+    nor are pages whose title reads like an account/checkout page
+    (G-S2). The disk write is coalesced (G-P21): the visit is
+    kept at once and the file written a moment later, or on the
+    next read."""
     url = (url or "").strip()
     if not url.startswith(("http://", "https://")):
         return  # about:blank, data:, and other non-web pages are not history
@@ -313,28 +386,49 @@ def record_visit(url, title):
         return
     if is_sensitive_url(url):
         return
+    if is_sensitive_text(title):
+        return
     try:
-        entries = load_history()
-        entries = [e for e in entries if e.get("url") != url]
-        entries.insert(0, {"url": url, "title": (title or url).strip(),
-                           "at": time.time()})
-        entries = entries[:_HISTORY_LIMIT]
-        _save_history(entries)
+        with _history_lock:
+            entries = _load_history_merged()
+            entries = [e for e in entries if e.get("url") != url]
+            entries.insert(0, {"url": url, "title": (title or url).strip(),
+                               "at": time.time()})
+            entries = entries[:HISTORY_LIMIT]
+            path = history_path()
+            old = _history_pending.get(path)
+            if old is not None and old.get("timer") is not None:
+                old["timer"].cancel()
+            timer = threading.Timer(_HISTORY_SAVE_DELAY, _flush_history,
+                                    args=[path])
+            timer.daemon = True
+            _history_pending[path] = {"entries": entries, "timer": timer}
+            timer.start()
     except OSError:
         pass
 
 
 def clear_history():
-    """Delete all recorded history (N3). Returns True when the file
-    was removed."""
+    """Delete all recorded history (N3). Returns True when there
+    was history to clear — a pending (not yet written) visit
+    counts, so clearing right after a visit still reports True."""
+    path = history_path()
+    with _history_lock:
+        pending = _history_pending.pop(path, None)
+        if pending is not None and pending.get("timer") is not None:
+            pending["timer"].cancel()
+        had_pending = pending is not None
     try:
-        os.unlink(history_path())
+        os.unlink(path)
         return True
     except OSError:
-        return False
+        return had_pending
 
 
 def load_history():
+    # A pending save lands first, so this read — and any direct
+    # file read after it — sees the latest visits.
+    _flush_history(history_path())
     try:
         with open(history_path(), encoding="utf-8") as handle:
             data = json.load(handle)

@@ -1577,7 +1577,10 @@ class TitlesAuditTests(unittest.TestCase):
 
     def test_tidy_worker_coalesces_rapid_retitles(self):
         # N6: five retitles in a burst cost one brain call, on the
-        # latest title.
+        # latest title. The debounce here is 0.5, not the 0.01
+        # production default: under CPU starvation the burst
+        # itself can span more than 10 ms, and the test verifies
+        # coalescing, not the default window (D3).
         import threading as _threading
         from forge.browser.titles import TidyWorker
         calls = []
@@ -1590,7 +1593,7 @@ class TitlesAuditTests(unittest.TestCase):
         def on_done(view, url, tidy):
             done.set()
 
-        worker = TidyWorker(tidy_fn, on_done, debounce=0.01)
+        worker = TidyWorker(tidy_fn, on_done, debounce=0.5)
         view = object()
         for raw in ("One", "Two", "Three", "Four", "Five"):
             worker.request(view, "http://x.example/", raw)

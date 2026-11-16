@@ -22,6 +22,13 @@ It installs the program, puts its icon in your app menu, and
 offers to open it. No terminal, no commands. (If your file
 manager asks what to do with it, choose Run.)
 
+From a fresh clone instead of the release zip, the scripts arrive
+without their exec bits (the snapshot push stores every file as
+mode 644), so double-clicking does nothing until they are back.
+Run `sh install.sh` first — it restores the exec bits from
+EXECUTABLES.txt, then installs as usual. (Or run the installer
+with `sh "Install Forge Browser"`.)
+
 ## Run it (terminal)
 
 ```sh
@@ -62,7 +69,7 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-534 checks, offline, including the chat protocol with a stubbed
+900 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.
 
 ## License

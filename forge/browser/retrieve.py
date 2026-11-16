@@ -78,6 +78,8 @@ def chunk_text(text, size=CHUNK_CHARS, overlap=CHUNK_OVERLAP):
 
 
 def _cosine(a, b):
+    """Cosine similarity — the one copy (G-C33): memory.py and
+    titles.py import this instead of keeping their own."""
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
@@ -86,14 +88,33 @@ def _cosine(a, b):
     return dot / (na * nb)
 
 
+def cosine_scores(query_vector, vectors):
+    """Cosine similarity of one query vector against each vector,
+    in order. The query norm is computed once, not once per
+    vector (G-P16): page recall scores up to 2,400 vectors, and
+    the old loop recomputed the query norm for every one."""
+    query_norm = math.sqrt(sum(x * x for x in query_vector))
+    if query_norm == 0:
+        return [0.0] * len(vectors)
+    scores = []
+    for vector in vectors:
+        norm = math.sqrt(sum(y * y for y in vector))
+        if norm == 0:
+            scores.append(0.0)
+        else:
+            dot = sum(x * y for x, y in zip(query_vector, vector))
+            scores.append(dot / (query_norm * norm))
+    return scores
+
+
 def retrieve_scored(query_embedding, chunk_embeddings, top_k=TOP_K):
     """[(index, score)] of the top_k chunks by cosine similarity,
     best first. Ties go to the earliest chunk (I3): sorted by
     (-score, i), not reverse-tuple order, which handed ties to
     the END of the page."""
     scored = sorted(
-        ((_cosine(query_embedding, emb), i)
-         for i, emb in enumerate(chunk_embeddings)),
+        ((score, i) for i, score in
+         enumerate(cosine_scores(query_embedding, chunk_embeddings))),
         key=lambda p: (-p[0], p[1]))
     return [(i, score) for score, i in scored[:top_k]]
 

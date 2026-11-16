@@ -4,9 +4,11 @@ Same contract as the #65 tool in the shared tree, implemented on
 Forge Browser's own engine instead of the Browse connector:
 
 * A project-relative path is served by a throwaway stdlib server
-  bound to 127.0.0.1 only, rooted at the workspace, alive only for
-  this call. A path escaping the workspace is refused (traversal),
-  as is a path that does not exist.
+  bound to 127.0.0.1 only, serving ONLY that one file (G-S11) —
+  no other file in the workspace, no directory listing — alive
+  only for this call. A path escaping the workspace is refused
+  (traversal, with symlinks resolved first), as is a path that
+  does not exist.
 * The page comes back as TEXT (rendered Markdown when an engine is
   available, plain fetch otherwise — the result says which), plus
   the accessibility snapshot when an engine is present.
@@ -26,16 +28,49 @@ Forge Browser's own engine instead of the Browse connector:
   port alone would not isolate them.)
 """
 
-import functools
 import http.server
+import mimetypes
 import os
 import threading
+from urllib.parse import quote, unquote, urlparse
 
 from .errors import BrowserError
 from .fetch import fetch as _plain_fetch
 
 
-class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+class _SingleFileHandler(http.server.BaseHTTPRequestHandler):
+    """Serve exactly one file, and nothing else (G-S11).
+
+    The old handler rooted SimpleHTTPRequestHandler at the
+    workspace, serving every file plus directory listings. This
+    one answers only the target's URL path (anything else 404s)
+    and never lists a directory. The file to serve rides on the
+    server object, not on the request path — the path is only
+    ever compared, never opened, so no traversal or encoding
+    trick can reach another file.
+    """
+
+    def do_GET(self):
+        target = self.server.forge_target_path
+        wanted = self.server.forge_url_path
+        requested = unquote(urlparse(self.path).path)
+        if requested != wanted:
+            self.send_error(404, "not found")
+            return
+        try:
+            with open(target, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            self.send_error(404, "not found")
+            return
+        content_type = (mimetypes.guess_type(target)[0]
+                        or "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, *args):
         pass
 
@@ -48,23 +83,33 @@ def verify_in_browser(target, workspace, engine="auto", session_factory=None):
     A custom factory owns freshness itself; the default opener
     always starts fresh (see the module docs).
     """
-    workspace = os.path.abspath(workspace)
+    workspace = os.path.realpath(workspace)
     if target.startswith(("http://", "https://")):
         raise BrowserError(
             "verify_in_browser covers project files; external pages go "
             "through fetch / render so their source is recorded")
-    path = os.path.abspath(os.path.join(workspace, target))
+    # G-S11: resolve symlinks BEFORE the containment check — the
+    # old abspath check let a symlink inside the workspace point
+    # outside it.
+    path = os.path.realpath(os.path.join(workspace, target))
     if path != workspace and not path.startswith(workspace + os.sep):
         raise BrowserError(f"refused: {target!r} is outside the project folder")
     if not os.path.isfile(path):
         raise BrowserError(f"refused: {target!r} does not exist in the project")
 
-    handler = functools.partial(_QuietHandler, directory=workspace)
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    relpath = os.path.relpath(path, workspace).replace(os.sep, "/")
+    # G-C15: quote each path segment — a space or # in the name
+    # used to produce a broken URL.
+    url_path = "/" + "/".join(quote(part, safe="")
+                              for part in relpath.split("/"))
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), _SingleFileHandler)
+    server.forge_target_path = path
+    server.forge_url_path = "/" + relpath
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"http://127.0.0.1:{port}/" + os.path.relpath(path, workspace).replace(os.sep, "/")
+    url = f"http://127.0.0.1:{port}" + url_path
     try:
         result = {"target": target, "url": url, "screenshot": None, "note": ""}
         try:
@@ -72,7 +117,9 @@ def verify_in_browser(target, workspace, engine="auto", session_factory=None):
             opener = session_factory or (
                 lambda: BrowserSession.start(engine=engine, fresh=True))
             with opener() as session:
-                page = session.page(url)
+                # G-S9: the throwaway server is this call's own
+                # local page — the fence is explicitly allowed here.
+                page = session.page(url, allow_local=True)
                 result["text"] = page.markdown
                 result["rendered"] = True
                 result["snapshot"] = session.ax_snapshot()

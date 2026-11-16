@@ -18,11 +18,15 @@ creates a DebugLogger at startup, and gets:
 Pairs with BNB SKILLS debug-log-layer (S61), which is the standard
 this module implements.
 
+Vendored into Forge Browser from the BNB-TOOLS canonical copy;
+the examples below name this project (forge-browser), a
+deliberate divergence from the verbatim file (C13).
+
 Usage (library):
 
     from debug_log import DebugLogger, check_ollama
 
-    log = DebugLogger("duo", "0.3.1", log_dir="logs")
+    log = DebugLogger("forge-browser", "0.10", log_dir="logs")
     log.register_service("ollama", check_ollama)
     log.set_setting("model", "qwen3.5:2b")
     log.install_crash_handler()
@@ -33,7 +37,7 @@ Usage (library):
 
 Usage (one command, from the project folder):
 
-    python3 debug_log.py report --app duo --version 0.3.1
+    python3 debug_log.py report --app forge-browser --version 0.10
 """
 
 import argparse
@@ -70,11 +74,25 @@ _SCRUB_PATTERNS = [
     # Authorization: Bearer <value> / Basic <value>
     (re.compile(r"(Authorization:\s*(?:Bearer|Basic)\s+)\S+",
                 re.IGNORECASE), r"\1" + REDACTED),
-    # api_key=... / password: ... / secret = "..." (quoted or bare)
+    # api_key=... / password: ... / secret = "..." (quoted or bare).
+    # Bare "token" is in the alternation too (G-S1): a log line
+    # reading "token=abc" used to pass through unredacted.
     (re.compile(r"(?i)(api[_-]?key|api[_-]?token|access[_-]?token|"
-                r"auth[_-]?token|secret|password|passwd|pwd)"
+                r"auth[_-]?token|token|secret|password|passwd|pwd)"
                 r"(\s*[:=]\s*)[\"']?\S+?[\"']?(?=[\s,}\]]|$)"),
      r"\1\2" + REDACTED),
+    # JSON-style "password": "value" (G-S1): the key[:=]value
+    # pattern cannot match a quoted key, so a JSON dump of
+    # settings used to leak secrets into the report verbatim.
+    (re.compile(r"(?i)(\"(?:api[_-]?key|api[_-]?token|access[_-]?token|"
+                r"auth[_-]?token|token|secret|password|passwd|pwd)\""
+                r"\s*:\s*\")[^\"]*(\")"),
+     r"\1" + REDACTED + r"\2"),
+    # ... and the same keys with an unquoted JSON value.
+    (re.compile(r"(?i)(\"(?:api[_-]?key|api[_-]?token|access[_-]?token|"
+                r"auth[_-]?token|token|secret|password|passwd|pwd)\""
+                r"\s*:\s*)[^\"\s,\]}]+"),
+     r"\1" + REDACTED),
     # token=... in a URL query string
     (re.compile(r"(?i)([?&]token=)[^&\s]+"), r"\1" + REDACTED),
     # sk-... style API keys
@@ -228,6 +246,17 @@ def collect_context(app_name, version, settings=None, services=None,
 # ---------------------------------------------------------------- logger
 
 
+class _ScrubbingFormatter(logging.Formatter):
+    """Formats, then scrubs (G-S1). Logging formats exception
+    tracebacks itself, so a scrubbed message was never enough:
+    the traceback attached to an exception() call reached every
+    sink unscrubbed. Scrubbing at format time covers the message,
+    the traceback, and anything else the record carries."""
+
+    def format(self, record):
+        return scrub_text(super().format(record))
+
+
 class _RingBufferHandler(logging.Handler):
     """Keeps the last N formatted log records in memory."""
 
@@ -282,7 +311,7 @@ class DebugLogger:
         self.logger = logging.getLogger("debug_log." + app_name)
         self.logger.setLevel(logging.DEBUG)
         self.logger.propagate = False
-        fmt = logging.Formatter(
+        fmt = _ScrubbingFormatter(
             "%(asctime)s [%(levelname)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S")
         file_handler = logging.handlers.RotatingFileHandler(
@@ -400,13 +429,18 @@ class DebugLogger:
         sections.append("== Recent actions (last %d) =="
                         % len(self._ring.records))
         if self._ring.records:
-            sections.extend(self._ring.records)
+            # Re-scrubbed at report time (G-S1): the ring and the
+            # error capture used to go into the report without the
+            # re-scrub only the log tail got.
+            sections.extend(scrub_text(record)
+                            for record in self._ring.records)
         else:
             sections.append("  (none recorded)")
         sections.append("")
         sections.append("== Errors ==")
         if self._errors.errors:
-            sections.extend(self._errors.errors)
+            sections.extend(scrub_text(record)
+                            for record in self._errors.errors)
         else:
             sections.append("  (no errors captured)")
         sections.append("")

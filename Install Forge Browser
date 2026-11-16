@@ -70,14 +70,14 @@ gui_progress() { # shows progress until $DONE appears
                     echo "# ${LAST:-Working...}"
                     sleep 2
                 done
-            ) | zenity --progress --pulsate --auto-close --no-cancel \
+            ) | zenity --progress --pulsate --auto-close \
                 --title="$TITLE" \
                 --text="Installing Forge Browser — the first install downloads the browser engine, so it takes a few minutes."
             ;;
         tkinter)
             python3 "$DIR/install-gui.py" progress "$TITLE" \
                 "Installing Forge Browser — the first install downloads the browser engine, so it takes a few minutes." \
-                "$LOG" "$DONE"
+                "$LOG" "$DONE" "$INSTALL_PID"
             ;;
         *)
             command -v notify-send >/dev/null 2>&1 && notify-send "$TITLE" "Installing Forge Browser — this takes a few minutes the first time."
@@ -93,6 +93,22 @@ Details are in the install log:
 $LOG"
     rm -f "$DONE" "$DONE.tmp"
     exit 1
+}
+
+kill_install_group() { # stop the background install, whole group
+    # D21: Cancel kills install.sh plus its curl/pip children,
+    # not just the shell — the install runs in its own process
+    # group (setsid below), so a negative pid reaches all of them.
+    # TERM first, KILL after a grace period; the plain-pid kill is
+    # the fallback if the group form is not supported.
+    if [ -n "$INSTALL_PID" ] && kill -0 "$INSTALL_PID" 2>/dev/null; then
+        kill -TERM -- "-$INSTALL_PID" 2>/dev/null || kill -TERM "$INSTALL_PID" 2>/dev/null
+        sleep 2
+        if kill -0 "$INSTALL_PID" 2>/dev/null; then
+            kill -KILL -- "-$INSTALL_PID" 2>/dev/null || kill -KILL "$INSTALL_PID" 2>/dev/null
+        fi
+        wait "$INSTALL_PID" 2>/dev/null
+    fi
 }
 
 # --- pre-flight ------------------------------------------------------
@@ -116,7 +132,25 @@ fi
 # install is restored — a failed swap leaves a working install.
 rm -rf "$APP_TMP" "$APP_OLD"
 mkdir -p "$APP_TMP" || fail "Could not create the install folder."
-cp -R "$DIR"/. "$APP_TMP"/ || fail "Could not copy the program files."
+# D11: a .venv in the source tree is broken at its new path
+# (absolute paths in pyvenv.cfg and shebangs), and __pycache__
+# is stale bytecode — neither is copied. tar excludes them
+# during the copy (a 600 MB venv is not copied just to be
+# deleted); without tar, copy everything and prune them after.
+if command -v tar >/dev/null 2>&1; then
+    _COPY_TAR="$APP_DIR.copy.tar"
+    if ( cd "$DIR" && tar --exclude='.venv' --exclude='__pycache__' -cf "$_COPY_TAR" . ) \
+        && ( cd "$APP_TMP" && tar -xf "$_COPY_TAR" ); then
+        rm -f "$_COPY_TAR"
+    else
+        rm -f "$_COPY_TAR"
+        fail "Could not copy the program files."
+    fi
+else
+    cp -R "$DIR"/. "$APP_TMP"/ || fail "Could not copy the program files."
+    rm -rf "$APP_TMP/.venv"
+    find "$APP_TMP" -name __pycache__ -type d -prune -exec rm -rf {} +
+fi
 if [ -e "$APP_DIR" ]; then
     mv "$APP_DIR" "$APP_OLD" || fail "Could not move the old install aside."
 fi
@@ -126,6 +160,18 @@ if ! mv "$APP_TMP" "$APP_DIR"; then
     fi
     fail "Could not move the program into place."
 fi
+# D12: an update used to rebuild the venv from scratch (~600 MB
+# of PySide6 over the wire) because the venv lived inside the
+# swapped tree. Carry the old venv across when it still imports
+# — it returns to the exact path it was built for, so its
+# absolute paths are right again, and the new tree's install.sh
+# then skips the rebuild. A venv that no longer imports is left
+# behind and rebuilt.
+if [ -x "$APP_OLD/.venv/bin/python" ] && [ ! -e "$APP_DIR/.venv" ]; then
+    if "$APP_OLD/.venv/bin/python" -c "import PySide6.QtWebEngineWidgets" 2>/dev/null; then
+        cp -R "$APP_OLD/.venv" "$APP_DIR/.venv"
+    fi
+fi
 rm -rf "$APP_OLD"
 rm -f "$DONE" "$DONE.tmp"
 
@@ -134,16 +180,35 @@ rm -f "$DONE" "$DONE.tmp"
 # exit status in $DONE; the progress dialog watches for that file.
 # The whole install is capped at one hour — a stall past that means
 # something is broken, and the log says what.
+# D21: the install runs in its own process group (setsid, when
+# available) so Cancel — and the timeout — kill the whole install
+# (install.sh plus its curl/pip children) instead of orphaning
+# them. The group id is the background job's pid.
+if command -v setsid >/dev/null 2>&1; then _SETSID="setsid"; else _SETSID=""; fi
 : > "$LOG"
+# install.sh runs from inside the installed tree (its .venv and
+# relative paths live there), and always records its exit status
+# in $DONE — even if the cd itself fails — so the progress
+# dialog never waits on a file that will never appear.
 if command -v timeout >/dev/null 2>&1; then
-    ( timeout 3600 sh "$APP_DIR/install.sh" >"$LOG" 2>&1; echo $? > "$DONE.tmp"; mv "$DONE.tmp" "$DONE" ) &
+    $_SETSID sh -c 'cd "$1" && timeout 3600 sh install.sh >"$2" 2>&1; echo $? > "$3.tmp"; mv "$3.tmp" "$3"' _ "$APP_DIR" "$LOG" "$DONE" &
 else
-    ( sh "$APP_DIR/install.sh" >"$LOG" 2>&1; echo $? > "$DONE.tmp"; mv "$DONE.tmp" "$DONE" ) &
+    $_SETSID sh -c 'cd "$1" && sh install.sh >"$2" 2>&1; echo $? > "$3.tmp"; mv "$3.tmp" "$3"' _ "$APP_DIR" "$LOG" "$DONE" &
 fi
+INSTALL_PID=$!
 gui_progress
+if [ "$?" != "0" ]; then
+    # Cancelled: stop the background install, then say so plainly.
+    kill_install_group
+    fail "The install was cancelled. Nothing was changed — run the installer again any time."
+fi
 STATUS=$(cat "$DONE" 2>/dev/null || echo 1)
 rm -f "$DONE" "$DONE.tmp"
-if [ "$STATUS" != "0" ]; then
+if [ "$STATUS" = "124" ]; then
+    # D22: timeout(1) exits 124 when it kills the install at the
+    # 1-hour cap — name the limit, and say re-running resumes.
+    fail "The install ran past its 1-hour limit and was stopped. Run the installer again — it picks up where it left off (downloads resume, finished steps are skipped)."
+elif [ "$STATUS" != "0" ]; then
     fail "The install did not finish cleanly. Check the log, then run the installer again — it picks up where it left off."
 fi
 
@@ -154,24 +219,34 @@ fi
 
 # --- menu entry + icon --------------------------------------------------
 mkdir -p "$DESKTOP_DIR" "$ICON_DIR"
+ICON_MISSING=0
 if [ -f "$DIR/forge-browser.svg" ]; then
     cp "$DIR/forge-browser.svg" "$ICON_DIR/forge-browser.svg"
+else
+    # D23: a release without the icon ships a generic menu icon
+    # — say so instead of leaving the person wondering.
+    ICON_MISSING=1
 fi
 cat > "$DESKTOP_DIR/forge-browser.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
 Name=Forge Browser
-Comment=Your browser. No accounts, no API keys, nothing tracked.
-Exec=sh $APP_DIR/run.sh
+Comment=Your browser. No accounts, no API keys. Nothing leaves this machine.
+Exec=sh $APP_DIR/run.sh %u
 Path=$APP_DIR
 Icon=$ICON_DIR/forge-browser.svg
 Terminal=false
 Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+StartupWMClass=Forge Browser
 EOF
 chmod +x "$DESKTOP_DIR/forge-browser.desktop"
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$DESKTOP_DIR" >/dev/null 2>&1 || true
+fi
+if [ "$ICON_MISSING" = "1" ]; then
+    gui_info "Forge Browser is installed, but the icon file was missing from the release, so the menu entry shows a generic icon. The program itself installed fine."
 fi
 
 # --- done ----------------------------------------------------------------

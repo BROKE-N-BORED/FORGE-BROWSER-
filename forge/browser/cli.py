@@ -106,10 +106,26 @@ def _cmd_render(args):
     return 0
 
 
+def _redact_snapshot_elements(data):
+    """Snapshot data with password/hidden input values blanked
+    (G-S5): the engine reports every input's value, including
+    passwords, and the terminal must never print them. Returns a
+    copy; the library result is untouched."""
+    elements = []
+    for element in data.get("elements", []):
+        if (element.get("tag") == "input"
+                and str(element.get("type", "")).lower()
+                in ("password", "hidden")):
+            element = dict(element, text="")
+        elements.append(element)
+    return dict(data, elements=elements)
+
+
 def _cmd_snapshot(args):
     from .render import snapshot
-    data = snapshot(args.url, engine=args.engine,
-                    allow_local=args.allow_local)
+    data = _redact_snapshot_elements(
+        snapshot(args.url, engine=args.engine,
+                 allow_local=args.allow_local))
     if args.json:
         _print_json(data)
         return 0
@@ -176,8 +192,14 @@ def _cmd_research(args):
         return 0
     report, _sources = run_research(plan, approved=True)
     if args.out:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            handle.write(report)
+        try:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(report)
+        except OSError as exc:
+            # G-C25: a file error is a plain BrowserError, not a
+            # traceback — main() only catches BrowserError.
+            raise BrowserError(
+                f"could not write the report to {args.out} ({exc})") from exc
         print(f"Report written: {args.out}")
     else:
         print(report)
@@ -393,13 +415,30 @@ def _cmd_cards(args):
 
 def _cmd_card(args):
     from .cards import new_card, run_card, validate_card
+    # G-C26: check/new are flags now (card --check <name>,
+    # card --new <name>), so cards named "check" or "new" can be
+    # run. `card check <name>` / `card new <name>` still work as
+    # before when a name follows; with no name after them, a card
+    # actually named check or new runs.
+    if getattr(args, "check", False):
+        ok, message = validate_card(args.name)
+        print(message)
+        return 0 if ok else 1
+    if getattr(args, "new", False):
+        try:
+            path = new_card(args.name)
+        except Exception as exc:
+            print(f"forge browser: {exc}")
+            return 1
+        print(f"New card: {path}")
+        return 0
     # O10: `card check <name>` validates without running;
     # `card new <name>` scaffolds a new card file.
-    if args.name == "check":
+    if args.name == "check" and args.question:
         ok, message = validate_card(args.question or "")
         print(message)
         return 0 if ok else 1
-    if args.name == "new":
+    if args.name == "new" and args.question:
         try:
             path = new_card(args.question or "")
         except Exception as exc:
@@ -452,6 +491,12 @@ def _cmd_memory(args):
             print("usage: memory add <what to remember>")
             return 1
         entry = remember(args.value, source="cli")
+        if entry is None:
+            # G-C24: remember() returns None for blank text — the
+            # old code read entry['text'] and crashed with
+            # TypeError on whitespace-only input.
+            print("nothing to remember, that was blank")
+            return 1
         print(f"remembered: {entry['text']}")
         return 0
     if args.action == "forget":
@@ -525,9 +570,12 @@ def _cmd_memory(args):
             if not found:
                 print("nothing in your visited pages matches that")
         else:
-            for page in list_pages():
+            # G-C35: the page list is loaded once — the old code
+            # re-read and re-parsed the file for the empty check.
+            pages = list_pages()
+            for page in pages:
                 print(f"{page['title']} — {page['url']} ({page['chunks']} chunks)")
-            if not list_pages():
+            if not pages:
                 print("no pages remembered yet")
         return 0
     entries = list_entries()
@@ -558,7 +606,9 @@ def _cmd_voice(args):
     if not recorder.start():
         print("couldn't start the microphone")
         return 1
-    seconds = min(args.seconds, MAX_RECORD_SECONDS)
+    # G-C23: negative seconds used to reach time.sleep(-5) and
+    # crash with ValueError — clamp to 0 first.
+    seconds = max(0, min(args.seconds, MAX_RECORD_SECONDS))
     print(f"recording for {seconds}s — speak now…")
     time.sleep(seconds)
     path = recorder.stop()
@@ -618,8 +668,15 @@ def _cmd_history(args):
         entries = load_history()
         path = args.value or os.path.expanduser(
             "~/.forge/history-export.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"visits": entries}, handle, indent=2)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"visits": entries}, handle, indent=2)
+        except OSError as exc:
+            # G-C25: a file error is a plain BrowserError, not a
+            # traceback — main() only catches BrowserError.
+            raise BrowserError(
+                f"could not write the history export to {path} "
+                f"({exc})") from exc
         print(f"exported {len(entries)} visits to {path}")
         return 0
     print("usage: history export <file>")
@@ -711,11 +768,15 @@ def main(argv=None):
     p.set_defaults(func=_cmd_cards)
 
     p = sub.add_parser("card", help="run one saved workflow card "
-                                    "(card check <name> validates, "
-                                    "card new <name> scaffolds)")
+                                    "(card --check <name> validates, "
+                                    "card --new <name> scaffolds)")
     p.add_argument("name", help="card name, e.g. summarize-page")
     p.add_argument("question", nargs="?", default="",
                    help="the question or topic the card works on")
+    p.add_argument("--check", action="store_true",
+                   help="validate the card instead of running it")
+    p.add_argument("--new", action="store_true",
+                   help="scaffold a new card with this name")
     p.set_defaults(func=_cmd_card)
 
     p = sub.add_parser("memory", help="the remembered facts (list/add/forget/search/export/pages/page-forget/sites)")
@@ -860,7 +921,13 @@ def main(argv=None):
     p.set_defaults(func=_cmd_reports)
 
     args = parser.parse_args(argv)
-    if getattr(args, "action", "") in ("add", "remove") and not args.site:
+    # G-C1: the vault add/remove site check is scoped to the vault
+    # subcommand — the old check ran for every subcommand, and the
+    # memory parser defines no `site`, so `memory add` crashed
+    # with AttributeError before _cmd_memory ran.
+    if (args.command == "vault"
+            and getattr(args, "action", "") in ("add", "remove")
+            and not args.site):
         print("Forge Browser: vault add/remove need a SITE", file=sys.stderr)
         return 2
     try:
