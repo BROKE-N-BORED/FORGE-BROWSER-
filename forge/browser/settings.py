@@ -19,6 +19,7 @@ DEFAULTS = {
     "ollama_url": "",     # empty = http://127.0.0.1:11434
     "searxng_url": "",    # empty = no local SearXNG
     "preview_dwell_ms": "600",  # hover dwell before a link preview (L9)
+    "check_updates": "1",  # v0.12: "1" = check for updates on startup
 }
 
 

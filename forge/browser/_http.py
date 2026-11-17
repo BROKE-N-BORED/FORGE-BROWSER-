@@ -466,7 +466,7 @@ def _opener_for(allow_local):
 # W6: the browser names its own repo (the old string said Code
 # Forge's). The version tracks the package — bump it with the
 # version bump.
-USER_AGENT = "ForgeBrowser/0.11 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
+USER_AGENT = "ForgeBrowser/0.12 (Forge Browser; +https://github.com/BROKE-N-BORED/FORGE-BROWSER-)"
 DEFAULT_TIMEOUT = 20  # seconds
 
 # W5: the full-disk guard — a download stops cleanly when free

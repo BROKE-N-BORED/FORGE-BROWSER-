@@ -1,5 +1,40 @@
 # Forge Browser — Changelog
 
+## 0.12 - 2026-11-17
+
+Silent update check and ask-first auto-update (Joshua's
+standing order, 2026-11-17). 1044 checks, all green.
+
+- On launch, the app silently checks GitHub for a newer
+  release. Up to date means nothing at all: no popup, no
+  noise. A failed check (no network, GitHub down) is silent
+  too. The check runs in a background thread after the
+  window shows, so it never slows first paint.
+- When a newer release exists, a popup says so and asks.
+  Only on the user's tap does the app pull the update. The
+  download is verified against the release's checksum
+  sidecar before anything is installed: a missing sidecar
+  refuses before downloading, a hash mismatch refuses after,
+  and the old version stays put either way.
+- The install reuses the installer's safe properties:
+  extract, swap the new tree in with the old one kept aside,
+  run the new tree's install.sh, verify, restore on any
+  failure. User data in ~/.forge/ is never touched.
+- After the update installs, a popup asks: restart now to
+  complete the update, yes or no. Yes restarts the program
+  on its own with the update applied. No waits: the update
+  completes on the next restart.
+- Help menu: "Check for updates" (manual, reports the
+  outcome) and checkable "Check for updates on startup"
+  (default on, stored in settings).
+- Every release from v0.12 on carries a checksum sidecar
+  (<zip>.sha256) next to the zip, so the updater always has
+  something to verify against.
+- Known edge: after an install with restart=No, the running
+  old window resolves any not-yet-loaded module from the
+  new tree. Nearly everything loads at startup, and the
+  restart prompt encourages restarting soon.
+
 ## 0.11 - 2026-11-16
 
 The Review 3 user-pass list, built

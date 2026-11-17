@@ -94,6 +94,41 @@ The Help menu has two things worth knowing about:
   it is written, so it is safe to share when something goes
   wrong.
 
+## Updates
+
+Forge Browser checks for updates on its own, and never
+installs one without asking. When the window opens, it
+silently asks GitHub whether a newer release is out: one
+plain request to a public page, no account, no identifying
+information. When you are up to date, or the check itself
+fails (no network, GitHub down), nothing happens at all: no
+popup, no noise.
+
+When a newer release is out, a popup says so and asks. Only
+your tap starts the download. The download is checked
+before it installs: every release carries a checksum file
+next to the release zip, and the updater compares the
+download against it. A download that does not match, or a
+release with no checksum published, is refused in plain
+words and nothing is installed.
+
+The install swaps the new program in the same safe way the
+installer does: the old install is moved aside (not
+deleted) until the new one is verified, and restored if
+anything fails. Your vault, memory, history, and settings
+live in `~/.forge/` and are never touched.
+
+When the install finishes, a popup asks whether to restart
+now. Yes restarts the program on the new version by itself.
+No leaves the old window running. The update finishes the
+next time you open Forge Browser. Until you restart, the
+running window is the old version.
+
+Help, Check for updates on startup turns the launch check
+off (it is on by default). Help, Check for updates checks
+right now and reports the result either way: up to date, an
+update is out, or the check could not run and why.
+
 ## Test it
 
 ```
@@ -683,7 +718,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (974 checks),
+`forge/browser/` (the package), `tests/` (1044 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that
@@ -695,7 +730,7 @@ wiring changes nothing in this build.
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-Verified in the sandbox on 2026-11-16: 974 checks, all green
+Verified in the sandbox on 2026-11-17: 1044 checks, all green
 (offline suite, including a fake CDP server exercising the real
 WebSocket/CDP code).
 The program itself was also run for real in the sandbox (offscreen

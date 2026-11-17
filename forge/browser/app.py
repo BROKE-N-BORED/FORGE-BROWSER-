@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -536,6 +537,9 @@ def create_window(server, profile, start_url=None):
         compare_refresh_done = QtCore.Signal(object, str)  # view, new table HTML
         download_retry_progress = QtCore.Signal(int, int, int)  # key, got, total
         download_retry_done = QtCore.Signal(int, bool, str)  # key, ok, final/error
+        update_check_done = QtCore.Signal(object)  # v0.12: check result dict
+        update_progress = QtCore.Signal(str, int, int)  # v0.12: phase, got, total
+        update_install_done = QtCore.Signal(bool, str)  # v0.12: ok, version/reason
 
         def __init__(self):
             super().__init__()
@@ -605,6 +609,14 @@ def create_window(server, profile, start_url=None):
             self.download_retry_progress.connect(
                 self._on_download_retry_progress)
             self.download_retry_done.connect(self._on_download_retry_done)
+            self.update_check_done.connect(self._on_update_check_done)
+            self.update_progress.connect(self._on_update_progress)
+            self.update_install_done.connect(self._on_update_install_done)
+            # v0.12: update state — one check and one install at
+            # a time; the progress dialog while a download runs.
+            self._update_check_running = False
+            self._update_busy = False
+            self._update_progress_dialog = None
             self._downloads = {}  # id(download) -> record dict
             self._downloads_dialog = None
             self._vault = None  # the vault, once unlocked this session
@@ -1543,6 +1555,19 @@ def create_window(server, profile, start_url=None):
                               self._show_debug_report)
             self._menu_action(help_menu, "About Forge Browser",
                               self._show_about)
+            # v0.12: the update check — a manual check that
+            # reports its outcome, and the startup toggle
+            # (on by default: the launch check is silent).
+            from .updates import startup_check_enabled
+            help_menu.addSeparator()
+            self._menu_action(help_menu, "Check for updates",
+                              self._on_check_updates)
+            self._update_toggle_action = self._menu_action(
+                help_menu, "Check for updates on startup",
+                self._on_toggle_update_check)
+            self._update_toggle_action.setCheckable(True)
+            self._update_toggle_action.setChecked(
+                startup_check_enabled())
 
         def _new_window(self):
             """R3-29: a second Forge Browser window. The
@@ -1757,6 +1782,199 @@ def create_window(server, profile, start_url=None):
                     "and research, all on this machine.")
 
             self._run_dialog(make)
+
+        # --- updates (v0.12) ----------------------------------------
+        # The launch check is silent and on by default: it runs
+        # in a background thread after the window shows, and
+        # says nothing at all when the app is current or the
+        # check fails. Only a newer release pops up — and only
+        # the user's tap starts the download, which is checked
+        # against its published checksum before it installs.
+        def _maybe_check_for_updates_on_startup(self):
+            """The silent launch check (run_app schedules it
+            after the window shows). Off means off — no
+            request is made at all."""
+            from .updates import startup_check_enabled
+            if not startup_check_enabled():
+                return
+            self._start_update_check(manual=False)
+
+        def _on_check_updates(self):
+            """Help, Check for updates: a manual check, which
+            reports its outcome either way."""
+            if not self._start_update_check(manual=True):
+                self.statusBar().showMessage(
+                    "Already checking for updates.", 4000)
+                return
+            self.statusBar().showMessage(
+                "Checking for updates…", 8000)
+
+        def _on_toggle_update_check(self, checked):
+            """Help, Check for updates on startup: remember
+            the choice at once. Turning it on does not check
+            now — the check runs on the next launch, or by
+            hand."""
+            from .settings import set_setting
+            set_setting("check_updates", "1" if checked else "0")
+
+        def _start_update_check(self, manual):
+            """Start one update check in a worker thread,
+            unless one is already running. Returns False when
+            a check is already running, True when one
+            started."""
+            if self._update_check_running:
+                return False
+            self._update_check_running = True
+            from . import __version__
+
+            def work():
+                from . import updates
+                try:
+                    result = updates.check_for_update(
+                        __version__)
+                except Exception as exc:  # noqa: BLE001 - window stays up
+                    result = {"state": "unknown", "latest": None,
+                              "url": None,
+                              "reason": ("the update check "
+                                         "failed: %s" % exc)}
+                result["manual"] = manual
+                self.update_check_done.emit(result)
+
+            threading.Thread(target=work, daemon=True).start()
+            return True
+
+        def _on_update_check_done(self, result):
+            """One check finished, back on the GUI thread. A
+            newer release is offered whether the check was
+            manual or automatic. Up to date, or a failed
+            check, is told only when the user asked — the
+            silent launch check says nothing for either."""
+            self._update_check_running = False
+            state = result.get("state")
+            manual = result.get("manual", False)
+            if state == "newer":
+                self._offer_update(result)
+                return
+            if state == "current":
+                if manual:
+                    from . import __version__
+                    self._show_message(
+                        "info", "No updates",
+                        "You have the newest version (%s)."
+                        % __version__)
+                return
+            if manual:
+                self._show_message(
+                    "warning", "Could not check for updates",
+                    result.get("reason")
+                    or "the update check failed")
+
+        def _offer_update(self, result):
+            """The update popup: a newer release is out, ask
+            first. Only a Yes starts the download. A question
+            that arrives while another dialog is up is
+            answered No at once (see _ask_yes_no) — the
+            person never sees a stale question later."""
+            from . import __version__
+            latest = result.get("latest") or "a newer version"
+            if self._ask_yes_no(
+                    "Update available",
+                    "Forge Browser %s is out. You have %s.\n\n"
+                    "Update now? The download is checked "
+                    "against its published checksum before it "
+                    "installs, and your vault, memory, and "
+                    "history are never touched."
+                    % (latest, __version__)):
+                self._start_update_download(result)
+
+        def _start_update_download(self, result):
+            """Download, verify, and install the update in a
+            worker thread, with a progress dialog. One install
+            at a time — a second tap while one runs does
+            nothing."""
+            if self._update_busy:
+                return
+            self._update_busy = True
+            dialog = QtWidgets.QProgressDialog(
+                "Downloading the update…", None, 0, 0, self)
+            dialog.setCancelButton(None)
+            dialog.setWindowModality(
+                QtCore.Qt.WindowModality.WindowModal)
+            dialog.setMinimumDuration(0)
+            dialog.setAutoClose(False)
+            dialog.setAutoReset(False)
+            self._update_progress_dialog = dialog
+            dialog.show()
+
+            def work():
+                from . import updates
+                work_dir = tempfile.mkdtemp(
+                    prefix="forge-update-download-")
+                try:
+                    def progress(got, total):
+                        self.update_progress.emit(
+                            "Downloading the update…", got, total)
+
+                    zip_path = updates.download_and_verify(
+                        result, work_dir, on_progress=progress)
+                    self.update_progress.emit(
+                        "Installing the update…", -1, -1)
+                    updates.install_update(zip_path)
+                except Exception as exc:  # noqa: BLE001 - reported plainly
+                    self.update_install_done.emit(False, str(exc))
+                else:
+                    self.update_install_done.emit(
+                        True, result.get("latest") or "")
+                finally:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _on_update_progress(self, phase, got, total):
+            """A download/install progress step, back on the
+            GUI thread. A negative total means the size is
+            unknown — the bar runs indeterminate."""
+            dialog = self._update_progress_dialog
+            if dialog is None:
+                return
+            dialog.setLabelText(phase)
+            if total and total > 0:
+                dialog.setMaximum(total)
+                dialog.setValue(got)
+            else:
+                dialog.setMaximum(0)
+                dialog.setValue(0)
+
+        def _on_update_install_done(self, ok, message):
+            """The download + install finished. On success the
+            restart prompt asks: Yes relaunches the new
+            version, No leaves the old window running and the
+            update finishes on the next launch. On failure the
+            reason is shown plainly and the old version keeps
+            running — nothing was installed."""
+            self._update_busy = False
+            dialog = self._update_progress_dialog
+            self._update_progress_dialog = None
+            if dialog is not None:
+                dialog.close()
+            if not ok:
+                self._show_message(
+                    "warning", "The update did not install",
+                    "%s\n\nThe old version is still here."
+                    % message)
+                return
+            version = message or "the new version"
+            if self._ask_yes_no(
+                    "Update installed",
+                    "Forge Browser %s is installed. Restart "
+                    "now to use it?\n\nIf you say no, the "
+                    "update finishes the next time you open "
+                    "Forge Browser." % version):
+                from . import updates
+                folder = updates.find_installed_app()
+                if folder is not None:
+                    updates.relaunch(folder)
+                QtWidgets.QApplication.instance().quit()
 
         # --- find in page (E4) --------------------------------------
         def _show_find(self):
@@ -5020,6 +5238,10 @@ def run_app(start_url=None):
         lambda: _handle_show_request(local_server, window))
     window.show()
     splash.finish(window)
+    # v0.12: the update check runs after the window shows —
+    # never before first paint, never on the UI thread.
+    QtCore.QTimer.singleShot(
+        0, window._maybe_check_for_updates_on_startup)
     try:
         return app.exec()
     finally:
