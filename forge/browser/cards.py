@@ -254,7 +254,8 @@ def run_card(session, name, question="", page_text=None,
     final brain call as ("thinking", seconds). A card step may
     run another card (G-C14) — nested runs answer with their own
     final brain call, up to MAX_CARD_DEPTH deep."""
-    from .chat import _run_open, _run_research, _run_search, visible_text
+    from .chat import (ChatStopped, _run_open, _run_research,
+                       _run_search, visible_text)
     from .retrieve import page_context
 
     card = load_card(name)
@@ -337,7 +338,12 @@ def run_card(session, name, question="", page_text=None,
     prompt = prompt.replace("{page}", page)
     prompt = _budget_prompt(prompt, results)
     think_started = time.monotonic()
-    reply = session._chat([{"role": "user", "content": prompt}], on_chunk)
+    try:
+        reply = session._chat([{"role": "user", "content": prompt}], on_chunk)
+    except ChatStopped:
+        # R3-07b: Stop landed while the final brain call was still
+        # waiting — a stopped card, not a failed one.
+        return "Stopped.", opens
     if on_step_done is not None:
         on_step_done("thinking", time.monotonic() - think_started)
     return visible_text(reply), opens

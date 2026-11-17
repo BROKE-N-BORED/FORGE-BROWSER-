@@ -5,4 +5,4 @@
 # shadowing if this tree and Code Forge's forge/ ever share a
 # sys.path); it used to say "2.5", the Code Forge parent version,
 # which gave a reader two answers for one question.
-__version__ = "0.10"
+__version__ = "0.11"

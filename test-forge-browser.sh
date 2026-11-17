@@ -40,7 +40,7 @@ cleanup_lightpanda() {
 trap cleanup_lightpanda EXIT INT TERM
 
 if want_step 1; then
-step "1. Unit tests (offline, 900 checks)"
+step "1. Unit tests (offline, 974 checks)"
 if $PY -m unittest discover -s tests -p "test_browser*.py" 2>&1 | grep -q "^OK"; then
     ok "unit tests"
 else

@@ -92,6 +92,66 @@ CHARS_PER_TOKEN = 4         # rough estimate for the budget
 # is treated as stalled, not waited on forever (G-C3). The
 # non-streaming call already waits at most 240 s for the reply.
 STREAM_STALL_SECONDS = 240
+# R3-07a: the first read of a brain call gets a long allowance —
+# a cold model load on two CPU cores takes well over the 10 s the
+# old code gave every read, so chat failed while the brain was
+# still loading. Once the first bytes arrive, later reads keep
+# the short stall timeout below.
+FIRST_READ_SECONDS = 120
+READ_TIMEOUT_SECONDS = 10
+# R3-07b: a non-streaming brain call (Summarize's reduce, a card's
+# final call) waits at most this long in total — the old code let
+# a stalled brain hold Summarize for up to 4 minutes.
+NON_STREAM_CAP_SECONDS = 120
+# How often the open-request wait checks for Stop.
+OPEN_POLL_SECONDS = 0.2
+
+
+class ChatStopped(Exception):
+    """Raised by _chat when cancel() lands while a brain call is
+    still waiting for its first bytes (R3-07b). ask() turns it
+    into "Stopped.", summarize_page turns it into
+    SummarizeStopped, and run_card turns it into its own
+    ("Stopped.", opens) — it never reaches the person as an
+    error."""
+
+
+def _response_socket(response):
+    """The socket under an open urllib response, or None. The
+    response may be an addinfourl wrapping an HTTPResponse
+    wrapping a buffered socket file, so the walk follows .fp
+    links until it finds a .raw with a _sock. Anything unusual
+    returns None — the caller degrades to the long timeout
+    instead of failing."""
+    obj = response
+    for _ in range(4):
+        raw = getattr(obj, "raw", None)
+        if raw is not None:
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                return sock
+        nxt = getattr(obj, "fp", None)
+        if nxt is None or nxt is obj:
+            return None
+        obj = nxt
+    return None
+
+
+def _tighten_response_timeout(response, seconds):
+    """Set the socket timeout under an open urllib response to
+    seconds (R3-07a: the long first-read allowance tightens to
+    the short stall timeout once the first bytes arrive).
+    Returns True when the socket was found and set, False
+    otherwise — a missed socket only means the long timeout
+    stays, never an error."""
+    sock = _response_socket(response)
+    if sock is None:
+        return False
+    try:
+        sock.settimeout(seconds)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def total_ram_bytes():
@@ -233,6 +293,42 @@ def _preference_matches(low, parts):
     return all(_size_matches(low, part) for part in parts[1:])
 
 
+def _auto_pick(models, sizes, guide, note):
+    """The size-aware auto pick against one guide: (model,
+    reason, note). Skips models over the guide (G6); when every
+    model is over it, takes the smallest rather than no brain at
+    all, and says so. An embed model is never picked, even as a
+    last resort (G4)."""
+    oversize = [m for m in models
+                if sizes.get(m) and sizes[m] > guide]
+    candidates = [m for m in models if m not in oversize]
+    if not candidates and models:
+        # Every model is over the guide — take the smallest rather
+        # than no brain at all, and say so. G-C30: models with an
+        # unknown size sort last, not as 0 — the old key picked an
+        # unknown-size model ahead of every real size.
+        candidates = [min(
+            models, key=lambda m: (0, sizes[m]) if sizes.get(m) else (1, 0))]
+        if not note:
+            note = (f"every model is over the {_format_gb(guide)} size "
+                    f"guide, using the smallest ({candidates[0]}); "
+                    "it may swap")
+    lowered = [(name, name.lower()) for name in candidates]
+    for parts in _CHAT_PREFERENCE:
+        for name, low in lowered:
+            if "embed" not in low and _preference_matches(low, parts):
+                return name, "auto", note
+    for name, low in lowered:
+        if "embed" not in low and any(hint in low for hint in _PREFERRED):
+            return name, "fallback", note
+    for name, low in lowered:
+        if "embed" not in low:
+            return name, "fallback", note
+    if not models:
+        return None, "none", "no chat model is installed"
+    return None, "none", note or "no chat model is installed"
+
+
 def pick_chat_model_with_reason(models=None, sizes=None,
                                 ignore_saved=False):
     """(model, reason, note). reason: "your pick" (saved seat),
@@ -264,10 +360,14 @@ def pick_chat_model_with_reason(models=None, sizes=None,
         # models/sizes call keeps the startup guide, so it stays a
         # pure function of its arguments.
         guide = brain_size_guide()
+        full_guide = guide
         if free_ram_bytes() < 1024 ** 3:
             guide = min(guide, 1024 ** 3)
+        dropped = guide < full_guide
     else:
         guide = MAX_BRAIN_BYTES
+        dropped = False
+        full_guide = guide
     sizes = sizes or {}
     note = ""
     from .seats import load_seats
@@ -284,35 +384,19 @@ def pick_chat_model_with_reason(models=None, sizes=None,
         if not note:
             note = (f"the {wanted!r} model from FORGE_BROWSER_CHAT_MODEL "
                     "is not installed — using auto")
-    # Size-aware auto pick: skip models over the guide.
-    oversize = [m for m in models
-                if sizes.get(m) and sizes[m] > guide]
-    candidates = [m for m in models if m not in oversize]
-    if not candidates and models:
-        # Every model is over the guide — take the smallest rather
-        # than no brain at all, and say so. G-C30: models with an
-        # unknown size sort last, not as 0 — the old key picked an
-        # unknown-size model ahead of every real size.
-        candidates = [min(
-            models, key=lambda m: (0, sizes[m]) if sizes.get(m) else (1, 0))]
-        if not note:
-            note = (f"every model is over the {_format_gb(guide)} size "
-                    f"guide, using the smallest ({candidates[0]}); "
-                    "it may swap")
-    lowered = [(name, name.lower()) for name in candidates]
-    for parts in _CHAT_PREFERENCE:
-        for name, low in lowered:
-            if "embed" not in low and _preference_matches(low, parts):
-                return name, "auto", note
-    for name, low in lowered:
-        if "embed" not in low and any(hint in low for hint in _PREFERRED):
-            return name, "fallback", note
-    for name, low in lowered:
-        if "embed" not in low:
-            return name, "fallback", note
-    if not models:
-        return None, "none", "no chat model is installed"
-    return None, "none", note or "no chat model is installed"
+    model, reason, note = _auto_pick(models, sizes, guide, note)
+    if model and dropped:
+        # R3-06: the low-RAM guide drop used to re-pick to a
+        # smaller model silently — the header just showed a
+        # different model with no reason. Re-run the pick against
+        # the full guide; when it differs, say so in the note,
+        # which the header shows under the model line.
+        full_model, _reason, _note = _auto_pick(models, sizes,
+                                                full_guide, "")
+        if full_model and full_model != model and not note:
+            note = (f"free RAM is low (under 1 GB), so {model} was "
+                    f"picked instead of {full_model}")
+    return model, reason, note
 
 
 def pick_chat_model(models=None, sizes=None):
@@ -646,13 +730,131 @@ class ChatSession:
         like the morning brief. Returns the reply text."""
         return self._chat([{"role": "user", "content": prompt}])
 
+    def _run_interruptible(self, fn, cap_seconds, timeout_message):
+        """Run fn() in a daemon thread and wait for it (R3-07b).
+        Stop lands within ~OPEN_POLL_SECONDS even while the call
+        is blocked in the network — urlopen and read cannot be
+        interrupted directly, so the wait polls instead. A wait
+        past cap_seconds raises BrowserError(timeout_message).
+        The thread is daemon and the call's own socket timeout
+        bounds it, so an abandoned call never hangs the process.
+        Returns fn()'s result, or re-raises fn()'s error."""
+        box = {}
+
+        def _run():
+            try:
+                box["result"] = fn()
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + cap_seconds
+        while worker.is_alive():
+            if self._stop_requested:
+                raise ChatStopped("stopped while waiting for the brain")
+            if time.monotonic() > deadline:
+                raise BrowserError(timeout_message)
+            worker.join(timeout=OPEN_POLL_SECONDS)
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    def _open_request(self, request):
+        """Open the Ollama request and wait for the response
+        headers (R3-07a): the first read gets FIRST_READ_SECONDS,
+        because a cold model load on two CPU cores takes far
+        longer than the 10 s the old code gave every read.
+        Returns the open response; the caller owns closing it.
+        Raises ChatStopped when cancel() lands during the wait."""
+        return self._run_interruptible(
+            lambda: urllib.request.urlopen(request,
+                                           timeout=FIRST_READ_SECONDS),
+            FIRST_READ_SECONDS,
+            f"The chat brain ({self.model}) did not answer "
+            f"within {FIRST_READ_SECONDS} seconds")
+
+    def _read_whole_reply(self, response, started):
+        """Read a non-streaming reply body (R3-07b): Stop lands
+        while the body is still arriving (ChatStopped), and the
+        whole call is capped at NON_STREAM_CAP_SECONDS from the
+        call start, so a stalled brain cannot hold Summarize for
+        minutes. Returns the reply text."""
+        remaining = NON_STREAM_CAP_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            raise BrowserError(
+                f"The chat brain ({self.model}) did not finish its "
+                f"reply within {NON_STREAM_CAP_SECONDS} seconds")
+        raw = self._run_interruptible(
+            response.read, remaining,
+            f"The chat brain ({self.model}) did not finish its "
+            f"reply within {NON_STREAM_CAP_SECONDS} seconds")
+        data = json.loads(raw.decode("utf-8"))
+        return (data.get("message") or {}).get("content", "")
+
+    def _read_stream(self, response, on_chunk):
+        """Read a streaming reply line by line. A timeout on one
+        read is retried — the server may just be slow between
+        tokens — but STREAM_STALL_SECONDS with no new token
+        raises instead of hanging the turn forever (G-C3). The
+        check runs every time round the loop, not just on a
+        timeout, so a server dribbling blank lines cannot hold
+        the turn open either; only a line with content resets
+        the clock. Stop breaks out of the loop (P3); the caller
+        sees the partial text and checks the stop flag."""
+        parts = []
+        last_token = time.monotonic()
+        while True:
+            if self._stop_requested:
+                break
+            if (time.monotonic() - last_token
+                    > STREAM_STALL_SECONDS):
+                raise BrowserError(
+                    f"The chat brain ({self.model}) "
+                    "stopped answering mid-reply, no "
+                    "new words for "
+                    f"{STREAM_STALL_SECONDS} seconds")
+            try:
+                line = response.readline()
+            except socket.timeout:
+                continue
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            # Only a line with content resets the stall
+            # clock (G-C3): blank keepalive lines are
+            # not tokens, so they must not hold a dead
+            # stream open forever.
+            last_token = time.monotonic()
+            try:
+                data = json.loads(line.decode("utf-8"))
+            except ValueError:
+                continue
+            content = (data.get("message") or {}).get("content") or ""
+            if content:
+                parts.append(content)
+                on_chunk(content)
+        return "".join(parts)
+
     def _chat(self, messages, on_chunk=None):
         """One brain call. Without on_chunk this waits for the
         whole reply (stream False). With on_chunk, Ollama streams
         NDJSON lines and each content piece is handed to on_chunk
         as it arrives, so words appear while they are generated —
         at 3–6 tok/s, waiting for the full answer feels broken.
-        Returns the full reply text either way."""
+        Returns the full reply text either way.
+
+        R3-07a: the first read gets FIRST_READ_SECONDS — a cold
+        model load on two CPU cores takes far longer than the
+        10 s the old code gave every read, so chat failed while
+        the brain was still loading. Once the first bytes arrive
+        the socket tightens to READ_TIMEOUT_SECONDS per read, so
+        a stalled brain is still caught fast. R3-07b: cancel()
+        interrupts the wait for the first bytes and the read of
+        a whole reply (ChatStopped), and a non-streaming call
+        waits at most NON_STREAM_CAP_SECONDS in total."""
         if not self.model:
             raise BrowserError(
                 "No chat brain: no local model is answering at "
@@ -668,65 +870,17 @@ class ChatSession:
             OLLAMA_URL + "/api/chat", data=payload,
             headers={"Content-Type": "application/json"})
         started = time.monotonic()
-        # P3: a streaming read waits at most 10 s per line, so Stop
-        # lands within ~10 s instead of after a minutes-long
-        # generation. A timeout on one read is retried — the
-        # server may just be slow between tokens. The non-streaming
-        # call keeps the 240 s wait for the whole reply.
-        read_timeout = 10 if on_chunk is not None else 240
         try:
-            with urllib.request.urlopen(request,
-                                        timeout=read_timeout) as response:
+            response = self._open_request(request)
+            with response:
+                # The first bytes arrived — tighten to the short
+                # per-read timeout for the rest of the call.
+                _tighten_response_timeout(response, READ_TIMEOUT_SECONDS)
                 if on_chunk is None:
-                    data = json.loads(response.read().decode("utf-8"))
-                    text = (data.get("message") or {}).get("content", "")
+                    text = self._read_whole_reply(response, started)
                 else:
-                    parts = []
-                    # G-C3: a stalled stream ends. A timeout on one
-                    # read is retried — the server may just be slow
-                    # between tokens — but STREAM_STALL_SECONDS
-                    # with no new token raises instead of hanging
-                    # the turn forever (only cancel() broke it out
-                    # before). The check runs every time round the
-                    # loop, not just on a timeout, so a server
-                    # dribbling blank lines cannot hold the turn
-                    # open either; only a line with content resets
-                    # the clock.
-                    last_token = time.monotonic()
-                    while True:
-                        if self._stop_requested:
-                            break
-                        if (time.monotonic() - last_token
-                                > STREAM_STALL_SECONDS):
-                            raise BrowserError(
-                                f"The chat brain ({self.model}) "
-                                "stopped answering mid-reply, no "
-                                "new words for "
-                                f"{STREAM_STALL_SECONDS} seconds")
-                        try:
-                            line = response.readline()
-                        except socket.timeout:
-                            continue
-                        if not line:
-                            break
-                        line = line.strip()
-                        if not line:
-                            continue
-                        # Only a line with content resets the stall
-                        # clock (G-C3): blank keepalive lines are
-                        # not tokens, so they must not hold a dead
-                        # stream open forever.
-                        last_token = time.monotonic()
-                        try:
-                            data = json.loads(line.decode("utf-8"))
-                        except ValueError:
-                            continue
-                        content = (data.get("message") or {}).get("content") or ""
-                        if content:
-                            parts.append(content)
-                            on_chunk(content)
-                    text = "".join(parts)
-        except BrowserError:
+                    text = self._read_stream(response, on_chunk)
+        except (BrowserError, ChatStopped):
             raise
         except Exception as exc:
             raise BrowserError(
@@ -764,8 +918,9 @@ class ChatSession:
         the CLI can log per-step durations ("search took 8s").
         on_note(text) carries a plain-words note for the log (an
         empty named tab, J2).
-        cancel() stops the turn at the next step boundary, and
-        interrupts a streaming generation in flight (P3)."""
+        cancel() stops the turn at the next step boundary, interrupts
+        a streaming generation in flight (P3), and interrupts a
+        brain call still waiting for its first bytes (R3-07b)."""
         self._stop_requested = False
         self._turn_tokens = 0
         self._turn_seconds = 0.0
@@ -906,7 +1061,14 @@ class ChatSession:
             # V4: the brain call is a timed step — its duration
             # lands in the step log when it returns.
             think_started = time.monotonic()
-            reply = self._chat(budget_messages(messages), on_chunk)
+            try:
+                reply = self._chat(budget_messages(messages), on_chunk)
+            except ChatStopped:
+                # R3-07b: Stop landed while the brain was still
+                # loading or answering — the turn ends as stopped,
+                # not as an error.
+                answer = "Stopped."
+                break
             if on_step_done is not None:
                 on_step_done("thinking", time.monotonic() - think_started)
             # P3: a generation Stop interrupted never runs an

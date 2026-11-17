@@ -41,6 +41,7 @@ Usage (one command, from the project folder):
 """
 
 import argparse
+import importlib
 import json
 import logging
 import logging.handlers
@@ -180,15 +181,46 @@ def _disk_usage(path):
         return None
 
 
+# R3-21: PySide6 6.12 split the distribution into sub-packages, so
+# no distribution named "PySide6" exists anymore — the version lives
+# under pyside6_essentials (and the WebEngine half under
+# pyside6_webengine). A package with no distribution entry falls
+# back to its module's __version__ when the name is a module.
+_PACKAGE_ALIASES = {
+    "PySide6": ("pyside6_essentials",),
+    "PySide6-WebEngine": ("pyside6_webengine",),
+}
+
+
 def _package_version(name):
     if importlib_metadata is None:
         return "unknown"
     try:
         return importlib_metadata.version(name)
     except importlib_metadata.PackageNotFoundError:
-        return "not installed"
+        pass
     except Exception:  # never let a version lookup break the report
         return "unknown"
+    for alias in _PACKAGE_ALIASES.get(name, ()):
+        try:
+            return importlib_metadata.version(alias)
+        except importlib_metadata.PackageNotFoundError:
+            continue
+        except Exception:
+            return "unknown"
+    # Last resort: the installed module's own version, when the
+    # name is a module (a dashed name like "PySide6-WebEngine"
+    # never is).
+    if name.isidentifier():
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            module = None
+        if module is not None:
+            version = getattr(module, "__version__", None)
+            if version:
+                return version
+    return "not installed"
 
 
 def check_ollama(base_url="http://127.0.0.1:11434", timeout=2):

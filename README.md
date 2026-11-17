@@ -69,7 +69,7 @@ Full manual: [BROWSER.md](BROWSER.md)
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-900 checks, offline, including the chat protocol with a stubbed
+974 checks, offline, including the chat protocol with a stubbed
 brain. The guided tour: `sh test-forge-browser.sh`.
 
 ## License

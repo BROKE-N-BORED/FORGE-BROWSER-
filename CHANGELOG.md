@@ -1,5 +1,69 @@
 # Forge Browser — Changelog
 
+## 0.11 - 2026-11-16
+
+The Review 3 user-pass list, built
+(docs/TASK-LIST-2026-11-16.md): 36 items built, 1 checked
+not reproducible (R3-25). 974 checks, all green.
+
+- The window fits a 768px screen now (R3-01): the chat dock
+  sits in a scroll area, so the window shrinks to the
+  advertised 1240x720 default instead of stopping at 793px
+  tall, and the seat descriptions render in full instead of
+  clipping mid-glyph. The dock minimum is now 270px wide
+  (was 240): the panel needs 256 plus the scrollbar, and
+  240 clipped the Stop research and Run card buttons.
+- The "Models and AI" toggle is readable when checked
+  (R3-02): the stylesheet has background and :checked rules
+  for it. A failed load keeps the address that failed in
+  the address bar instead of the data: URL from setHtml
+  (R3-03).
+- The brain header is honest while it checks (R3-04): it
+  shows "(checking...)" until the answer check lands, and a
+  "(not answering)" brain gets a one-click fix button
+  (R3-05), not only ollama-down and no-models. When the
+  brain re-picks to a smaller model for low RAM, the header
+  says which model and why (R3-06).
+- Chat timing (R3-07): the first brain read gets a longer
+  allowance (a cold model load on 2 cores), later reads
+  keep the short stall timeout; Summarize caps how long it
+  sits on a stalled brain, and Stop interrupts a stalled
+  read instead of waiting for the call to return.
+- Dialogs and lists: the Downloads dialog fits all six
+  buttons on two rows (R3-08); the card dropdown starts
+  with no selection, and Run card with nothing chosen asks
+  for a pick (R3-09); action buttons disable when nothing
+  is selected instead of silently doing nothing (R3-11);
+  empty states say what the list is for and how to fill it
+  (R3-12); Downloads lives in one menu only (R3-13); the
+  Research Reports empty line wraps (R3-14); seat picker
+  combos read in full at narrow dock widths (R3-15); the
+  Edit menu has Cut/Copy/Paste/Select All (R3-16);
+  history and bookmark entries run two lines (R3-17); the
+  vault create page is tightened and the doubled "No vault
+  yet." is gone (R3-18); the "part 1 of 1" line is in
+  plain words (R3-19); the start page search placeholder
+  fits narrow windows (R3-20).
+- How to Use (R3-10): the manual is em-dash free, split
+  into user topics and developer topics so a first-time
+  user never meets "Verify (the #65 contract)", and the
+  counts are current (164+ items, not "22 improvements").
+  The debug report finds PySide6 6.12 (R3-21: it probes
+  pyside6_essentials now).
+- New: a visible download indicator (R3-22); the dock
+  width caps at half the window (R3-23); a bookmark
+  refusal names the reason (R3-24); a splash screen while
+  the app starts (R3-26); the address bar stays empty on
+  local pages by decision, said so in the code comment
+  (R3-27); Print to PDF (R3-28); New Window (R3-29);
+  Fullscreen on F11 (R3-30); Open File on Ctrl+O (R3-31);
+  per-download Save As, or an always-ask setting (R3-32);
+  a tab overflow menu (R3-33).
+- R3-25 checked, not reproducible: the bad-URL error page
+  rendered in full on two unresolvable URLs in a probe
+  (the one blank capture was timing); a regression test
+  guards it.
+
 ## 0.10 - 2026-11-15
 
 The 2026-11-15 review list, built

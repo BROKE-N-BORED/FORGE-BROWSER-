@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -80,7 +81,12 @@ QMenu::item:selected { background: #2c313a; }
 QStatusBar { background: #1a1d22; color: #9a958a; }
 QStatusBar::item { border: none; }
 QDockWidget::title { background: #1a1d22; color: #e8e4da; padding: 4px; }
-QLabel, QCheckBox, QToolButton { color: #e8e4da; }
+QLabel, QCheckBox { color: #e8e4da; }
+QToolButton#models_toggle { background: #23272f; color: #e8e4da;
+  border: 1px solid #3a3f48; border-radius: 6px; padding: 4px 8px; }
+QToolButton#models_toggle:hover { border-color: #ffb347; }
+QToolButton#models_toggle:checked { background: #2c313a;
+  border-color: #ffb347; }
 QProgressBar { background: #171b22; border: 1px solid #2c313a;
   border-radius: 4px; color: #e8e4da; }
 QProgressBar::chunk { background: #ffb347; }
@@ -95,6 +101,11 @@ _TAB_TITLE_CHARS = 28
 PLAN_TIMEOUT_SECONDS = 300
 
 _QT = None
+
+# R3-29: every open window, so a second window (File → New
+# Window) is not garbage-collected the moment _new_window
+# returns. Windows remove themselves in closeEvent.
+_WINDOWS = []
 
 
 def needs_all_tab_text(text):
@@ -605,6 +616,11 @@ def create_window(server, profile, start_url=None):
             self._chat_dock = None  # set by _attach_chat (G-UX4)
             self._view_menu = None  # set by _build_menu (G-UX4)
             self._closed_tabs = []  # URLs of closed tabs (G-UX2/G-UX12)
+            # R3-03: id(view) -> the URL that failed to load, for
+            # views showing the failed-load page. The view's own
+            # URL is a data: URL once setHtml runs, so the bar
+            # needs the failed URL kept aside to show it.
+            self._failed_urls = {}
             # B3: one modal dialog at a time (U18) — a second
             # request waits in line instead of stacking.
             self._dialog_active = False
@@ -620,6 +636,21 @@ def create_window(server, profile, start_url=None):
                 QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
             self.tabs.tabBar().customContextMenuRequested.connect(
                 self._on_tab_context_menu)
+            # R3-33: a tab overflow menu at the bar's right end —
+            # one click lists every tab by name and jumps to the
+            # one picked.
+            self._tabs_menu = QtWidgets.QMenu(self)
+            self._tabs_menu.aboutToShow.connect(
+                self._rebuild_tabs_menu)
+            tabs_btn = QtWidgets.QToolButton()
+            tabs_btn.setObjectName("tabs_overflow_button")
+            tabs_btn.setText("▾")
+            tabs_btn.setToolTip("List all tabs")
+            tabs_btn.setMenu(self._tabs_menu)
+            tabs_btn.setPopupMode(
+                QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
+            self.tabs.setCornerWidget(
+                tabs_btn, QtCore.Qt.Corner.TopRightCorner)
             # Tabs above, find bar below (hidden until Ctrl+F).
             central = QtWidgets.QWidget()
             central_layout = QtWidgets.QVBoxLayout(central)
@@ -679,6 +710,18 @@ def create_window(server, profile, start_url=None):
             bar.addAction("＋ Tab", lambda: self.new_tab())
             star = bar.addAction("★", self._bookmark_current)
             star.setToolTip("Bookmark this page (Ctrl+D)")
+            # R3-22: downloads are one click away, with a live
+            # count of active downloads — the old code buried
+            # them two menus deep.
+            self._downloads_btn = QtWidgets.QToolButton()
+            self._downloads_btn.setObjectName("downloads_button")
+            self._downloads_btn.setText("↓ Downloads")
+            self._downloads_btn.setToolButtonStyle(
+                QtCore.Qt.ToolButtonStyle.ToolButtonTextOnly)
+            self._downloads_btn.setToolTip("Show downloads")
+            self._downloads_btn.clicked.connect(
+                self._open_downloads_dialog)
+            bar.addWidget(self._downloads_btn)
             self._build_menu()
             QtGui.QShortcut(QtGui.QKeySequence("Ctrl+F"), self,
                             self._show_find)
@@ -726,6 +769,9 @@ def create_window(server, profile, start_url=None):
                     self.new_tab(server.home_url)
 
         def closeEvent(self, event):
+            # R3-29: a second window leaves the kept-alive list.
+            if self in _WINDOWS:
+                _WINDOWS.remove(self)
             # Remember size, position, and dock layout for next launch.
             settings = QtCore.QSettings("ForgeBrowser", "Forge Browser")
             settings.setValue("window/geometry", self.saveGeometry())
@@ -856,6 +902,21 @@ def create_window(server, profile, start_url=None):
                                     self._reopen_closed_tab)
             reopen.setEnabled(bool(self._closed_tabs))
             menu.exec(bar.mapToGlobal(pos))
+
+        def _rebuild_tabs_menu(self):
+            """R3-33: the overflow menu lists every tab by title —
+            the bar scrolls with many tabs, and a tab is hard to
+            find by name. Rebuilt each time the menu opens, so
+            it never goes stale; the current tab is checked."""
+            self._tabs_menu.clear()
+            for index in range(self.tabs.count()):
+                title = self.tabs.tabText(index) or "Untitled"
+                action = self._tabs_menu.addAction(title)
+                action.setCheckable(True)
+                action.setChecked(index == self.tabs.currentIndex())
+                action.triggered.connect(
+                    lambda _checked=False, i=index:
+                        self.tabs.setCurrentIndex(i))
 
         def _close_other_tabs(self, keep):
             for i in range(self.tabs.count() - 1, -1, -1):
@@ -1081,8 +1142,20 @@ def create_window(server, profile, start_url=None):
                 # entry for a page never seen.
                 url = view.url().toString()
                 _log_error(f"Page failed to load: {url}")
+                # R3-03: keep the failed URL aside before setHtml
+                # replaces the view's URL with a data: URL — the
+                # bar shows the failed address, not the page's
+                # own giant data: URL.
+                if url:
+                    self._failed_urls[id(view)] = url
                 view.setHtml(load_failed_html(url))
                 return
+            # R3-03: a real page loaded — the failed URL is stale.
+            # A data: URL here is the failed-load page's own
+            # loadFinished (setHtml fires one), so it must not
+            # clear the entry.
+            if not view.url().toString().startswith("data:"):
+                self._failed_urls.pop(id(view), None)
             from .titles import record_visit
             url = view.url().toString()
             title = view.title()
@@ -1114,6 +1187,9 @@ def create_window(server, profile, start_url=None):
                 if url:
                     self._closed_tabs.append(url)
                     del self._closed_tabs[:-_CLOSED_TABS_KEEP]
+                # R3-03: drop the failed-URL entry with the view,
+                # so a later view reusing this id cannot inherit it.
+                self._failed_urls.pop(id(widget), None)
             if self.tabs.count() > 1:
                 self._agent_tab_ids.discard(id(widget))
                 self.tabs.removeTab(index)
@@ -1139,13 +1215,30 @@ def create_window(server, profile, start_url=None):
                     view.stop()
                     self._refresh_comparison(view)
                     return
-                # Forge Browser's own local pages aren't addresses
-                # the person typed — keep the bar clean on those.
-                # An empty URL (a setHtml page, like the failed-load
-                # page) leaves the bar as it was.
-                if url:
+                # R3-27: the bar stays empty on Forge Browser's own
+                # local pages, by decision — the bar is for
+                # addresses the person types and pages they can
+                # share, and a 127.0.0.1 address is neither:
+                # copying it hands someone a link to their own
+                # machine. An empty bar also lets the search
+                # placeholder show.
+                if url.startswith("http://127.0.0.1"):
+                    self.address.setText("")
+                elif url.startswith("data:"):
+                    # R3-03: a setHtml page has no address of its
+                    # own — WebEngine reports a data: URL holding
+                    # the whole page, which the old code put in
+                    # the bar verbatim. A failed load shows the
+                    # address that failed (kept aside in
+                    # _failed_urls); any other setHtml page
+                    # (compare table, research notes) leaves the
+                    # bar empty, like the other local pages.
                     self.address.setText(
-                        "" if url.startswith("http://127.0.0.1") else url)
+                        self._failed_urls.get(id(view), ""))
+                elif url:
+                    self.address.setText(url)
+                # An empty URL (a fresh view, no load yet) leaves
+                # the bar as it was.
             # A navigation ends any hover — the link is gone.
             self._preview_url = ""
             self._preview_timer.stop()
@@ -1379,17 +1472,33 @@ def create_window(server, profile, start_url=None):
             file_menu = bar.addMenu("&File")
             self._menu_action(file_menu, "New Tab",
                               lambda: self.new_tab(), "Ctrl+T")
+            self._menu_action(file_menu, "New Window",
+                              self._new_window, "Ctrl+N")
+            self._menu_action(file_menu, "Open File…",
+                              self._open_file, "Ctrl+O")
             self._menu_action(
                 file_menu, "Close Tab",
                 lambda: self._close_tab(self.tabs.currentIndex()), "Ctrl+W")
             self._menu_action(file_menu, "Reopen Closed Tab",
                               self._reopen_closed_tab, "Ctrl+Shift+T")
             file_menu.addSeparator()
-            self._menu_action(file_menu, "Downloads",
-                              self._open_downloads_dialog)
+            self._menu_action(file_menu, "Print…",
+                              self._print_page, "Ctrl+P")
+            self._menu_action(file_menu, "Save as PDF…",
+                              self._save_page_pdf)
             file_menu.addSeparator()
             self._menu_action(file_menu, "Quit", self.close, "Ctrl+Q")
             edit_menu = bar.addMenu("&Edit")
+            self._menu_action(edit_menu, "Cut",
+                              lambda: self._edit_action("cut"), "Ctrl+X")
+            self._menu_action(edit_menu, "Copy",
+                              lambda: self._edit_action("copy"), "Ctrl+C")
+            self._menu_action(edit_menu, "Paste",
+                              lambda: self._edit_action("paste"), "Ctrl+V")
+            self._menu_action(edit_menu, "Select All",
+                              lambda: self._edit_action("selectAll"),
+                              "Ctrl+A")
+            edit_menu.addSeparator()
             self._menu_action(edit_menu, "Find in Page",
                               self._show_find, "Ctrl+F")
             view_menu = bar.addMenu("&View")
@@ -1398,6 +1507,9 @@ def create_window(server, profile, start_url=None):
             self._menu_action(view_menu, "Zoom Out", self._zoom_out, "Ctrl+-")
             self._menu_action(view_menu, "Reset Zoom", self._zoom_reset,
                               "Ctrl+0")
+            self._fullscreen_action = self._menu_action(
+                view_menu, "Fullscreen", self._toggle_fullscreen, "F11")
+            self._fullscreen_action.setCheckable(True)
             # G-UX1: history gets a menu of its own.
             history_menu = bar.addMenu("&History")
             self._menu_action(history_menu, "Show All History",
@@ -1432,6 +1544,122 @@ def create_window(server, profile, start_url=None):
             self._menu_action(help_menu, "About Forge Browser",
                               self._show_about)
 
+        def _new_window(self):
+            """R3-29: a second Forge Browser window. The
+            single-instance guard is per-process (the QLockFile
+            and QLocalServer held by run_app), so a window opened
+            inside this process is allowed deliberately — the
+            guard only stops a second PROCESS. The new window
+            opens with one start-page tab (a start URL skips
+            session restore), offset so it does not sit exactly
+            on top of this one."""
+            other = create_window(server, profile, server.home_url)
+            _WINDOWS.append(other)
+            other.move(self.x() + 40, self.y() + 40)
+            other.show()
+            return other
+
+        def _open_file(self):
+            """R3-31: open a local file in a new tab — through the
+            window's file:// load path, the same any-file-type
+            path the engine room uses: WebEngine renders HTML,
+            text, images, and PDF natively, and downloads the
+            rest instead of showing binary."""
+            path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Open File")
+            if not path:
+                return
+            self.new_tab(QtCore.QUrl.fromLocalFile(path).toString())
+
+        def _edit_action(self, kind):
+            """R3-16: Cut/Copy/Paste/Select All on whatever has
+            focus — a text field in the window (address bar, chat
+            entry, chat log), or the page in the current tab via
+            its WebEngine page action. The menu shortcut consumes
+            the key, so the field does not also act on it."""
+            widget = QtWidgets.QApplication.focusWidget()
+            if isinstance(widget, (QtWidgets.QLineEdit,
+                                   QtWidgets.QTextEdit,
+                                   QtWidgets.QPlainTextEdit)):
+                getattr(widget, kind)()
+                return
+            view = self._view()
+            if view is not None:
+                action = {"cut": QWebEnginePage.WebAction.Cut,
+                          "copy": QWebEnginePage.WebAction.Copy,
+                          "paste": QWebEnginePage.WebAction.Paste,
+                          "selectAll":
+                              QWebEnginePage.WebAction.SelectAll}[kind]
+                view.page().triggerAction(action)
+
+        def _toggle_fullscreen(self):
+            """R3-30: F11 toggles fullscreen; the View menu item
+            follows the window's state."""
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+            self._fullscreen_action.setChecked(self.isFullScreen())
+
+        def _print_page(self):
+            """R3-28: print the current page. This PySide6 build
+            does not bind QWebEnginePage.print and ships no QtPdf,
+            so there is no direct path to a printer — the page is
+            rendered to a PDF through the WebEngine print path
+            and opened in the system's PDF viewer, which prints
+            it. The status line says so plainly instead of
+            pretending a printer dialog ran."""
+            view = self._view()
+            if view is None:
+                return
+            path = os.path.join(tempfile.gettempdir(),
+                                "forge-browser-print.pdf")
+
+            def done(pdf_path, ok):
+                if pdf_path != path:
+                    return
+                if ok:
+                    QtGui.QDesktopServices.openUrl(
+                        QtCore.QUrl.fromLocalFile(path))
+                    self.statusBar().showMessage(
+                        "Opened the page as a PDF to print.", 5000)
+                else:
+                    self.statusBar().showMessage(
+                        "Could not make a PDF of this page.", 5000)
+
+            view.page().pdfPrintingFinished.connect(
+                done, QtCore.Qt.ConnectionType.SingleShotConnection)
+            view.page().printToPdf(path)
+
+        def _save_page_pdf(self):
+            """R3-28: save the current page as a PDF, through the
+            WebEngine print path."""
+            view = self._view()
+            if view is None:
+                return
+            path, _filter = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save Page as PDF", "",
+                "PDF Files (*.pdf)")
+            if not path:
+                return
+            if not path.lower().endswith(".pdf"):
+                path += ".pdf"
+
+            def done(pdf_path, ok):
+                if pdf_path != path:
+                    return
+                if ok:
+                    self.statusBar().showMessage(
+                        "Saved the page as "
+                        f"{os.path.basename(path)}.", 5000)
+                else:
+                    self.statusBar().showMessage(
+                        "Could not save the page as a PDF.", 5000)
+
+            view.page().pdfPrintingFinished.connect(
+                done, QtCore.Qt.ConnectionType.SingleShotConnection)
+            view.page().printToPdf(path)
+
         def _clear_history_native(self):
             """G-UX1: clear history from the menu — a destructive
             action, so it confirms first, default No (U23)."""
@@ -1451,9 +1679,13 @@ def create_window(server, profile, start_url=None):
 
         def _show_howto(self):
             """U22: the manual as an index window — sections from
-            BROWSER.md's own headings; clicking one shows its text."""
-            from .howto import load_sections
+            BROWSER.md's own headings; clicking one shows its text.
+            R3-10b: user topics first, developer topics grouped
+            under their own heading below, so a first-time user
+            never meets the engine-room internals unprompted."""
+            from .howto import load_sections, split_sections
             sections = load_sections()
+            user_sections, dev_sections = split_sections(sections)
             dialog = QtWidgets.QDialog(self)
             dialog.setWindowTitle("How to Use")
             dialog.resize(900, 600)
@@ -1463,12 +1695,27 @@ def create_window(server, profile, start_url=None):
             text = QtWidgets.QTextBrowser()
             text.setObjectName("howto_text")
             text.setOpenExternalLinks(False)
-            for _level, title, _body in sections:
+            # shown[row] is the section for that list row, or None
+            # for the developer heading (not selectable).
+            shown = []
+            for _level, title, _body in user_sections:
                 listing.addItem("  " * (_level - 1) + title)
+                shown.append((_level, title, _body))
+            if dev_sections:
+                heading = QtWidgets.QListWidgetItem("Developer topics")
+                heading.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
+                bold = heading.font()
+                bold.setBold(True)
+                heading.setFont(bold)
+                listing.addItem(heading)
+                shown.append(None)
+                for _level, title, _body in dev_sections:
+                    listing.addItem("  " * (_level - 1) + title)
+                    shown.append((_level, title, _body))
 
             def show_section(row):
-                if 0 <= row < len(sections):
-                    text.setPlainText(sections[row][2])
+                if 0 <= row < len(shown) and shown[row] is not None:
+                    text.setPlainText(shown[row][2])
 
             listing.currentRowChanged.connect(show_section)
             if sections:
@@ -1589,9 +1836,16 @@ def create_window(server, profile, start_url=None):
             if view is None:
                 return
             url = view.url().toString()
-            if not url.startswith("http") or url.startswith(server.home_url):
+            # R3-24: the refusal says why — the old "This page
+            # can't be bookmarked." left the person guessing
+            # whether it was a bug or a rule.
+            if url.startswith(server.home_url):
                 self.statusBar().showMessage(
-                    "This page can't be bookmarked.", 3000)
+                    "The start page can't be bookmarked.", 3000)
+                return
+            if not url.startswith("http"):
+                self.statusBar().showMessage(
+                    "Only web pages can be bookmarked.", 3000)
                 return
             # G-UX16: the star toggles — bookmarked already means
             # unbookmark.
@@ -1636,20 +1890,37 @@ def create_window(server, profile, start_url=None):
             listing = QtWidgets.QListWidget()
             listing.setObjectName("bookmarks_list")
             layout.addWidget(listing)
+            # R3-12: an empty list says what it is for and how to
+            # fill it, instead of showing a blank box.
+            empty = QtWidgets.QLabel(
+                "No bookmarks yet. Open a web page and press "
+                "Ctrl+D to add one.")
+            empty.setObjectName("bookmarks_empty")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
 
             def refresh():
                 listing.clear()
+                empty.setVisible(len(list_bookmarks()) == 0)
                 for mark in list_bookmarks():
+                    # R3-17: title on one line, address on the
+                    # next — the old "Title: URL" single line ran
+                    # off the right edge for long entries.
+                    title = mark.get("title") or mark["url"]
                     item = QtWidgets.QListWidgetItem(
-                        f"{mark.get('title') or mark['url']}: {mark['url']}")
+                        f"{title}\n{mark['url']}")
                     item.setData(QtCore.Qt.ItemDataRole.UserRole,
                                  mark["url"])
+                    item.setData(QtCore.Qt.ItemDataRole.UserRole + 1,
+                                 title)
                     listing.addItem(item)
 
             refresh()
             buttons = QtWidgets.QHBoxLayout()
             open_btn = QtWidgets.QPushButton("Open")
+            open_btn.setObjectName("bookmarks_open")
             remove_btn = QtWidgets.QPushButton("Remove")
+            remove_btn.setObjectName("bookmarks_remove")
             close_btn = QtWidgets.QPushButton("Close")
 
             def open_selected():
@@ -1680,7 +1951,12 @@ def create_window(server, profile, start_url=None):
                 if item is None:
                     return
                 url = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                current = item.text().rsplit(": ", 1)[0]
+                # R3-17: the title rides in the item's data now —
+                # the text is two lines ("title\nurl"), so the
+                # old ": " split no longer finds it.
+                current = (item.data(
+                    QtCore.Qt.ItemDataRole.UserRole + 1)
+                    or item.text().split("\n", 1)[0])
                 title, ok = QtWidgets.QInputDialog.getText(
                     dialog, "Rename bookmark", "Title:", text=current)
                 if ok and title.strip():
@@ -1688,11 +1964,23 @@ def create_window(server, profile, start_url=None):
                     add_bookmark(url, title.strip())
                     refresh()
 
+            # R3-11: Open, Rename, and Remove need a selection —
+            # they sit disabled with nothing picked instead of
+            # silently doing nothing when clicked.
+            def update_buttons():
+                picked = listing.currentItem() is not None
+                open_btn.setEnabled(picked)
+                rename_btn.setEnabled(picked)
+                remove_btn.setEnabled(picked)
+
             open_btn.clicked.connect(open_selected)
             remove_btn.clicked.connect(remove_selected)
             rename_btn = QtWidgets.QPushButton("Rename")
             rename_btn.setObjectName("bookmarks_rename")
             rename_btn.clicked.connect(rename_selected)
+            listing.currentItemChanged.connect(
+                lambda *a: update_buttons())
+            update_buttons()
             close_btn.clicked.connect(dialog.reject)
             listing.itemDoubleClicked.connect(lambda item: open_selected())
             buttons.addWidget(open_btn)
@@ -1701,6 +1989,11 @@ def create_window(server, profile, start_url=None):
             buttons.addStretch(1)
             buttons.addWidget(close_btn)
             layout.addLayout(buttons)
+            # R3-11: Close takes the initial focus, not the list —
+            # a list that takes focus on open auto-selects its
+            # first row, which would enable the buttons with no
+            # pick.
+            close_btn.setFocus()
             dialog.exec()
 
         # --- history + research windows (B12) -----------------------
@@ -1722,6 +2015,14 @@ def create_window(server, profile, start_url=None):
             listing = QtWidgets.QListWidget()
             listing.setObjectName("history_list")
             layout.addWidget(listing)
+            # R3-12: an empty list says what it is for and how to
+            # fill it, instead of showing a blank box.
+            empty = QtWidgets.QLabel(
+                "No visits recorded yet. Browse a page and it "
+                "shows up here.")
+            empty.setObjectName("history_empty")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
             cap = QtWidgets.QLabel(
                 f"History keeps the newest {_HISTORY_LIMIT} visits. "
                 "Older visits drop off.")
@@ -1741,14 +2042,20 @@ def create_window(server, profile, start_url=None):
                     if needle and needle not in title.lower() \
                             and needle not in url.lower():
                         continue
-                    item = QtWidgets.QListWidgetItem(f"{title}: {url}")
+                    # R3-17: title on one line, address on the
+                    # next, like bookmarks.
+                    item = QtWidgets.QListWidgetItem(f"{title}\n{url}")
                     item.setData(QtCore.Qt.ItemDataRole.UserRole, url)
                     listing.addItem(item)
+                # R3-12: the guidance shows only when the list
+                # is empty (a search with no matches counts).
+                empty.setVisible(listing.count() == 0)
 
             search.textChanged.connect(refresh)
             refresh()
             buttons = QtWidgets.QHBoxLayout()
             open_btn = QtWidgets.QPushButton("Open")
+            open_btn.setObjectName("history_open")
             clear_btn = QtWidgets.QPushButton("Clear History…")
             close_btn = QtWidgets.QPushButton("Close")
 
@@ -1768,8 +2075,17 @@ def create_window(server, profile, start_url=None):
                     _log_action("Cleared history")
                     refresh()
 
+            # R3-11: Open needs a selection — it sits disabled
+            # with nothing picked instead of silently doing
+            # nothing when clicked.
+            def update_buttons():
+                open_btn.setEnabled(listing.currentItem() is not None)
+
             open_btn.clicked.connect(open_selected)
             clear_btn.clicked.connect(clear_all)
+            listing.currentItemChanged.connect(
+                lambda *a: update_buttons())
+            update_buttons()
             close_btn.clicked.connect(dialog.reject)
             listing.itemDoubleClicked.connect(lambda item: open_selected())
             buttons.addWidget(open_btn)
@@ -1796,14 +2112,20 @@ def create_window(server, profile, start_url=None):
                 item.setData(QtCore.Qt.ItemDataRole.UserRole,
                              report["name"])
                 listing.addItem(item)
-            if not list_reports():
-                listing.addItem(
-                    "No research reports saved yet. Ask the browser "
-                    "to research something and the report lands here.")
-                listing.item(0).setFlags(
-                    QtCore.Qt.ItemFlag.NoItemFlags)
+            # R3-14: the empty state is a wrapping label, not a
+            # list item — the old single line ran off the right
+            # edge with a horizontal scrollbar.
+            empty = QtWidgets.QLabel(
+                "No research reports saved yet. Ask the browser "
+                "to research something and the report lands here.")
+            empty.setObjectName("research_empty")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
+            empty.setVisible(listing.count() == 0)
+            listing.setVisible(listing.count() > 0)
             buttons = QtWidgets.QHBoxLayout()
             open_btn = QtWidgets.QPushButton("Open")
+            open_btn.setObjectName("research_open")
             close_btn = QtWidgets.QPushButton("Close")
 
             def open_selected():
@@ -1815,13 +2137,30 @@ def create_window(server, profile, start_url=None):
                     self.new_tab(server.home_url + "research/" + name)
                     dialog.accept()
 
+            # R3-11: Open needs a selection — it sits disabled
+            # with nothing picked instead of silently doing
+            # nothing when clicked.
+            def update_buttons():
+                item = listing.currentItem()
+                open_btn.setEnabled(
+                    item is not None
+                    and bool(item.data(
+                        QtCore.Qt.ItemDataRole.UserRole)))
+
             open_btn.clicked.connect(open_selected)
+            listing.currentItemChanged.connect(
+                lambda *a: update_buttons())
+            update_buttons()
             close_btn.clicked.connect(dialog.reject)
             listing.itemDoubleClicked.connect(lambda item: open_selected())
             buttons.addWidget(open_btn)
             buttons.addStretch(1)
             buttons.addWidget(close_btn)
             layout.addLayout(buttons)
+            # R3-11: Close takes the initial focus, not the list —
+            # a list that takes focus on open auto-selects its
+            # first row, which would enable Open with no pick.
+            close_btn.setFocus()
             dialog.exec()
 
         # --- downloads (E1) -----------------------------------------
@@ -1831,8 +2170,25 @@ def create_window(server, profile, start_url=None):
             # atomic link in keep_download), then lands under its
             # uniquified name when it finishes.
             from .files import download_dir
+            from .settings import get_setting
             name = download.downloadFileName() or "download"
             folder = download_dir()
+            save_as = None
+            if get_setting("download_ask") == "1":
+                # R3-32: ask where to save this one — the dialog
+                # suggests the download folder and name, and its
+                # own overwrite prompt covers an existing file.
+                # Cancelling the dialog cancels the download.
+                picked, _filter = (
+                    QtWidgets.QFileDialog.getSaveFileName(
+                        self, "Save download",
+                        os.path.join(folder, name)))
+                if not picked:
+                    download.cancel()
+                    return
+                save_as = picked
+                folder = os.path.dirname(picked) or folder
+                name = os.path.basename(picked)
             tmp_name = f".forge-download-{id(download)}.part"
             download.setDownloadDirectory(folder)
             download.setDownloadFileName(tmp_name)
@@ -1840,6 +2196,7 @@ def create_window(server, profile, start_url=None):
             record = {"download": download, "name": name,
                       "tmp": os.path.join(folder, tmp_name),
                       "folder": folder, "final": None,
+                      "save_as": save_as,
                       "status": "downloading",
                       # G-UX10: the URL + the partial file are what
                       # a retry resumes from; "error" is why a
@@ -1967,16 +2324,30 @@ def create_window(server, profile, start_url=None):
             except OSError:
                 pass
 
+        def _finish_download_file(self, record):
+            """Land a finished download at its final path (R3-32):
+            the path the person picked with Save as, or the
+            uniquified name in the download folder. Returns the
+            final path."""
+            chosen = record.get("save_as")
+            if chosen:
+                parent = os.path.dirname(chosen)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                os.replace(record["tmp"], chosen)
+                return chosen
+            from .files import keep_download
+            return keep_download(record["tmp"], record["name"],
+                                 record["folder"])
+
         def _on_download_state(self, key, state):
             record = self._downloads.get(key)
             if record is None:
                 return
             states = QWebEngineDownloadRequest.DownloadState
             if state == states.DownloadCompleted:
-                from .files import keep_download
                 try:
-                    record["final"] = keep_download(
-                        record["tmp"], record["name"], record["folder"])
+                    record["final"] = self._finish_download_file(record)
                     record["status"] = "done"
                     _log_action(
                         f"Downloaded: {record['name']} to "
@@ -2054,15 +2425,13 @@ def create_window(server, profile, start_url=None):
 
             def work_retry():
                 from ._http import http_get_to_file
-                from .files import keep_download
                 try:
                     _final, _headers, _size = http_get_to_file(
                         record["url"], record["tmp"], resume=True,
                         on_progress=lambda got, total:
                             self.download_retry_progress.emit(
                                 key, got, total or 0))
-                    final = keep_download(record["tmp"], record["name"],
-                                          record["folder"])
+                    final = self._finish_download_file(record)
                     self.download_retry_done.emit(key, True, final)
                 except Exception as exc:
                     self.download_retry_done.emit(key, False, str(exc))
@@ -2092,16 +2461,20 @@ def create_window(server, profile, start_url=None):
             listing.setObjectName("downloads_list")
             layout.addWidget(listing)
             self._downloads_list = listing
+            # R3-08: the buttons sit on two rows, not one — six
+            # buttons in a row overflowed the dialog's width and
+            # the last ones were cut off. Row one holds the
+            # per-file actions, row two the folder and Close.
             buttons = QtWidgets.QHBoxLayout()
-            folder_btn = QtWidgets.QPushButton("Open download folder")
             open_btn = QtWidgets.QPushButton("Open")
             open_btn.setObjectName("downloads_open")
             show_btn = QtWidgets.QPushButton("Show in folder")
             show_btn.setObjectName("downloads_show")
             retry_btn = QtWidgets.QPushButton("Retry")
             retry_btn.setObjectName("downloads_retry")
-            cancel_btn = QtWidgets.QPushButton("Cancel download")
+            cancel_btn = QtWidgets.QPushButton("Cancel")
             cancel_btn.setObjectName("downloads_cancel")
+            folder_btn = QtWidgets.QPushButton("Open folder")
             close_btn = QtWidgets.QPushButton("Close")
             self._download_buttons = {"open": open_btn, "show": show_btn,
                                       "retry": retry_btn,
@@ -2153,17 +2526,25 @@ def create_window(server, profile, start_url=None):
             close_btn.clicked.connect(dialog.close)
             listing.currentItemChanged.connect(
                 lambda *a: self._update_download_buttons())
-            buttons.addWidget(folder_btn)
             buttons.addWidget(open_btn)
             buttons.addWidget(show_btn)
             buttons.addWidget(retry_btn)
             buttons.addWidget(cancel_btn)
             buttons.addStretch(1)
-            buttons.addWidget(close_btn)
             layout.addLayout(buttons)
+            bottom_row = QtWidgets.QHBoxLayout()
+            bottom_row.addWidget(folder_btn)
+            bottom_row.addStretch(1)
+            bottom_row.addWidget(close_btn)
+            layout.addLayout(bottom_row)
             dialog.destroyed.connect(self._on_downloads_dialog_closed)
             self._downloads_dialog = dialog
             self._refresh_downloads_list()
+            # R3-11: Close takes the initial focus, not the list —
+            # a list that takes focus on open auto-selects its
+            # first row, which would enable the buttons with no
+            # pick.
+            close_btn.setFocus()
             dialog.show()
 
         # --- vault autofill (E3) ------------------------------------
@@ -2282,7 +2663,11 @@ def create_window(server, profile, start_url=None):
             dialog = QtWidgets.QDialog(self)
             dialog.setWindowTitle("Vault")
             dialog.setObjectName("vault_dialog")
-            dialog.setMinimumSize(520, 360)
+            # R3-18: the minimum fits the short pages (create /
+            # locked); the entry list grows the dialog when it
+            # shows, so the short pages no longer sit in a tall
+            # box of dead space.
+            dialog.setMinimumSize(520, 220)
             layout = QtWidgets.QVBoxLayout(dialog)
             status = QtWidgets.QLabel("")
             status.setObjectName("vault_status")
@@ -2309,9 +2694,11 @@ def create_window(server, profile, start_url=None):
             # Page 1: no vault yet — choose a passphrase + Create.
             create_page = QtWidgets.QWidget()
             create_layout = QtWidgets.QVBoxLayout(create_page)
+            # R3-18: the status line above already says "No vault
+            # yet." — the instruction does not repeat it.
             create_layout.addWidget(QtWidgets.QLabel(
-                "No vault yet. Choose a passphrase (at least 8 "
-                "characters) to create one."))
+                "Choose a passphrase (at least 8 characters) "
+                "to create one."))
             new_pass = QtWidgets.QLineEdit()
             new_pass.setObjectName("vault_new_passphrase")
             new_pass.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
@@ -2348,6 +2735,9 @@ def create_window(server, profile, start_url=None):
             stack.addWidget(list_page)
 
             def refresh():
+                # R3-18: the dialog fits the page it shows — the
+                # entry list gets room, the short pages do not
+                # carry 360 px of dead space.
                 if self._vault is not None:
                     status.setText("Unlocked. Passwords are never shown.")
                     listing.clear()
@@ -2358,12 +2748,24 @@ def create_window(server, profile, start_url=None):
                                     item["site"])
                         listing.addItem(row)
                     stack.setCurrentIndex(2)
+                    dialog.resize(520, 360)
                 elif os.path.exists(default_vault_path()):
                     status.setText("The vault is locked.")
                     stack.setCurrentIndex(0)
+                    dialog.resize(520, 240)
                 else:
                     status.setText("No vault yet.")
                     stack.setCurrentIndex(1)
+                    dialog.resize(520, 260)
+                # R3-11: refresh leaves nothing selected — the
+                # page switch moves focus to the list, and a list
+                # that takes focus auto-selects its first row.
+                # Clearing here (after the switch) is what keeps
+                # Delete disabled until the person picks an entry.
+                listing.setCurrentRow(-1)
+                # R3-11: Delete needs a selected entry.
+                delete_btn.setEnabled(
+                    listing.currentItem() is not None)
 
             def do_unlock():
                 try:
@@ -2376,6 +2778,11 @@ def create_window(server, profile, start_url=None):
                 pass_entry.clear()
                 _log_action("Unlocked the vault")
                 refresh()
+                # R3-11: after unlock the list page shows — Add
+                # takes the focus, not the list, or Qt
+                # auto-selects the first entry and Delete enables
+                # with no pick.
+                add_btn.setFocus()
 
             def do_create():
                 first = new_pass.text()
@@ -2465,10 +2872,19 @@ def create_window(server, profile, start_url=None):
             lock_btn.clicked.connect(do_lock)
             add_btn.clicked.connect(do_add)
             delete_btn.clicked.connect(do_delete)
+            listing.currentItemChanged.connect(
+                lambda *a: delete_btn.setEnabled(
+                    listing.currentItem() is not None))
             close_btn = QtWidgets.QPushButton("Close")
             close_btn.clicked.connect(dialog.accept)
             layout.addWidget(close_btn)
             refresh()
+            # R3-11: when the vault is already unlocked the list
+            # page shows at once — Add takes the initial focus,
+            # not the list, or Qt auto-selects the first entry
+            # and Delete enables with no pick.
+            if self._vault is not None:
+                add_btn.setFocus()
             dialog.exec()
 
         # --- settings (E9) ------------------------------------------
@@ -2517,7 +2933,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # lands through brain_ready.
     session = None
     window._chat_session = None
-    brain_health = {"checked": False, "answers": None}
+    # R3-04: "checking" is True while the answer-check runs — the
+    # header says "(checking…)" instead of looking healthy for
+    # the ~40 s the check can take.
+    brain_health = {"checked": False, "answers": None, "checking": False}
     retrieval_state = {"models": []}  # fill_seat_combos keeps this fresh
 
     def brain_header_text():
@@ -2543,7 +2962,9 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             text = f"Brain: {session.model}"
             if session.pick_reason and session.pick_reason != "given":
                 text += f" ({session.pick_reason})"
-            if brain_health["checked"]:
+            if brain_health["checking"]:
+                text += " (checking…)"
+            elif brain_health["checked"]:
                 text += (" (answering)" if brain_health["answers"]
                          else " (not answering)")
             if session.pick_note:
@@ -2559,11 +2980,18 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     def _check_brain_in_background():
         # G7: prove the picked model answers, off the GUI thread.
+        # R3-04: the header shows "(checking…)" while the check
+        # runs — it used to look healthy until "(not answering)"
+        # appeared up to 40 s later.
         if session is None:
             return
         model = session.model
         if not model:
             return
+        brain_health["checking"] = True
+        brain_health["checked"] = False
+        brain_health["answers"] = None
+        apply_ai_state()
 
         def work_check():
             from .chat import check_model_answers
@@ -2627,8 +3055,15 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     get_model_btn = QtWidgets.QPushButton("Get a chat model")
     get_model_btn.setObjectName("get_model_button")
     get_model_btn.setVisible(False)
+    # R3-05: a picked brain that does not answer gets a fix button
+    # too — the old code only showed fix buttons for Ollama-down
+    # and no-models, so "(not answering)" was a dead end.
+    retry_brain_btn = QtWidgets.QPushButton("Retry brain")
+    retry_brain_btn.setObjectName("retry_brain_button")
+    retry_brain_btn.setVisible(False)
     fix_row.addWidget(start_ollama_btn)
     fix_row.addWidget(get_model_btn)
+    fix_row.addWidget(retry_brain_btn)
     fix_row.addStretch(1)
     layout.addLayout(fix_row)
     log = QtWidgets.QTextEdit()
@@ -2729,6 +3164,14 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     cards_row.addWidget(QtWidgets.QLabel("Card:"))
     cards_combo = QtWidgets.QComboBox()
     cards_combo.setObjectName("cards_combo")
+    # R3-01a follow-up: the combo must not demand the width of
+    # its longest card name — that forced the whole panel (and
+    # the dock minimum) wide. It takes the spare width, and the
+    # dropdown shows full names.
+    cards_combo.setSizeAdjustPolicy(
+        QtWidgets.QComboBox.SizeAdjustPolicy
+        .AdjustToMinimumContentsLengthWithIcon)
+    cards_combo.setMinimumContentsLength(12)
     cards_row.addWidget(cards_combo, 1)
     run_card_btn = QtWidgets.QPushButton("Run card")
     run_card_btn.setObjectName("run_card_button")
@@ -2775,6 +3218,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                     f"{page['title']}: {page['url']}")
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, page["url"])
                 pages_list.addItem(item)
+            # R3-12: each empty list says what it is for and how
+            # to fill it, instead of showing a blank box.
+            facts_empty.setVisible(facts_list.count() == 0)
+            pages_empty.setVisible(pages_list.count() == 0)
             sites_list.clear()
             sites = list_site_memory()
             for host in sites.get("blocked", []):
@@ -2787,6 +3234,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                     f"Always remembered: {host}")
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, host)
                 sites_list.addItem(item)
+            sites_empty.setVisible(sites_list.count() == 0)
 
         def forget_fact():
             item = facts_list.currentItem()
@@ -2881,12 +3329,24 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
         vbox.addWidget(QtWidgets.QLabel("Remembered facts:"))
         vbox.addWidget(facts_list)
+        facts_empty = QtWidgets.QLabel(
+            "No facts remembered yet. Ask the chat to remember "
+            "something.")
+        facts_empty.setObjectName("memory_facts_empty")
+        facts_empty.setWordWrap(True)
+        vbox.addWidget(facts_empty)
         forget_btn = QtWidgets.QPushButton("Forget selected fact")
         forget_btn.setObjectName("memory_forget_button")
         forget_btn.clicked.connect(forget_fact)
         vbox.addWidget(forget_btn)
         vbox.addWidget(QtWidgets.QLabel("Stored pages:"))
         vbox.addWidget(pages_list)
+        pages_empty = QtWidgets.QLabel(
+            "No pages stored yet. Pages you visit are kept here "
+            "so the chat can recall them.")
+        pages_empty.setObjectName("memory_pages_empty")
+        pages_empty.setWordWrap(True)
+        vbox.addWidget(pages_empty)
         remove_btn = QtWidgets.QPushButton("Remove selected page")
         remove_btn.setObjectName("memory_remove_button")
         remove_btn.clicked.connect(remove_page)
@@ -2901,6 +3361,12 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         vbox.addWidget(QtWidgets.QLabel(
             "Sites with their own memory rule:"))
         vbox.addWidget(sites_list)
+        sites_empty = QtWidgets.QLabel(
+            "No site rules yet. A rule makes one site always or "
+            "never remembered.")
+        sites_empty.setObjectName("memory_sites_empty")
+        sites_empty.setWordWrap(True)
+        vbox.addWidget(sites_empty)
         site_row = QtWidgets.QHBoxLayout()
         block_btn = QtWidgets.QPushButton("Never remember a site…")
         block_btn.setObjectName("memory_block_button")
@@ -2915,18 +3381,103 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(dialog.accept)
         vbox.addWidget(close_btn)
+        # R3-11: Forget, Remove, and Remove-rule need a selection
+        # in their own list — they sit disabled with nothing
+        # picked instead of silently doing nothing when clicked.
+        def update_buttons():
+            forget_btn.setEnabled(
+                facts_list.currentItem() is not None)
+            remove_btn.setEnabled(
+                pages_list.currentItem() is not None)
+            unblock_btn.setEnabled(
+                sites_list.currentItem() is not None)
+
+        facts_list.currentItemChanged.connect(
+            lambda *a: update_buttons())
+        pages_list.currentItemChanged.connect(
+            lambda *a: update_buttons())
+        sites_list.currentItemChanged.connect(
+            lambda *a: update_buttons())
+        update_buttons()
         refresh()
         dialog.resize(560, 560)
+        # R3-11: Close takes the initial focus, not a list — a
+        # list that takes focus on open auto-selects its first
+        # row, which would enable its button with no pick.
+        close_btn.setFocus()
         dialog.exec()
 
     memory_btn.clicked.connect(show_memory_view)
-    dock.setWidget(panel)
+    # R3-01a: the panel scrolls — the dock used to demand the
+    # panel's full height (793 px minimum), so the window could
+    # not fit a 1366x768 screen at all. With a scroll area the
+    # dock takes what height the window has and the rest scrolls.
+    # Horizontal scrolling stays off: the panel is laid out for
+    # the dock's width, and a sideways scroll would hide buttons.
+    scroll = QtWidgets.QScrollArea()
+    scroll.setObjectName("chat_scroll")
+    scroll.setWidget(panel)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(
+        QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+    # R3-01a follow-up: the panel needs its usable width for
+    # the 2x2 button rows — the vertical scrollbar takes ~15 px
+    # of the dock, so the scroll area's own minimum covers the
+    # panel's own minimum plus the scrollbar, and the buttons
+    # never clip at the narrowest dock. Measured once the
+    # window has shown (see below) and again when the seats
+    # fill, so the number is the laid-out one.
+    def _update_dock_minimum():
+        scroll.setMinimumWidth(
+            max(_CHAT_DOCK_MIN_WIDTH,
+                panel.minimumSizeHint().width())
+            + scroll.verticalScrollBar().sizeHint().width())
+        dock.updateGeometry()
+    # R3-01a follow-up: the scroll area's viewport paints the
+    # default (light) palette colour behind the transparent
+    # panel — as the dock's direct widget the panel sat on dark,
+    # but inside a scroll area the light viewport shows through
+    # and the cream labels go unreadable. Paint both dark. The
+    # viewport's palette does not stick (Qt's repolish resets
+    # it), so the viewport carries a stylesheet instead — a
+    # stylesheet survives repolish.
+    palette = panel.palette()
+    palette.setColor(QtGui.QPalette.ColorRole.Window,
+                     QtGui.QColor("#14161a"))
+    panel.setPalette(palette)
+    scroll.viewport().setStyleSheet("background-color: #14161a;")
+    panel.setAutoFillBackground(True)
+    dock.setWidget(scroll)
     # G-UX4 (extension): the dock is freely resizable by dragging
     # its border — the old 320 minimum is now 240, and nothing in
     # the panel pins the width (buttons and toggles sit 2x2).
     dock.setMinimumWidth(_CHAT_DOCK_MIN_WIDTH)
     window.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
     window._chat_dock = dock
+    # R3-23: the dock can be dragged wider than half the window,
+    # leaving the page a sliver. Clamp it at half the window
+    # width (never below the 240 px minimum) — the page always
+    # keeps half the window. The guard stops the clamp's own
+    # resize from re-entering.
+    dock_clamp = {"clamping": False}
+
+    class _DockWidthFilter(QtCore.QObject):
+        def eventFilter(self, obj, event):
+            if (event.type() == QtCore.QEvent.Type.Resize
+                    and not dock_clamp["clamping"]):
+                limit = max(_CHAT_DOCK_MIN_WIDTH, window.width() // 2)
+                if dock.width() > limit:
+                    dock_clamp["clamping"] = True
+                    try:
+                        window.resizeDocks(
+                            [dock], [limit],
+                            QtCore.Qt.Orientation.Horizontal)
+                    finally:
+                        dock_clamp["clamping"] = False
+            return super().eventFilter(obj, event)
+
+    dock.installEventFilter(_DockWidthFilter(dock))
     # G-UX4: View → Chat Dock re-shows a closed dock — and tracks
     # it, so the check follows the X button too.
     if window._view_menu is not None:
@@ -2941,6 +3492,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # G-UX4 (extension): the dock comes back at the size it was
     # left at — restored once the window has shown and laid out.
     QtCore.QTimer.singleShot(0, window._restore_chat_dock)
+    # R3-01a: the minimum is measured once the window has shown
+    # and laid out — before show the panel's hint overestimates
+    # by ~18 px and the dock would sit too wide.
+    QtCore.QTimer.singleShot(0, _update_dock_minimum)
 
     state = {"busy": False, "live": False}
     # V2: "waited" is the plan-gate time accumulated this turn
@@ -3051,17 +3606,35 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         seat_grid.addWidget(QtWidgets.QLabel(label), row * 2, 0)
         combo = QtWidgets.QComboBox()
         combo.setObjectName(f"{key}_combo")
+        # R3-15 follow-up: the combo must not demand the width
+        # of its longest model name — a 33-char roster entry
+        # would force the whole panel (and the dock minimum)
+        # wide. It takes the spare width, the tooltip names the
+        # auto pick, and the dropdown shows full names.
+        combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy
+            .AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(12)
         combos[key] = combo
         seat_grid.addWidget(combo, row * 2, 1)
         desc = QtWidgets.QLabel(_SEAT_DESCRIPTIONS[key])
         desc.setObjectName(f"{key}_desc")
         desc.setWordWrap(True)
+        # R3-01b: never shrink a description below its size hint —
+        # the old layout clipped them to ~1.5 lines when the dock
+        # was short. With the scroll area (R3-01a) the panel gets
+        # its full height, and this keeps the text whole even so.
+        desc.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                           QtWidgets.QSizePolicy.Policy.Minimum)
         desc_labels[key] = desc
         seat_grid.addWidget(desc, row * 2 + 1, 0, 1, 2)
     refresh_btn = QtWidgets.QPushButton("↻")
     refresh_btn.setObjectName("refresh_seats")
     refresh_btn.setToolTip("Re-read the models Ollama has installed")
     seat_grid.addWidget(refresh_btn, 0, 2)
+    # R3-15: the combo column takes the spare width, so a long
+    # model name has room instead of truncating at once.
+    seat_grid.setColumnStretch(1, 1)
     models_layout.addLayout(seat_grid)
 
     # G-UX4 (extension): the toggles sit 2x2, not 1x4 — four
@@ -3117,7 +3690,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         mic_btn.setEnabled(chat_ok and not busy
                            and not voice_state["transcribing"])
         run_card_btn.setEnabled(chat_ok and not busy
-                                and cards_combo.count() > 0)
+                                and cards_combo.count() > 1)
         # G-UX5: the fix buttons show only for the state they fix.
         brain_state = (session.brain_state if session is not None
                        else None)
@@ -3127,6 +3700,14 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         get_model_btn.setVisible(
             ai_on and chat_on and brain_state == "no-models")
         get_model_btn.setEnabled(True)
+        # R3-05: Retry brain shows when a picked brain was checked
+        # and did not answer — re-picking and re-checking is the
+        # fix for a brain that was still loading or briefly stuck.
+        retry_brain_btn.setVisible(
+            ai_on and chat_on and brain_state == "ok"
+            and brain_health["checked"]
+            and not brain_health["answers"])
+        retry_brain_btn.setEnabled(True)
         ai_toggle.setChecked(ai_on)
         chat_toggle.setChecked(chat_on)
         tidy_toggle.setChecked(seats["features"]["tidy_titles"])
@@ -3135,6 +3716,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             box.setEnabled(ai_on)
 
     seat_sizes = {}  # name -> bytes, from the last seat fill (B7)
+    # R3-15: what (auto) would pick for the Brain seat, from the
+    # last seat fill — named in the description line and the combo
+    # tooltip, not inside the combo label (which truncated).
+    auto_pick_state = {"brain": None}
 
     def fill_seat_combos(details=None):
         # Each item carries the model name as its data; the label
@@ -3143,7 +3728,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # or Fast (T6); a saved pick that is gone shows as dead
         # (T5) instead of hiding behind "(auto)", and a saved
         # embed pick shows as an embed model. The Brain combo's
-        # (auto) entry names what auto would pick (T12).
+        # (auto) entry stays short (R3-15) — what auto would pick
+        # is named in the description line, not the label.
         # G-P1: details arrive from the background pick — only
         # the ↻ path calls check_ollama() itself, via
         # _start_brain_pick(refresh=True), never directly.
@@ -3159,13 +3745,15 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         if models:
             auto_pick, _reason, _note = pick_chat_model_with_reason(
                 models=models, sizes=sizes, ignore_saved=True)
+        auto_pick_state["brain"] = auto_pick
         for key, combo in combos.items():
             combo.blockSignals(True)
             combo.clear()
-            label = "(auto)"
-            if key == "brain" and auto_pick:
-                label = f"(auto: {auto_pick})"
-            combo.addItem(label, None)
+            # R3-15: the (auto) label is always just "(auto)" —
+            # the old "(auto: qwen3.5:4b)" truncated in the narrow
+            # combo. The pick is named in the description line
+            # (_refresh_seat_descriptions) and the tooltip instead.
+            combo.addItem("(auto)", None)
             for name in models:
                 if key in ("brain", "fast") and "embed" in name.lower():
                     continue
@@ -3193,17 +3781,26 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             else:
                 combo.setCurrentIndex(0)
             combo.blockSignals(False)
+        combos["brain"].setToolTip(
+            f"Auto picks {auto_pick}." if auto_pick else "")
         _refresh_seat_descriptions()
+        # R3-01a: the filled combos can widen the panel's
+        # minimum — re-cover it so the buttons never clip.
+        _update_dock_minimum()
 
     def _refresh_seat_descriptions():
         """B7+B8: under each seat combo, what the seat is for plus
-        the picked model's one-line blurb."""
+        the picked model's one-line blurb. With (auto) picked on
+        the Brain seat, the description names what auto would
+        pick (R3-15) — the label itself stays short."""
         for key, combo in combos.items():
             picked = combo.currentData()
             text = _SEAT_DESCRIPTIONS[key]
             if picked:
                 text += " " + model_blurb(picked,
                                           seat_sizes.get(picked))
+            elif key == "brain" and auto_pick_state["brain"]:
+                text += f" Auto picks {auto_pick_state['brain']}."
             desc_labels[key].setText(text)
 
     def on_brain_ready(picked, details):
@@ -3212,6 +3809,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         nonlocal session
         session = picked
         window._chat_session = picked  # tab titles tidy against this brain
+        brain_health["checking"] = False
         brain_health["checked"] = False
         brain_health["answers"] = None
         fill_seat_combos(details)
@@ -3229,6 +3827,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
                 if session is None:
                     return
                 session.repick()
+                brain_health["checking"] = False
                 brain_health["checked"] = False
                 brain_health["answers"] = None
                 apply_ai_state()
@@ -3240,10 +3839,14 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def fill_cards_combo():
         # O11: the runnable cards, by name — broken cards are left
         # out (the CLI names them); a new card file appears after ↻.
+        # R3-09: the first item is empty — no card is picked by
+        # default, so Run card with nothing chosen says so instead
+        # of silently running the first card.
         from .cards import list_cards
         current = cards_combo.currentText()
         cards_combo.blockSignals(True)
         cards_combo.clear()
+        cards_combo.addItem("", None)
         cards_combo.addItems([c.name for c in list_cards() if not c.error])
         if current:
             cards_combo.setCurrentText(current)
@@ -3264,6 +3867,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # the check started makes it stale.
         if session is None or model != session.model:
             return
+        brain_health["checking"] = False
         brain_health["checked"] = True
         brain_health["answers"] = answers
         apply_ai_state()
@@ -3347,6 +3951,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     start_ollama_btn.clicked.connect(on_start_ollama)
     get_model_btn.clicked.connect(on_get_model)
+    # R3-05: Retry brain re-picks and re-checks — the same path as
+    # the ↻ button, which is what fixes a brain that was still
+    # loading or briefly stuck when it was checked.
+    retry_brain_btn.clicked.connect(on_refresh)
     signals.brain_fix_done.connect(on_refresh)
 
     # --- G-UX9: the chat log persists across restarts -------------
@@ -3906,6 +4514,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             return
         name = cards_combo.currentText()
         if not name:
+            # R3-09: nothing picked — say so in the log and the
+            # status line instead of silently doing nothing.
+            append("Forge Browser", "Pick a card first.")
+            window.statusBar().showMessage("Pick a card first.", 3000)
             return
         state["busy"] = True
         state["live"] = False
@@ -4230,6 +4842,14 @@ def open_settings_dialog(parent, on_applied=None):
     download_row.addWidget(browse_btn)
     layout.addLayout(download_row)
 
+    # R3-32: ask where to save each download, instead of always
+    # landing in the folder above.
+    ask_box = QtWidgets.QCheckBox(
+        "Ask where to save each download")
+    ask_box.setObjectName("settings_download_ask")
+    ask_box.setChecked(get_setting("download_ask") == "1")
+    layout.addWidget(ask_box)
+
     # B11: the service addresses live behind an Advanced section —
     # settings that rarely change do not sit in the main list.
     # (The link-preview dwell control is gone entirely: the 600 ms
@@ -4315,6 +4935,8 @@ def open_settings_dialog(parent, on_applied=None):
         for key, box in feature_boxes.items():
             set_feature(key, box.isChecked())
         set_setting("download_dir", download_entry.text().strip())
+        set_setting("download_ask",
+                    "1" if ask_box.isChecked() else "0")
         set_setting("ollama_url", ollama_entry.text().strip())
         set_setting("searxng_url", searxng_entry.text().strip())
         if on_applied is not None:
@@ -4324,6 +4946,28 @@ def open_settings_dialog(parent, on_applied=None):
     save_btn.clicked.connect(save)
     cancel_btn.clicked.connect(dialog.reject)
     dialog.exec()
+
+
+def _splash_pixmap(QtGui, QtCore):
+    """R3-26: the startup splash image — Forge Browser on a dark
+    card, drawn in code so it needs no image file. The Qt modules
+    arrive as arguments because app.py loads Qt lazily."""
+    pixmap = QtGui.QPixmap(360, 160)
+    pixmap.fill(QtGui.QColor("#101216"))
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    painter.setPen(QtGui.QPen(QtGui.QColor("#ffb347")))
+    painter.drawRoundedRect(2, 2, 356, 156, 12, 12)
+    painter.setPen(QtGui.QPen(QtGui.QColor("#e8e4da")))
+    font = painter.font()
+    font.setPointSize(22)
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(),
+                     QtCore.Qt.AlignmentFlag.AlignCenter,
+                     "Forge Browser")
+    painter.end()
+    return pixmap
 
 
 def run_app(start_url=None):
@@ -4349,7 +4993,23 @@ def run_app(start_url=None):
         return 0
     _lock, local_server = guard
 
+    # R3-26: a splash shows at once — a cold first run can take
+    # the better part of a minute before the window appears, and
+    # with nothing on screen the launch looks dead.
+    splash = QtWidgets.QSplashScreen(_splash_pixmap(QtGui, QtCore))
+    splash.show()
+    splash.showMessage("Starting Forge Browser…",
+                       QtCore.Qt.AlignmentFlag.AlignHCenter |
+                       QtCore.Qt.AlignmentFlag.AlignBottom,
+                       QtGui.QColor("#e8e4da"))
+    app.processEvents()
+
     server = LocalPageServer().start()
+    splash.showMessage("Starting the local page server…",
+                       QtCore.Qt.AlignmentFlag.AlignHCenter |
+                       QtCore.Qt.AlignmentFlag.AlignBottom,
+                       QtGui.QColor("#e8e4da"))
+    app.processEvents()
     profile = QWebEngineProfile("forge-browser")
     profile.setPersistentStoragePath(
         os.path.join(default_profile_dir(), "app-profile"))
@@ -4359,6 +5019,7 @@ def run_app(start_url=None):
     local_server.newConnection.connect(
         lambda: _handle_show_request(local_server, window))
     window.show()
+    splash.finish(window)
     try:
         return app.exec()
     finally:

@@ -13,15 +13,17 @@ keeps the newest 50 entries, and any cache failure is ignored
 silently — summarization never depends on it.
 
 A long summarize is stoppable (K1): cancel() is honored between
-map calls, and the map step can ride the fast seat (K9) while the
-reduce stays on the brain. Map work is capped (K2) so a huge page
-cannot mean hundreds of brain calls.
+map calls and inside a brain call in flight (R3-07b), and the map
+step can ride the fast seat (K9) while the reduce stays on the
+brain. Map work is capped (K2) so a huge page cannot mean
+hundreds of brain calls.
 """
 
 import hashlib
 import json
 import os
 
+from .chat import ChatStopped
 from .errors import BrowserError
 from .retrieve import chunk_text
 
@@ -50,7 +52,8 @@ _REDUCE_PROMPT_SHORT = ("Combine these part-summaries into one short summary "
 
 
 class SummarizeStopped(Exception):
-    """A summarize was stopped by cancel() between brain calls (K1)."""
+    """A summarize was stopped by cancel() — between brain calls
+    (K1) or inside one in flight (R3-07b)."""
 
 
 class SummarizeEmptyError(BrowserError):
@@ -124,7 +127,7 @@ def summarize_page(session, page_text, url=None, on_chunk=None,
     Returns "" only when the page itself is empty. A page with
     text whose brain produced nothing raises SummarizeEmptyError
     (K5). A stop requested via cancel() raises SummarizeStopped
-    between brain calls (K1)."""
+    between brain calls (K1) or inside one in flight (R3-07b)."""
     # Not a chat turn: clear the last-turn speed so a summary's done
     # line can't show a stale one (G10). A mid-turn summarize action
     # is unaffected — ask() recomputes the speed when the turn ends.
@@ -146,15 +149,28 @@ def summarize_page(session, page_text, url=None, on_chunk=None,
     # With several chunks the map calls stay silent and only the
     # combine step streams, so the person never sees scratch work.
     stream_map = on_chunk if len(chunks) == 1 else None
+
+    def _call(sess, messages, chunk_cb=None):
+        """One brain call; a Stop inside it is a stopped
+        summarize (R3-07b), not an error."""
+        try:
+            return sess._chat(messages, chunk_cb)
+        except ChatStopped:
+            raise SummarizeStopped("summarize stopped") from None
+
     parts = []
     for i, chunk in enumerate(chunks):
         if getattr(session, "_stop_requested", False):
             raise SummarizeStopped("summarize stopped")
-        if on_progress is not None:
+        # R3-19: the progress line only speaks when it carries
+        # information — one part of one says nothing, and the
+        # bare "part 1 of 1" reads as a leak, not a status. With
+        # several parts it still says "part N of M".
+        if on_progress is not None and len(chunks) > 1:
             on_progress(f"part {i + 1} of {len(chunks)}")
-        reply = mapper._chat([{"role": "user",
-                               "content": map_prompt.format(chunk=chunk)}],
-                             stream_map)
+        reply = _call(mapper, [{"role": "user",
+                                "content": map_prompt.format(chunk=chunk)}],
+                      stream_map)
         if reply.strip():
             parts.append(reply.strip())
     if not parts:
@@ -169,10 +185,10 @@ def summarize_page(session, page_text, url=None, on_chunk=None,
                 if getattr(session, "_stop_requested", False):
                     raise SummarizeStopped("summarize stopped")
                 group = parts[start:start + REDUCE_GROUP]
-                reply = session._chat(
-                    [{"role": "user",
-                      "content": reduce_prompt.format(
-                          parts="\n\n".join(group))}])
+                reply = _call(session,
+                              [{"role": "user",
+                                "content": reduce_prompt.format(
+                                    parts="\n\n".join(group))}])
                 if reply.strip():
                     grouped.append(reply.strip())
             if not grouped:
@@ -184,10 +200,11 @@ def summarize_page(session, page_text, url=None, on_chunk=None,
     else:
         if getattr(session, "_stop_requested", False):
             raise SummarizeStopped("summarize stopped")
-        summary = session._chat(
-            [{"role": "user",
-              "content": reduce_prompt.format(parts="\n\n".join(parts))}],
-            on_chunk)
+        summary = _call(session,
+                        [{"role": "user",
+                          "content": reduce_prompt.format(
+                              parts="\n\n".join(parts))}],
+                        on_chunk)
     summary = summary.strip()
     if not summary:
         raise SummarizeEmptyError(

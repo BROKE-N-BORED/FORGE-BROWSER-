@@ -11,6 +11,40 @@ Standard library only, like everything in the engine room.
 import os
 
 
+# R3-10b: the manual's developer topics — engine-room internals,
+# CLI reference, and build/verify notes a first-time user never
+# needs. How to Use lists the user topics first and these under
+# a "Developer topics" heading, so a new user never meets
+# "Verify (the #65 contract)" or "Research (Item 3)" unprompted.
+# Titles are matched after load_sections' em-dash cleanup.
+DEVELOPER_SECTIONS = frozenset((
+    "Fetch address fence",
+    "Engine downloads are pinned + verified",
+    "Kitesurf-local: a third engine",
+    "Every verification starts fresh",
+    "Commands",
+    "Rendered pages, snapshots, screenshots (Item 2)",
+    "The browser engine's debugging port",
+    "Verify (the #65 contract)",
+    "Research (Item 3)",
+    "Setup for the optional engines (Item 4)",
+    "What is in the folder",
+    "Tests",
+))
+
+
+def split_sections(sections):
+    """(user_sections, developer_sections) from load_sections'
+    output — every section lands in exactly one list, in manual
+    order. The developer content stays reachable, just grouped
+    after the user topics."""
+    user = [entry for entry in sections
+            if entry[1] not in DEVELOPER_SECTIONS]
+    developer = [entry for entry in sections
+                 if entry[1] in DEVELOPER_SECTIONS]
+    return user, developer
+
+
 def find_manual():
     """Path to BROWSER.md, or None when it is not installed.
 

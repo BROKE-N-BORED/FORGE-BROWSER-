@@ -1,14 +1,16 @@
-# Forge Browser (standalone — the AI browser build)
+# Forge Browser (standalone: the AI browser build)
 
 This tree is the FORGE BROWSER GitHub project: the standalone
-browser program with the chat interface (an AI browser — you talk
+browser program with the chat interface (an AI browser: you talk
 to it, it browses). It is the current build: the Qt window plus
-the full engine room, with all 22 improvements from the task list.
+the full engine room, with the improvements from the task lists
+built in: the original improvements list, the audit list, and
+the 2026-11-15 review list.
 
 Forge Browser is a browser program, built 2026-11-11. It runs
 STANDALONE: its own folder, its own window, no Code Forge
 required. The engine room is also wired into Code Forge as a
-tool, but this build stands on its own — the package layout
+tool, but this build stands on its own: the package layout
 (forge/browser/) is kept compatible with that wiring, and
 nothing in this build needs, touches, or installs into Code Forge.
 
@@ -30,10 +32,10 @@ the program. (If the file manager asks what to do, choose Run.)
 
 ```
 sh install.sh     # checks Python, installs/updates the engines, builds the app venv, runs the test suite
-sh run.sh         # opens Forge Browser — the program, its own window
+sh run.sh         # opens Forge Browser: the program, its own window
 ```
 
-`install.sh` is also the update path — run it again any time to
+`install.sh` is also the update path: run it again any time to
 refresh everything and re-check. It installs two engines into
 `~/.local/share/forge-browser/`: Lightpanda (the fast headless
 reader) and a full Chromium build (~250 MB, one time) used by
@@ -44,11 +46,11 @@ in current PySide6). Nothing needs sudo.
 `sh install.sh --check` reports without changing anything.
 
 From a fresh clone (rather than the release zip), every script
-arrives without its exec bit — the snapshot push stores every
-file as mode 644 — so double-clicking the installer does nothing
+arrives without its exec bit: the snapshot push stores every
+file as mode 644, so double-clicking the installer does nothing
 until the bits are back. Run `sh install.sh` first: it restores
 the exec bits from EXECUTABLES.txt, then installs as usual. (Or
-run the installer itself with `sh "Install Forge Browser"` —
+run the installer itself with `sh "Install Forge Browser"`:
 `sh` runs a script without needing its exec bit.)
 
 ## The program
@@ -57,7 +59,7 @@ run the installer itself with `sh "Install Forge Browser"` —
 tabs, back/forward/reload, and an address bar. Type an address
 to go there; type words instead and Forge Browser searches with
 its own keyless chain and shows the results on its own page. The
-start page is Forge Browser's own too — served locally, showing
+start page is Forge Browser's own too: served locally, showing
 what this machine has (engines, seats, vault). Your logins and
 cookies persist in Forge Browser's own profile under
 `~/.forge/browser-profile/`.
@@ -73,7 +75,7 @@ the program is the front of the house now.
 runs the full guided test below.
 
 Opening Forge Browser a second time does not open a second
-copy — the running window comes to the front instead (single
+copy: the running window comes to the front instead (single
 instance). If the first copy is still starting up, the second
 launch says so plainly instead of opening nothing.
 
@@ -81,7 +83,7 @@ launch says so plainly instead of opening nothing.
 
 The Help menu has two things worth knowing about:
 
-- **How to Use…** opens this manual as a window — the same
+- **How to Use…** opens this manual as a window: the same
   sections as BROWSER.md, listed on the left; click one to read
   it. It reads the manual itself, so it can never go stale.
 - **Debug Report…** writes a debug report file (under
@@ -104,11 +106,11 @@ round-trip in a throwaway vault, the research plan gate plus a
 small live research run, and a rendered-page snapshot if a browser
 engine is present. Local checks print PASS/FAIL; live steps print
 their real output (marked SHOW) for you to judge. To give it an
-engine first (optional — search/fetch/research/vault work without
+engine first (optional: search/fetch/research/vault work without
 one): `sh browser-setup.sh lightpanda`.
 
 `sh run.sh check` reports what this machine has (engines, seats,
-vault) plus the threshold validators' verdicts — whether tab
+vault) plus the threshold validators' verdicts: whether tab
 grouping and memory search separate well on this machine's real
 embeddings (0.75 for tab grouping, 0.5 for the memory floor).
 The validators need Ollama answering with nomic-embed-text;
@@ -117,18 +119,18 @@ that ran and found its threshold does not separate fails the
 check.
 
 
-## Chat — the AI part
+## Chat: the AI part
 
-The window has a chat dock ("Chat — talk to your browser"). A
+The window has a chat dock ("Chat: talk to your browser"). A
 LOCAL Ollama model is the brain (automatic pick, or set
 FORGE_BROWSER_CHAT_MODEL). It answers directly, or takes one
 action at a time with the engine room: search (keyless), open a
 page (which also opens it in a tab for you), research (the
-plan-gated runner — asking in chat is the approval), read_page
+plan-gated runner: asking in chat is the approval), read_page
 (the current tab's text is its context), or summarize (the current
 page, map-reduce in ~1500-char chunks so a long page still fits a
 small model; cached by URL + content hash under
-~/.forge/summaries.json) — plus memory (remember, forget, recall,
+~/.forge/summaries.json), plus memory (remember, forget, recall,
 and recall_pages for things read before), cards (run a saved
 workflow card), the morning brief, and compare (pull the same
 fields out of several tabs). At most 3 actions per message, so a small
@@ -140,7 +142,7 @@ browsing still works. Terminal version: `python3 -m forge.browser chat`.
 
 ## Model picker + AI controls
 
-The chat dock has three seat dropdowns — Brain, Fast, Vision —
+The chat dock has three seat dropdowns: Brain, Fast, Vision,
 fed by `ollama list`, plus a master AI switch and one toggle per
 feature (Chat, Tidy titles, Memory). Picks live in
 `~/.forge/seats.json` and apply at once; a pick beats the env
@@ -150,11 +152,11 @@ beats the automatic choice. "(auto)" means no pick saved.
 - Brain: the model the dock chats with. Picking one switches
   the session live; the header shows what is driving the chat.
 - Fast: the model that writes short tab titles. None (the
-  default) means the brain does it — no extra model swap on a
+  default) means the brain does it, with no extra model swap on a
   one-model machine.
 - Vision: the model that describes images. Used by `describe`
   and by fetch-any on image files.
-- AI off: every AI feature stops — chat, tidy titles, memory
+- AI off: every AI feature stops: chat, tidy titles, memory
   context and page recording, summarize, brief, compare,
   research, voice, and image describing. Flipping it off
   mid-turn stops the turn in progress, not just the next one.
@@ -165,7 +167,7 @@ beats the automatic choice. "(auto)" means no pick saved.
   and pages are not recorded for recall.
 - The morning brief and the terminal `voice` command are gated
   on Chat, like the dock mic. Image describing is gated on the
-  master AI switch only — Chat off does not kill it. The
+  master AI switch only. Chat off does not kill it. The
   terminal `transcribe` command is a file utility, not an AI
   feature, and is not gated.
 
@@ -182,8 +184,8 @@ to start while AI or Chat is off.
 
 ## Chat progress honesty
 
-While a turn runs, the dock shows a working line under the log —
-"working: search… — 12s" — naming the step (thinking, search,
+While a turn runs, the dock shows a working line under the log:
+"working: search… 12s", naming the step (thinking, search,
 open, …) and ticking once a second. The Stop button is live for
 the whole turn; hitting it stops the turn at the next step
 boundary and interrupts a brain call already in flight,
@@ -206,7 +208,7 @@ the switch.
 To fetch a local address on purpose: `--allow-local` on the
 command line, `allow_local=True` in code, or
 `FORGE_BROWSER_ALLOW_LOCAL=1`. A locally hosted SearXNG instance
-you configured (FORGE_SEARXNG_URL) is allowed the same way — the
+you configured (FORGE_SEARXNG_URL) is allowed the same way: the
 configuration is the switch. The verify flow for project pages
 allows its own throwaway local server on its own. The browser
 window itself is not fenced, by design: the person driving it can
@@ -220,7 +222,7 @@ fetch, including brain-triggered ones. The scoped alternative is
 `allow_local=True` on one call.
 
 IP literals in non-dotted forms (2130706433, 0x7f.0.0.1,
-0177.0.0.1, 127.1) are normalized before the check — the socket
+0177.0.0.1, 127.1) are normalized before the check: the socket
 layer accepts them, so an un-normalized fence would wave them
 through. Redirects are re-fenced on every hop: a public URL that
 302s to a local address is refused, not followed. DNS names are
@@ -229,7 +231,7 @@ LAN; CGNAT (100.64/10) is allowed, because a public name can
 resolve there behind a proxy and CGNAT is ISP space, not this
 machine. The connection goes to the address the fence checked:
 each request's host is resolved once, the answer is checked,
-and the socket connects to that same answer — a hostile DNS
+and the socket connects to that same answer, so a hostile DNS
 cannot flip the answer between the check and the connection
 (the window the 0.7 notes named is closed). For HTTPS the TLS
 handshake still uses the DNS name, only the socket is pinned.
@@ -252,14 +254,14 @@ before it is installed. The pins live in `engine-pins.txt`:
 
 Lightpanda is checked with `sha256sum` against the pinned hash;
 a mismatch refuses the install and keeps whatever was there
-before. The Chromium zip is checked the same way — against the
+before. The Chromium zip is checked the same way: against the
 SHA-256 recorded in `engine-pins.txt`, plus a zip CRC check
 before extracting. The snapshot publisher publishes no SHA-256
 for snapshots, so the recorded hashes were computed once from a
 download verified against the GCS metadata (size + MD5, both
 matched); honest limit: a hash computed from a download proves
 the bytes match what was recorded, not that the snapshot
-publisher published them — what the pin catches is any later
+publisher published them. What the pin catches is any later
 tamper or corruption. The installed
 chrome binary is re-verified by hash on every install.sh run
 (--check included), like
@@ -280,7 +282,7 @@ version and hash already match the pin. (PySide6 is pinned in
 lives in `_http.http_get_to_file`.)
 
 To bump a pin: update the version AND the hash in
-`engine-pins.txt` together — download the release, check its
+`engine-pins.txt` together: download the release, check its
 size against the release page, sha256sum it, and record the hash.
 
 ## Kitesurf-local: a third engine
@@ -288,7 +290,7 @@ size against the release page, sha256sum it, and record the hash.
 Kitesurf is Cloudflare's browser engine for AI agents, open
 source under Apache 2.0 (github.com/cloudflare/kitesurf). It
 parses HTML, applies CSS, runs page JavaScript, and renders
-screenshots without Chrome or a browser container — Rust
+screenshots without Chrome or a browser container. Rust
 compiled to WebAssembly (Blitz layout, Stylo CSS, Boa JS),
 running inside a Workers isolate. Forge Browser treats it as a
 third engine behind the same seam as Chromium and Lightpanda,
@@ -297,7 +299,7 @@ Chromium is heavy on an 8 GB machine and Lightpanda cannot run
 JavaScript.
 
 It speaks the Chrome DevTools Protocol, so the existing session
-code drives it unchanged — `/json/version` discovery, then the
+code drives it unchanged: `/json/version` discovery, then the
 browser WebSocket. Pick it with `--engine kitesurf` on `render`,
 `snapshot`, `screenshot`, and `verify`, or point
 `FORGE_KITESURF_URL` at a running one (it also joins the `auto`
@@ -306,7 +308,7 @@ reports whether a Kitesurf-local is serving; the endpoint only
 counts when its /json/version names itself Kitesurf.
 
 Local-only, by design. Kitesurf-local is a dev server you start
-by hand — it is not installed by install.sh and Forge Browser
+by hand. It is not installed by install.sh and Forge Browser
 never launches it:
 
 ```sh
@@ -326,21 +328,21 @@ editing the vendored crate patches). The first build compiles
 the Rust core and its vendored crates, which takes a while.
 There is no cloud path here on purpose: running Kitesurf on
 Cloudflare needs Dynamic Workers, which are part of the Workers
-Paid plan — that breaks the $0 rule. Kitesurf has no built-in
+Paid plan. That breaks the $0 rule. Kitesurf has no built-in
 authentication either, so a deployed instance would be public
 without an auth layer in front of it; the local dev server only
 listens on 127.0.0.1.
 
 Honest build verdict (2026-11-13): the engine itself could NOT
 be built in the sandbox. Bazel could not fetch its module
-registry there at all — with the sandbox proxy set, Bazel's
+registry there at all: with the sandbox proxy set, Bazel's
 Java downloader crashed on the proxy's CONNECT handshake; with
 the proxy unset, direct TLS to bcr.bazel.build failed (the
 sandbox egress answers it with plain HTTP). The toolchain up to
 that point worked (pnpm 9.15.4 and Bazelisk installed cleanly,
 `pnpm install --frozen-lockfile` finished in about a minute),
 and the adapter was built and tested against a fake CDP server
-speaking Kitesurf's documented protocol — but no live Kitesurf
+speaking Kitesurf's documented protocol, but no live Kitesurf
 engine has been driven yet. On the real PC the build should be
 attempted with normal home internet (no proxy): the first build
 is the heavy part on a 2-core machine with a hard drive, while
@@ -356,7 +358,7 @@ other engine gap.
 A verification never reuses browser state from an earlier run.
 Before v0.8, verify attached to an already-running engine
 whenever one was configured, and its page landed in that
-engine's shared default context — cookies and storage from
+engine's shared default context: cookies and storage from
 earlier runs could leak in (cookies are host-scoped, so the
 throwaway server's fresh port did not isolate them). Now a
 verification launches a fresh engine whenever it can (a
@@ -365,13 +367,13 @@ and, when the only engine is one already running, opens its
 page in its own isolated browser context and throws the context
 away when the run ends. An engine that cannot isolate a context
 refuses in plain words instead of sharing state. The plain
-read, screenshot, and snapshot paths are unchanged — they attach
+read, screenshot, and snapshot paths are unchanged: they attach
 to the engine you point them at, because that is what they are
 for; only verification forces fresh.
 
 ## Research as a background job
 
-Ask for research in chat and the turn ends at once — the job
+Ask for research in chat and the turn ends at once. The job
 runs behind your browsing, strictly one at a time, with a
 progress line in the dock ("Reading 2 of 6: …"). Expect minutes,
 not seconds. When it finishes, the report opens in its own tab
@@ -383,8 +385,8 @@ plan synchronously, the way it always has.
 ## Cross-tab compare
 
 Say "compare these three" (or "compare @tab1 @tab2 on price") and
-the brain pulls the same fields out of each tab — one small call
-per tab, never one giant prompt — and opens a Comparison tab with
+the brain pulls the same fields out of each tab, one small call
+per tab and never one giant prompt, and opens a Comparison tab with
 the table in the window. A field a page doesn't list reads "not
 listed"; a reply the brain couldn't use reads "couldn't extract".
 The brain also gets the table as text, so it can talk about it.
@@ -392,7 +394,7 @@ The brain also gets the table as text, so it can talk about it.
 ## Link previews
 
 Rest on a link for a moment and a small box by the cursor shows
-two lines about where it goes — the destination's title plus the
+two lines about where it goes: the destination's title plus the
 first lines of its own text. Nothing is fetched on hover alone
 and nothing is prefetched; the fetch happens only after the short
 dwell, and the result is cached by URL so a second hover costs
@@ -402,49 +404,49 @@ Terminal version: `python3 -m forge.browser preview <url>`.
 ## Morning brief
 
 On first launch of the day the browser builds, in the background,
-a short card about what yesterday's browsing was about — from the
+a short card about what yesterday's browsing was about, from the
 local memory store, cached at `~/.forge/brief-YYYY-MM-DD.json`
 (yesterday's date) and shown on the start page the next time it
 loads. The brain writes the summary when one is answering;
 otherwise the card is the plain list of pages. A day with no
-pages says so, and a failed brain call is not cached — the next
+pages says so, and a failed brain call is not cached, so the next
 launch retries. A launch with no brain still caches the plain
 list so the card shows at once, but the summary fills in later:
 a cached summary-less brief is rebuilt as soon as a brain is
 available. The summary samples 12 pages spread across the day
-(600 chars each), and sensitive pages — banking, logins,
-checkout — never reach the brief, list or summary. Old brief
+(600 chars each), and sensitive pages (banking, logins,
+checkout) never reach the brief, list or summary. Old brief
 files are pruned to the last 30 days. On demand: ask "give me
 my morning brief" in chat (a cached brief answers at once; an
 uncached one builds in the background and lands in the log when
 it is done), or `python3 -m forge.browser brief` in the
 terminal. The start page lists every page in the brief, has a
 "Refresh brief ↻" link that rebuilds it on demand, and shows
-"Today so far" — today's pages, listed live — alongside
+"Today so far": today's pages, listed live, alongside
 yesterday. `python3 -m forge.browser brief today` briefs today
 so far with a summary instead.
 
 ## Plan, run, interrupt
 
 The brain never acts on its own. When it wants to do something,
-it shows the plan first — "Search the web for gears", "Open
-example.org in a new tab" — and waits for your yes in a dialog
+it shows the plan first: "Search the web for gears", "Open
+example.org in a new tab", and waits for your yes in a dialog
 (the terminal asks on its own line). Anything that changes what
 is remembered asks again, even inside an approved turn. Pages
 the brain opens land in tabs marked 🤖, so you can see at a
 glance which tabs it opened and which are yours. The Stop button
-ends the turn at the next step — and interrupts a brain call
-already in flight, mid-stream — and nothing after it runs.
+ends the turn at the next step and interrupts a brain call
+already in flight, mid-stream. Nothing after it runs.
 
-## Voice — hold to talk
+## Voice: hold to talk
 
 The chat dock has a "🎤 Hold to talk" button. Hold it, speak,
 release: the recording is transcribed on this machine and the
-text lands in the chat box for you to read and send — never sent
+text lands in the chat box for you to read and send. It is never sent
 on its own. While recording, the button shows the elapsed time
 and whether audio is arriving; recording stops itself at the
 2-minute cap. Recording needs a system recorder: `arecord`,
-`parecord`, or `ffmpeg` (first working one wins — if the first
+`parecord`, or `ffmpeg` (first working one wins: if the first
 dies at once, the next is tried). Pin one with
 `FORGE_BROWSER_RECORDER` and pick a microphone with
 `FORGE_BROWSER_MIC_DEVICE` (e.g. `hw:1,0`). Terminal version:
@@ -454,7 +456,7 @@ at 120).
 Transcription backends, in order: `FORGE_TRANSCRIBE_CMD` (a
 command template with `{file}`/`{path}` and `{out_dir}`), the
 `whisper` CLI, whisper.cpp (`whisper-cli`/`main`), faster-whisper
-(local files only — it never downloads a model unannounced).
+(local files only: it never downloads a model unannounced).
 whisper.cpp gets the model file passed explicitly:
 `FORGE_WHISPER_MODEL_PATH`, default `~/.forge/whisper/base.en`
 (the English-only 148 MB one). Fetch it with
@@ -464,10 +466,10 @@ itself comes from https://github.com/ggerganov/whisper.cpp
 transcription says which kind it was: no transcriber installed,
 the transcriber errored, or nothing was heard.
 
-## Memory — what it remembers
+## Memory: what it remembers
 
 Say "remember ..." in chat (or `python3 -m forge.browser memory add
-"...") and the browser keeps that fact in `~/.forge/memory.json` —
+"...") and the browser keeps that fact in `~/.forge/memory.json`,
 plain JSON you can read, edit, and export (`memory export
 path.json`). It offers the relevant ones back as context when you
 ask something they bear on, and never records anything on its own:
@@ -481,7 +483,7 @@ Pages you visit are kept too, as text chunks in
 the browser's own local pages). Ask "that thing I read about
 gears" and the brain searches them (`recall_pages` action; CLI:
 `memory pages <words>`). Chunks are stored as text and embedded
-only when you ask — embedding at visit time would keep evicting
+only when you ask. Embedding at visit time would keep evicting
 the chat brain from the one-model slot.
 
 ## Commands
@@ -495,7 +497,7 @@ python3 -m forge.browser chat              # talk to the browser in the terminal
 python3 -m forge.browser cards             # list the saved workflow cards
 python3 -m forge.browser card NAME ["question"]  # run one saved workflow card (card check NAME validates, card new NAME scaffolds)
 python3 -m forge.browser memory [list | add "..." | forget WORDS | search WORDS | export PATH | pages WORDS]  # the remembered facts and pages
-python3 -m forge.browser brief [today]     # the morning brief — what yesterday's browsing was about
+python3 -m forge.browser brief [today]     # the morning brief: what yesterday's browsing was about
 python3 -m forge.browser preview URL       # two lines about where a link goes (fetched on demand)
 python3 -m forge.browser seats [brain MODEL | ai off]  # the model seats + AI toggles (same as the dock picker)
 python3 -m forge.browser voice [seconds]   # record the microphone and transcribe it (local whisper)
@@ -524,12 +526,12 @@ the shape a Forge tool wrapper uses.
 
 Keyless. Backends in order: a local SearXNG instance when
 `FORGE_SEARXNG_URL` is set; otherwise the keyless search
-backends — the first backend that returns results wins. All are
+backends: the first backend that returns results wins. All are
 public web pages read with a plain GET. (One backend's main
 endpoint bot-checks some networks; that is why the chain
 exists.)
 
-## Fetch — pages and every other file type
+## Fetch: pages and every other file type
 
 `fetch` reads a page into clean Markdown: structure kept, scripts /
 styles / nav / footer removed, links kept with full URLs, long pages
@@ -551,13 +553,13 @@ paged via `--offset` so a small model can read them in slices.
 
 Files are saved under `~/.forge/browser-media/` (override:
 `FORGE_BROWSER_MEDIA_DIR`). A name that is already taken gets
-uniquified — report-1.pdf, report-2.pdf — instead of overwriting
+uniquified (report-1.pdf, report-2.pdf) instead of overwriting
 the file already there.
 
 ## Rendered pages, snapshots, screenshots (Item 2)
 
 `render`, `snapshot`, and `screenshot` drive a browser engine on
-this machine over the Chrome DevTools Protocol — no cloud browser,
+this machine over the Chrome DevTools Protocol: no cloud browser,
 no key. Engine choice ("auto"): `FORGE_CDP_URL` if set, else
 `FORGE_LIGHTPANDA_URL`, else `FORGE_KITESURF_URL`, else a
 Chromium-family browser found on the machine (chromium,
@@ -588,22 +590,22 @@ Media is turned into text by a local seat; the text is what models
 read. An image is never attached to a model that cannot see images,
 and nothing is described or transcribed by invention.
 
-Vision seat — local Ollama (`FORGE_OLLAMA_URL`, default
+Vision seat: local Ollama (`FORGE_OLLAMA_URL`, default
 http://127.0.0.1:11434). Model choice: `FORGE_VISION_MODEL` when
 set, else the first installed of Forge's seat models
-(eriktonon/bonsai-2-uncensored:2b — it carries a vision projector —
+(eriktonon/bonsai-2-uncensored:2b, which carries a vision projector,
 then dolphinlabs/qwen3.5-uncensored), else any installed model
 Ollama reports as vision-capable, else common vision models
 (moondream, llava, qwen2.5vl...). The seat prompt asks for a full
 description plus all visible text transcribed.
 
-Transcription — first working backend wins: `FORGE_TRANSCRIBE_CMD`
+Transcription: first working backend wins: `FORGE_TRANSCRIBE_CMD`
 (a command template with {file} and {out_dir}), the `whisper` CLI,
 whisper.cpp, or an installed faster-whisper package (local files
 only). Model: `FORGE_WHISPER_MODEL` (default `base`, sized for
 CPU); whisper.cpp reads the model file at
-`FORGE_WHISPER_MODEL_PATH`, default `~/.forge/whisper/base.en` —
-fetch it with `sh install.sh --with-whisper`.
+`FORGE_WHISPER_MODEL_PATH`, default `~/.forge/whisper/base.en`.
+Fetch it with `sh install.sh --with-whisper`.
 
 ## Getting past site furniture and gates
 
@@ -620,12 +622,12 @@ person clears it once; the persistent profile then carries the
 session, so later visits are seamless. Paywalls and age gates are
 likewise detected and reported.
 
-## The vault — passwords and account information
+## The vault: passwords and account information
 
 `vault` stores site logins in one encrypted file
 (`~/.forge/browser-vault.json`, override `FORGE_BROWSER_VAULT`):
 
-- The whole file — sites, usernames, passwords, notes — is
+- The whole file (sites, usernames, passwords, notes) is
   encrypted as one blob. Key: the master passphrase, stretched with
   PBKDF2-HMAC-SHA256 (600,000 rounds, random salt). Encryption:
   HMAC-SHA256 keystream with a fresh nonce per save, authenticated
@@ -635,7 +637,7 @@ likewise detected and reported.
   stored). For scripts, `FORGE_BROWSER_VAULT_PASSPHRASE` works and
   carries the obvious risk of living in the environment.
 - The file is written 0600 in a 0700 folder. `vault list` shows
-  site + username only — never passwords.
+  site + username only, never passwords.
 - Filling: `BrowserSession.fill_login` (or
   `vault.fill_from_vault`) types the credentials into the page and
   reports only how many fields were filled. Values never enter a
@@ -649,18 +651,18 @@ likewise detected and reported.
 `verify page.html --workspace DIR` serves the project file from a
 throwaway 127.0.0.1 server (paths outside the project are refused),
 returns the page text (rendered when an engine is available, plain
-otherwise — the result says which), the accessibility snapshot
+otherwise; the result says which), the accessibility snapshot
 when rendered, and saves a screenshot under
 `<project>/.forge/artifacts/` when the engine can take one. The
 screenshot is a file path, never image data in the result.
 
 ## Research (Item 3)
 
-Plan first, always: `research "topic"` prints the plan — the exact
-searches and how many sources will be read — and searches nothing.
+Plan first, always: `research "topic"` prints the plan: the exact
+searches and how many sources will be read, and searches nothing.
 `--yes` approves and runs it: each query is searched, top sources
 are read with `fetch-any` (pages, PDFs, other files), deduplicated,
-numbered once, and written into a Markdown report — what each
+numbered once, and written into a Markdown report: what each
 source said under its citation number, barriers noted, full source
 list at the end. The report contains only what the sources said;
 it does not write findings of its own.
@@ -673,7 +675,7 @@ sh browser-setup.sh searxng      # upstream git repo into a private venv
 sh browser-setup.sh all
 ```
 
-SearXNG is installed from its own git repo deliberately — the PyPI
+SearXNG is installed from its own git repo deliberately: the PyPI
 package named "searxng" is not the upstream project. The script
 prints the two `export` lines (FORGE_LIGHTPANDA_URL /
 FORGE_SEARXNG_URL) to put in the shell once installed.
@@ -681,7 +683,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (900 checks),
+`forge/browser/` (the package), `tests/` (974 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that
@@ -693,19 +695,19 @@ wiring changes nothing in this build.
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-Verified in the sandbox on 2026-11-15: 900 checks, all green
+Verified in the sandbox on 2026-11-16: 974 checks, all green
 (offline suite, including a fake CDP server exercising the real
 WebSocket/CDP code).
 The program itself was also run for real in the sandbox (offscreen
 Qt): window opened on its start page, a live site loaded with its
 real content, and words typed in the address bar came back as a
 results page from the keyless chain.
-The push-time check is `sh ci/check.sh` — the free CI. GitHub
+The push-time check is `sh ci/check.sh`, the free CI. GitHub
 Actions is billing-locked, so this script runs locally instead:
 the full suite plus a Release-shaped zip build with its stored
 modes verified. It writes the verdict to `CI-STATUS.md`.
 Live checks the same day: real keyless search; live fetch; a live
-research run producing a cited report; and a REAL engine session —
+research run producing a cited report; and a REAL engine session:
 the Lightpanda nightly binary driven over CDP by this code
 (navigate, rendered text, elements, accessibility snapshot, click,
 and a valid screenshot of example.org). Chromium itself was not
@@ -719,7 +721,7 @@ on Joshua's PC. His run closes the items, as usual.
   render/snapshot/screenshot drives a single page at a time, no
   parallel pages in this build; that is deliberate on an 8 GB
   machine. The window itself has as many tabs as the person
-  opens — this limit is the engine room's, not the window's.
+  opens, and this limit is the engine room's, not the window's.
 - Lightpanda is a beta engine: partial web APIs, rough rendering,
   and link-click navigation did not complete in the live test
   (the click dispatched; the page did not change). Chromium is the

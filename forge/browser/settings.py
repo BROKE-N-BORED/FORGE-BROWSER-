@@ -15,6 +15,7 @@ import os
 
 DEFAULTS = {
     "download_dir": "",   # empty = ~/Downloads
+    "download_ask": "0",  # R3-32: "1" = ask where to save each download
     "ollama_url": "",     # empty = http://127.0.0.1:11434
     "searxng_url": "",    # empty = no local SearXNG
     "preview_dwell_ms": "600",  # hover dwell before a link preview (L9)

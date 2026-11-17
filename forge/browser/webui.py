@@ -453,7 +453,7 @@ Nothing leaves this machine. Visits and page text are kept on this PC:
 <p class="tip">Tip: in chat, write <b>@tab2</b> to ask about tab 2, or compare tabs by number.</p>
 {howto}
 <form action="/search" method="get">
-<input type="text" name="q" placeholder="Search the web, or type an address up top" autofocus>
+<input type="text" name="q" placeholder="Search the web or type an address" autofocus>
 <button type="submit">Search</button>
 </form>
 {quick}
@@ -470,26 +470,46 @@ def howto_page():
     """U22: the How to Use index as a page — BROWSER.md's headings
     as links, each section's text under its heading. The start
     page's first-run link and the Help menu's window both lead
-    here (the window shows the same sections natively)."""
-    from .howto import load_sections
+    here (the window shows the same sections natively). R3-10b:
+    user topics first, developer topics grouped after them, so a
+    first-time user never meets the engine-room internals
+    unprompted."""
+    from .howto import load_sections, split_sections
     sections = load_sections()
     if not sections:
         body = ("<p>The manual (BROWSER.md) is not installed with "
                 "this copy of Forge Browser, so there is nothing to "
                 "show here. Reinstalling puts it back.</p>")
     else:
-        index = "".join(
-            f'<div style="margin:4px 0 4px {(level - 1) * 18}px;">'
-            f'<a href="#s{i}">{html.escape(title)}</a></div>'
-            for i, (level, title, _body) in enumerate(sections))
-        blocks = []
-        for i, (level, title, text) in enumerate(sections):
-            tag = "h2" if level <= 2 else "h3"
-            blocks.append(
-                f'<{tag} id="s{i}">{html.escape(title)}</{tag}>'
-                f"<pre>{html.escape(text)}</pre>")
-        body = (f"<h2>Index</h2>{index}"
-                + "\n".join(blocks))
+        user_sections, dev_sections = split_sections(sections)
+        # Anchor ids run across both groups, so no two collide.
+        numbered = ([(i, entry) for i, entry in enumerate(user_sections)]
+                    + [(len(user_sections) + i, entry)
+                       for i, entry in enumerate(dev_sections)])
+
+        def index_for(entries):
+            return "".join(
+                f'<div style="margin:4px 0 4px {(level - 1) * 18}px;">'
+                f'<a href="#s{i}">{html.escape(title)}</a></div>'
+                for i, (level, title, _body) in entries)
+
+        def blocks_for(entries):
+            parts = []
+            for i, (level, title, text) in entries:
+                tag = "h2" if level <= 2 else "h3"
+                parts.append(
+                    f'<{tag} id="s{i}">{html.escape(title)}</{tag}>'
+                    f"<pre>{html.escape(text)}</pre>")
+            return "\n".join(parts)
+
+        user_numbered = numbered[:len(user_sections)]
+        dev_numbered = numbered[len(user_sections):]
+        body = (f"<h2>Index</h2>{index_for(user_numbered)}"
+                + blocks_for(user_numbered))
+        if dev_numbered:
+            body += (f"<h2>Developer topics</h2>"
+                     f"{index_for(dev_numbered)}"
+                     + blocks_for(dev_numbered))
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>How to Use · Forge Browser</title><style>{_STYLE}</style></head>
 <body><div class="wrap">
