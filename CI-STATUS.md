@@ -3,9 +3,9 @@
 Free CI (`ci/check.sh`) — GitHub Actions is billing-locked
 account-wide, so this file is the verdict record. Last checked:
 
-- Commit: 418cc04bf72a647b3094253fc2211262ca49307b
-- Date (UTC): 2026-11-17T22:54:02Z
-- Suite: 1044 checks — PASS
-- Release zip: OK: 111 files, 8 dirs, 2214816 bytes, modes verified, SHA-256 1592667f29177c0fbb8db63e669cc1d2381e436ffadd035fde3304937d445837
+- Commit: a0a36da46b0c4cf097b99efc211cc728bac64f26
+- Date (UTC): 2026-11-19T02:06:26Z
+- Suite: 1082 checks — PASS
+- Release zip: OK: 114 files, 8 dirs, 2282165 bytes, modes verified, SHA-256 61a575503f067378101e619d7deaa92d89d97475a3f82b8716688261420944e6
 
 Run `sh ci/check.sh` from the repo root to re-check.
