@@ -23,7 +23,7 @@ import hashlib
 import json
 import os
 
-from .chat import ChatStopped
+from .chat import ChatStopped, visible_text
 from .errors import BrowserError
 from .retrieve import chunk_text
 
@@ -69,8 +69,13 @@ def cache_path():
 
 
 def _cache_key(url, text, length="standard"):
+    # R5-01: the "v2" salt retires entries cached before the
+    # protocol-line filter — an old entry can hold a raw ACTION
+    # line as its "summary", and it must be recomputed, not
+    # served.
     return hashlib.sha256(
-        ((url or "") + "\n" + length + "\n" + text).encode("utf-8")).hexdigest()
+        ("v2\n" + (url or "") + "\n" + length + "\n" + text
+         ).encode("utf-8")).hexdigest()
 
 
 def _load_cache():
@@ -152,9 +157,15 @@ def summarize_page(session, page_text, url=None, on_chunk=None,
 
     def _call(sess, messages, chunk_cb=None):
         """One brain call; a Stop inside it is a stopped
-        summarize (R3-07b), not an error."""
+        summarize (R3-07b), not an error. R5-01: the reply goes
+        through visible_text — a brain that answers a summarize
+        prompt with an ACTION protocol line (it happens with
+        small models, which are taught the protocol for chat)
+        has produced no summary, and the raw line must never
+        become the summary text: it used to land in the chat
+        log verbatim from the Summarize button."""
         try:
-            return sess._chat(messages, chunk_cb)
+            return visible_text(sess._chat(messages, chunk_cb))
         except ChatStopped:
             raise SummarizeStopped("summarize stopped") from None
 

@@ -27,7 +27,7 @@ import threading
 import time
 import urllib.parse
 
-from .chat import format_duration, step_words
+from .chat import format_duration, step_words, visible_text
 from .errors import BrowserError
 from .preview import dwell_ms
 
@@ -152,6 +152,32 @@ def turn_done_text(outcome, started, now=None, speed=None, waited=0):
     if parts:
         text += " (" + ", ".join(parts) + ")"
     return text + "."
+
+
+# R5-05: what a refused plan step reads as in the log line
+# "You said no, so I did not ..." — a verb phrase per action
+# kind, in the person's terms, not the protocol's.
+_PLAN_DENIAL_WORDS = {
+    "search": "search",
+    "open": "open that page",
+    "research": "start that research",
+    "read_page": "read the page",
+    "summarize": "summarize the page",
+    "card": "run that card",
+    "remember": "remember that",
+    "forget": "forget that",
+    "forget_page": "forget that page",
+    "recall": "look up what I remember",
+    "recall_pages": "search the remembered pages",
+    "brief": "build the brief",
+    "compare": "compare those tabs",
+}
+
+
+def plan_denial_words(kind):
+    """The verb phrase naming a refused action kind, for the
+    denial line in the chat log (R5-05)."""
+    return _PLAN_DENIAL_WORDS.get(kind, "do that")
 
 
 def default_window_size(avail_width, avail_height):
@@ -709,17 +735,29 @@ def create_window(server, profile, start_url=None):
             bar = self.addToolBar("Navigation")
             bar.setObjectName("nav_toolbar")  # saveState needs a name
             bar.setMovable(False)
-            bar.addAction("←", lambda: self._view() and self._view().back())
-            bar.addAction("→", lambda: self._view() and self._view().forward())
-            bar.addAction("⟳", lambda: self._view() and self._view().reload())
-            bar.addAction("⌂", lambda: self._view() and self._view().load(
-                QtCore.QUrl(server.home_url)))
+            # R5-04: the glyph buttons carry word tooltips — a
+            # tooltip that just repeats the glyph ("←") never
+            # tells a new user what the button does.
+            back_act = bar.addAction(
+                "←", lambda: self._view() and self._view().back())
+            back_act.setToolTip("Back")
+            forward_act = bar.addAction(
+                "→", lambda: self._view() and self._view().forward())
+            forward_act.setToolTip("Forward")
+            reload_act = bar.addAction(
+                "⟳", lambda: self._view() and self._view().reload())
+            reload_act.setToolTip("Reload")
+            home_act = bar.addAction(
+                "⌂", lambda: self._view() and self._view().load(
+                    QtCore.QUrl(server.home_url)))
+            home_act.setToolTip("Home")
             self.address = QtWidgets.QLineEdit()
             self.address.setPlaceholderText(
                 "Type an address, or words to search")
             self.address.returnPressed.connect(self._go)
             bar.addWidget(self.address)
-            bar.addAction("＋ Tab", lambda: self.new_tab())
+            new_tab_act = bar.addAction("＋ Tab", lambda: self.new_tab())
+            new_tab_act.setToolTip("New tab")
             star = bar.addAction("★", self._bookmark_current)
             star.setToolTip("Bookmark this page (Ctrl+D)")
             # R3-22: downloads are one click away, with a live
@@ -1703,18 +1741,24 @@ def create_window(server, profile, start_url=None):
                 self.statusBar().showMessage("History cleared.", 3000)
 
         def _show_howto(self):
-            """U22: the manual as an index window — sections from
-            BROWSER.md's own headings; clicking one shows its text.
-            R3-10b: user topics first, developer topics grouped
-            under their own heading below, so a first-time user
-            never meets the engine-room internals unprompted."""
+            """U22: the How to Use window — a topic list on the
+            left, the topic's text on the right. R5-03: the
+            topics a first-time user meets are the plain user
+            help (userhelp.py), not the manual's own sections;
+            the manual's developer topics stay grouped under
+            their own heading below (R3-10b), out of the way
+            but reachable. R5-02: a Close button ends the
+            window — the X and Esc are no longer the only ways
+            out."""
             from .howto import load_sections, split_sections
-            sections = load_sections()
-            user_sections, dev_sections = split_sections(sections)
+            from .userhelp import user_help_topics
+            _manual_user, dev_sections = split_sections(load_sections())
             dialog = QtWidgets.QDialog(self)
             dialog.setWindowTitle("How to Use")
             dialog.resize(900, 600)
-            layout = QtWidgets.QHBoxLayout(dialog)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            panes = QtWidgets.QHBoxLayout()
+            layout.addLayout(panes)
             listing = QtWidgets.QListWidget()
             listing.setObjectName("howto_list")
             text = QtWidgets.QTextBrowser()
@@ -1723,9 +1767,9 @@ def create_window(server, profile, start_url=None):
             # shown[row] is the section for that list row, or None
             # for the developer heading (not selectable).
             shown = []
-            for _level, title, _body in user_sections:
-                listing.addItem("  " * (_level - 1) + title)
-                shown.append((_level, title, _body))
+            for title, body in user_help_topics():
+                listing.addItem(title)
+                shown.append((1, title, body))
             if dev_sections:
                 heading = QtWidgets.QListWidgetItem("Developer topics")
                 heading.setFlags(QtCore.Qt.ItemFlag.NoItemFlags)
@@ -1743,15 +1787,16 @@ def create_window(server, profile, start_url=None):
                     text.setPlainText(shown[row][2])
 
             listing.currentRowChanged.connect(show_section)
-            if sections:
-                listing.setCurrentRow(0)
-            else:
-                text.setPlainText(
-                    "The manual (BROWSER.md) is not installed with "
-                    "this copy of Forge Browser, so there is nothing "
-                    "to show here. Reinstalling puts it back.")
-            layout.addWidget(listing, 1)
-            layout.addWidget(text, 2)
+            listing.setCurrentRow(0)
+            panes.addWidget(listing, 1)
+            panes.addWidget(text, 2)
+            button_row = QtWidgets.QHBoxLayout()
+            button_row.addStretch(1)
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.setObjectName("howto_close")
+            close_btn.clicked.connect(dialog.accept)
+            button_row.addWidget(close_btn)
+            layout.addLayout(button_row)
             dialog.exec()
 
         def _show_debug_report(self):
@@ -3031,6 +3076,14 @@ def create_window(server, profile, start_url=None):
                 refresh()
 
             def do_add():
+                # R5-07: the entry actions guard on an unlocked
+                # vault — with none, they say so plainly instead
+                # of crashing on self._vault being None.
+                if self._vault is None:
+                    status.setText(
+                        "The vault is locked. Unlock it before "
+                        "adding a login.")
+                    return
                 form = QtWidgets.QDialog(dialog)
                 form.setWindowTitle("Add a login")
                 form_layout = QtWidgets.QVBoxLayout(form)
@@ -3061,6 +3114,15 @@ def create_window(server, profile, start_url=None):
                     site = site_entry.text().strip()
                     if not site:
                         return
+                    if self._vault is None:
+                        # R5-07: the vault was locked (or never
+                        # unlocked) while the form was open — a
+                        # plain message, not an AttributeError.
+                        status.setText(
+                            "The vault is locked. Unlock it before "
+                            "adding a login.")
+                        form.reject()
+                        return
                     self._vault.set(site, user_entry.text().strip(),
                                     pw_entry.text(), notes_entry.text())
                     _log_action(f"Added a vault entry for {site}")
@@ -3074,6 +3136,12 @@ def create_window(server, profile, start_url=None):
             def do_delete():
                 item = listing.currentItem()
                 if item is None:
+                    return
+                if self._vault is None:
+                    # R5-07: same guard as the add path.
+                    status.setText(
+                        "The vault is locked. Unlock it before "
+                        "changing logins.")
                     return
                 site = item.data(QtCore.Qt.ItemDataRole.UserRole)
                 if self._ask_yes_no(
@@ -3720,7 +3788,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     # (never counted as work); "wait_started" is when the current
     # wait began, or None when no dialog is up.
     turn = {"step": "thinking", "started": None, "retrieve_note": "",
-            "waited": 0.0, "wait_started": None}
+            "waited": 0.0, "wait_started": None,
+            # R5-05: plan-gate bookkeeping for the turn — how many
+            # plans were asked, and whether the first was refused.
+            "plans_seen": 0, "first_denied": False}
     # Voice state lives here (not with the mic handlers below) so
     # apply_ai_state can read it — it runs before the mic section.
     voice_state = {"recorder": None, "transcribing": False,
@@ -3942,12 +4013,14 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
     def fill_seat_combos(details=None):
         # Each item carries the model name as its data; the label
         # shows the size (T8) so a 2 GB model reads differently
-        # from an 8 GB one. Embed models are not offered as Brain
-        # or Fast (T6); a saved pick that is gone shows as dead
-        # (T5) instead of hiding behind "(auto)", and a saved
-        # embed pick shows as an embed model. The Brain combo's
-        # (auto) entry stays short (R3-15) — what auto would pick
-        # is named in the description line, not the label.
+        # from an 8 GB one. Embed models are offered for no seat
+        # (T6 for Brain/Fast; R5-06 for Vision — an embedding
+        # model cannot describe images); a saved pick that is
+        # gone shows as dead (T5) instead of hiding behind
+        # "(auto)", and a saved embed pick shows as an embed
+        # model. The Brain combo's (auto) entry stays short
+        # (R3-15) — what auto would pick is named in the
+        # description line, not the label.
         # G-P1: details arrive from the background pick — only
         # the ↻ path calls check_ollama() itself, via
         # _start_brain_pick(refresh=True), never directly.
@@ -3973,7 +4046,12 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             # (_refresh_seat_descriptions) and the tooltip instead.
             combo.addItem("(auto)", None)
             for name in models:
-                if key in ("brain", "fast") and "embed" in name.lower():
+                # The name is the only embed signal the seat fill
+                # has (check_ollama reports name + size; the
+                # capability list lives behind one /api/show call
+                # per model, which the fill does not make) — the
+                # same signal the Brain/Fast filter already uses.
+                if "embed" in name.lower():
                     continue
                 display = name
                 if sizes.get(name):
@@ -3989,8 +4067,7 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             if pick and pick not in models:
                 combo.addItem(f"{pick} (not installed)", pick)
                 combo.setCurrentIndex(combo.count() - 1)
-            elif (pick and key in ("brain", "fast")
-                  and "embed" in pick.lower()):
+            elif pick and "embed" in pick.lower():
                 combo.addItem(f"{pick} (embed model)", pick)
                 combo.setCurrentIndex(combo.count() - 1)
             elif pick:
@@ -4274,13 +4351,24 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
 
     def on_answer(text):
         outcome = "stopped" if (text or "").strip() == "Stopped." else "done"
+        if outcome == "done" and turn.get("first_denied"):
+            # R5-05: the first plan asked this turn was refused
+            # at the gate — the turn ends as stopped, not done,
+            # even though the brain wrapped up with words
+            # afterwards.
+            outcome = "stopped"
         if state["live"]:
             # The answer already streamed into the log line by line;
             # re-printing it would duplicate it.
             state["live"] = False
             finish(outcome)
         else:
-            append("Forge Browser", text)
+            # R5-01: an answer that never streamed (a button job
+            # whose reply the display filter held back whole) must
+            # not land in the log raw — a reply that is only an
+            # ACTION protocol line is not an answer, and the log
+            # is saved, so the raw line would outlive the turn.
+            append("Forge Browser", visible_text(text) or "(no answer)")
             finish(outcome)
 
     def on_failed(text):
@@ -4395,6 +4483,11 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
             timer.stop()
             state["approved"] = (
                 answer == QtWidgets.QMessageBox.StandardButton.Yes)
+            # R5-05: ask_plan tells a plain No apart from a
+            # timeout by these two flags — the timeout already
+            # leaves its own line below; a No leaves one there.
+            state["answered"] = True
+            state["timed_out"] = timed_out["value"]
             if timed_out["value"]:
                 append("Forge Browser",
                        "Plan timed out after 5 minutes. Treated as no.")
@@ -4428,9 +4521,20 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         state = {"event": threading.Event(), "approved": False,
                  "kind": kind}
         signals.plan.emit(plan_text, state)
+        turn["plans_seen"] = turn.get("plans_seen", 0) + 1
         if not state["event"].wait(timeout=PLAN_TIMEOUT_SECONDS):
             signals.notice.emit(
                 "Plan timed out after 5 minutes. Treated as no.")
+        elif not state["approved"] and not state.get("timed_out"):
+            # R5-05: a plain No at the gate leaves a plain line —
+            # the step was skipped, and the log says so. (A dialog
+            # timeout already left its own line in on_plan.) The
+            # first refusal of the turn also marks the turn, so
+            # it ends as stopped, not done (see on_answer).
+            if turn["plans_seen"] == 1:
+                turn["first_denied"] = True
+            signals.notice.emit(
+                f"You said no, so I did not {plan_denial_words(kind)}.")
         turn["waited"] = (turn.get("waited", 0.0)
                           + (time.monotonic() - turn["wait_started"]))
         turn["wait_started"] = None
@@ -4789,6 +4893,10 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # G-UX9: the entry stays editable while a summary runs.
         # Clear any earlier stop, or this summarize ends at once.
         session._stop_requested = False
+        # R5-01: the click leaves a plain line in the log — the
+        # button used to say nothing, so the only trace of a
+        # summarize was whatever the brain answered.
+        append("Forge Browser", "Summarizing the page")
         # K8: the button follows @tab — summarize the named tab
         # when the entry has @tabN.
         target = window.tabs.currentIndex()
@@ -4824,6 +4932,8 @@ def _attach_chat(window, QtCore, QtGui, QtWidgets):
         # J5: the working line names the phase honestly — the dock
         # is reading tabs before the brain starts, not thinking.
         turn["step"] = "reading tabs"
+        turn["plans_seen"] = 0
+        turn["first_denied"] = False
         turn["retrieve_note"] = ""
         turn["started"] = time.monotonic()
         turn["waited"] = 0.0

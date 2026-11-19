@@ -1526,7 +1526,7 @@ class DocsContentTests(unittest.TestCase):
         # date, not the stale 50/50 line. (The count itself is
         # pinned by test_no_stale_check_counts.)
         text = _flat("BROWSER.md")
-        self.assertIn("Verified in the sandbox on 2026-11-18", text)
+        self.assertIn("Verified in the sandbox on 2026-11-19", text)
         self.assertNotIn("50/50", text)
 
     def test_install_header_names_pip_window(self):

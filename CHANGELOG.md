@@ -1,5 +1,37 @@
 # Forge Browser — Changelog
 
+## 0.14 - 2026-11-19
+
+The Review 5 list, built: the seven findings from the
+user pass over v0.13 (docs/REVIEW-2026-11-19.md). 1100
+checks, all green.
+
+- Summarize no longer writes a raw protocol line into the
+  chat log. The filter sits at the shared funnels, so no
+  action can echo a raw ACTION line into the log or the
+  saved history; the click logs a plain "Summarizing the
+  page" line instead, and summaries cached by older
+  versions are recomputed rather than served.
+- How to Use now opens on plain user help: ten topics
+  written for a user (welcome, tabs and the address bar,
+  searching, the chat helper, downloads, bookmarks and
+  history, the vault, the doorway, updates, where your
+  files live). The developer topics stay grouped below
+  under their own heading. A Close button closes the
+  dialog (the X and Esc still work too).
+- The navigation buttons say what they do: Back, Forward,
+  Reload, Home, and New tab tooltips in words instead of
+  the glyphs themselves.
+- Saying no at the plan gate leaves a plain line in the
+  log ("You said no, so I did not search.") and the turn
+  ends as stopped, not done.
+- The Vision picker no longer offers embedding models
+  (they cannot describe images). A saved embedding-model
+  pick is shown labeled instead of silently selected.
+- The vault's add, save, and delete actions refuse
+  plainly while the vault is locked instead of raising
+  an error.
+
 ## 0.13 - 2026-11-18
 
 The doorway for Fyrn: a tiny local HTTP endpoint so another

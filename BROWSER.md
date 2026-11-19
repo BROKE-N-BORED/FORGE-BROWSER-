@@ -734,7 +734,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (1082 checks),
+`forge/browser/` (the package), `tests/` (1100 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that
@@ -746,7 +746,7 @@ wiring changes nothing in this build.
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-Verified in the sandbox on 2026-11-18: 1082 checks, all green
+Verified in the sandbox on 2026-11-19: 1100 checks, all green
 (offline suite, including a fake CDP server exercising the real
 WebSocket/CDP code).
 The program itself was also run for real in the sandbox (offscreen
