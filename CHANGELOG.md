@@ -1,5 +1,46 @@
 # Forge Browser — Changelog
 
+## 0.13 - 2026-11-18
+
+The doorway for Fyrn: a tiny local HTTP endpoint so another
+program on the same PC can hand Forge Browser a browsing job
+and get the result back. 1082 checks, all green.
+
+- Start it with `python3 -m forge.browser doorway`. It
+  listens on 127.0.0.1 port 18787 by default (--port and
+  FORGE_BROWSER_DOORWAY_PORT override it; on conflict it
+  tries the next few ports). The actual bound port is
+  written to ~/.forge/doorway/port so a client can discover
+  the address. No window needed; the doorway uses the
+  engine room only.
+- POST /task takes {"type": "open", "url": "..."} or
+  {"type": "research", "query": "..."} and returns a task
+  id. GET /task/<id> reports live status while it runs:
+  state, phase in plain words, current URL, and the result
+  when done. GET /tasks lists recent tasks, newest first.
+- An "open" task drives a fresh CDP session: navigate, read
+  the rendered page as markdown, take a real PNG screenshot.
+  A "research" task runs the keyless search, opens the best
+  result, and returns the same. One page per task; tasks run
+  one at a time in submission order.
+- The result carries the final URL, the page markdown, and
+  the screenshot path (~/.forge/doorway/<task-id>/shot.png,
+  updated at each navigation step so a view window can show
+  the live page by polling the file). The full markdown is
+  also in page.md next to it. Inline markdown in JSON is
+  capped at 20,000 chars with a plain note (RAM protection);
+  the full text is always in the file.
+- Local only: binds 127.0.0.1, no auth, no key. Task URLs
+  are fenced like the browser's own fetches: http(s) and
+  public only, local addresses refused plainly. A page that
+  needs a human (captcha, login) fails the task naming the
+  barrier; the doorway never solves human checks.
+- Full contract in docs/DOORWAY.md (start, endpoints, curl
+  + Python examples, result format, status values, port
+  file, caps). Finished tasks stay pollable for at least an
+  hour; task folders stay on disk after that, so a saved
+  screenshot or markdown path keeps working.
+
 ## 0.12 - 2026-11-17
 
 Silent update check and ask-first auto-update (Joshua's

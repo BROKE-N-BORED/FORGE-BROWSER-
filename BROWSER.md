@@ -551,11 +551,27 @@ python3 -m forge.browser engines [--json]
 python3 -m forge.browser vault create | list | add SITE | remove SITE
 python3 -m forge.browser history export out.json   # the visit history out as JSON
 python3 -m forge.browser reports                   # the saved research reports
+python3 -m forge.browser doorway [--port N] [--host H]  # the local doorway for other programs (Fyrn)
 python3 -m forge.browser --version                 # what changed in this version
 ```
 
 `--json` prints the same data the Python functions return, which is
 the shape a Forge tool wrapper uses.
+
+## The doorway: browsing jobs for other programs
+
+Another program on this PC can hand Forge Browser a browsing job
+through the doorway, a tiny local HTTP endpoint on 127.0.0.1
+(port 18787 by default). Start it with
+`python3 -m forge.browser doorway`; it needs no window. A job is
+either `open` (read one rendered page) or `research` (search,
+open the best result, read it). Jobs run one at a time, in
+submission order; each one returns the rendered page as markdown
+plus a real PNG screenshot, and the client polls for live status
+while it runs. Local-only binding is the protection (no auth, no
+key), task URLs are fenced the same as the browser's own fetches,
+and a page that needs a human fails plainly. The full contract,
+with curl and Python examples, is in `docs/DOORWAY.md`.
 
 ## Search
 
@@ -718,7 +734,7 @@ FORGE_SEARXNG_URL) to put in the shell once installed.
 
 ## What is in the folder
 
-`forge/browser/` (the package), `tests/` (1044 checks),
+`forge/browser/` (the package), `tests/` (1082 checks),
 `test-forge-browser.sh` (the guided test above), `install.sh`,
 `run.sh`, `browser-setup.sh` (optional engines), and this file.
 The engine room is also wired into Code Forge as a tool; that
@@ -730,7 +746,7 @@ wiring changes nothing in this build.
 python3 -m unittest discover -s tests -p "test_browser*.py"
 ```
 
-Verified in the sandbox on 2026-11-17: 1044 checks, all green
+Verified in the sandbox on 2026-11-18: 1082 checks, all green
 (offline suite, including a fake CDP server exercising the real
 WebSocket/CDP code).
 The program itself was also run for real in the sandbox (offscreen

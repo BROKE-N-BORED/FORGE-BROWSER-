@@ -17,6 +17,7 @@
     vault remove SITE
     history export <file>                    the visit history out as JSON
     reports                                  list the saved research reports
+    doorway [--port N] [--host H]            the local doorway for other programs (Fyrn)
     --version                                what changed in this version
 
 Human-readable output by default; --json prints the exact dicts the
@@ -734,6 +735,11 @@ def _cmd_seats(args):
     return 1
 
 
+def _cmd_doorway(args):
+    from .doorway import run_doorway
+    return run_doorway(port=args.port, host=args.host)
+
+
 def _cmd_open(args):
     from .cdp import open_browser_window
     result = open_browser_window(args.url)
@@ -919,6 +925,15 @@ def main(argv=None):
 
     p = sub.add_parser("reports", help="list the saved research reports")
     p.set_defaults(func=_cmd_reports)
+
+    p = sub.add_parser("doorway", help="the local doorway: browsing jobs "
+                                       "for other programs on this PC (Fyrn)")
+    p.add_argument("--port", type=int, default=None,
+                   help="port to listen on (default 18787, or "
+                        "FORGE_BROWSER_DOORWAY_PORT; 0 picks a free port)")
+    p.add_argument("--host", default=None,
+                   help="loopback address to bind (default 127.0.0.1)")
+    p.set_defaults(func=_cmd_doorway)
 
     args = parser.parse_args(argv)
     # G-C1: the vault add/remove site check is scoped to the vault
